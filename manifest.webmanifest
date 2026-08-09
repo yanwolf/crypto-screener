@@ -1,0 +1,18 @@
+{
+  "name": "加密貨幣量能雷達",
+  "short_name": "量能雷達",
+  "description": "CoinGecko 即時篩選、量能異動雷達、空頭結構雷達與鏈上風險檢查",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#0C1418",
+  "theme_color": "#0C1418",
+  "lang": "zh-Hant",
+  "categories": ["finance", "utilities"],
+  "icons": [
+    { "src": "icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "icon-512.png", "sizes": "512x512", "type": "image/png" },
+    { "src": "icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}
