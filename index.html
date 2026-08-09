@@ -435,7 +435,7 @@ const ERR_MSG = {
   RATE: "CoinGecko 回 429，額度已滿。無金鑰時每分鐘只有 5–15 次；等一分鐘再試，或填入免費 Demo API Key 提高到每分鐘 30 次。",
   AUTH: "API Key 被拒絕。確認金鑰沒打錯，且 Pro 金鑰才需勾選 Pro。",
   SERVER: "CoinGecko 伺服器暫時異常，稍後重試。",
-  NOPROXY: "同源路徑 /api/v3 回了 404，接請求的不是 screener_server.py。靜態伺服器不會轉發 API，請改跑 screener_server.py，或取消勾選「透過本機代理」。"
+  NOPROXY: "同源路徑 /api/v3 沒有回應，代理可能重新部署中或已停止。程式會自動改回直連，稍後可按「重新偵測」。"
 };
 const errText = e => ERR_MSG[e.message] || `請求失敗（${e.message}）。`;
 
@@ -2535,13 +2535,8 @@ function CryptoScreener() {
   const [apiKey, setApiKey] = useState("");
   const [pro, setPro] = useState(false);
   const [proxy, setProxy] = useState("");
-  const [local, setLocal] = useState(() => {
-    try {
-      return /^(localhost|127\.0\.0\.1|\[::1\])$/.test(location.hostname) && location.protocol.startsWith("http");
-    } catch (e) {
-      return false;
-    }
-  });
+  /* 同源是否有代理伺服器，開頁時自動探測一次，使用者不必自己勾 */
+  const [proxyMode, setProxyMode] = useState(() => store.get("proxyMode", "detecting"));
   const [autoRefresh, setAutoRefresh] = useState(false);
   const [showConn, setShowConn] = useState(false);
   const [showWeights, setShowWeights] = useState(false);
@@ -2642,6 +2637,7 @@ function CryptoScreener() {
   const toggleWatch = useCallback(id => {
     setWatch(w => w.includes(id) ? w.filter(x => x !== id) : [...w, id]);
   }, []);
+  const local = proxyMode === "server";
   const cfg = useMemo(() => ({
     key: apiKey.trim(),
     pro,
@@ -2684,8 +2680,33 @@ function CryptoScreener() {
       setLoading(false);
     }
   }, [pages, cfg, loadDemo]);
+  const loadRef = useRef(null);
+  loadRef.current = loadMarkets;
+  const detectProxy = useCallback(async () => {
+    let mode = "direct";
+    try {
+      if (location.protocol.startsWith("http")) {
+        const r = await fetch("/api/v3/ping", {
+          cache: "no-store"
+        });
+        // 自家代理一定會帶 X-Cache；靜態主機的 404 或其他頁面不會
+        if (r.ok && r.headers.get("X-Cache")) mode = "server";
+      }
+    } catch (e) {/* 沒有代理就走直連 */}
+    setProxyMode(mode);
+    store.set("proxyMode", mode);
+    return mode;
+  }, []);
   useEffect(() => {
-    loadMarkets(1); /* eslint-disable-next-line */
+    let dead = false;
+    (async () => {
+      await detectProxy();
+      if (!dead) loadRef.current(1);
+    })();
+    return () => {
+      dead = true;
+    };
+    /* eslint-disable-next-line */
   }, []);
   useEffect(() => {
     if (!autoRefresh) return;
@@ -2696,7 +2717,7 @@ function CryptoScreener() {
   }, [autoRefresh, loading, batch.running, loadMarkets]);
   const runDiag = useCallback(async () => {
     const out = [{
-      t: cfg.local ? "連線路徑：本機代理 /api/v3（同源）" : "連線路徑：瀏覽器直連 api.coingecko.com",
+      t: cfg.local ? "連線路徑：同源代理 /api/v3（自動偵測）" : "連線路徑：瀏覽器直連 api.coingecko.com",
       ok: null
     }];
     setDiag([...out, {
@@ -2716,9 +2737,9 @@ function CryptoScreener() {
         ok: false
       });
       if (e.message === "NOPROXY") {
-        setLocal(false);
+        const m = await detectProxy();
         out.push({
-          t: "已自動取消「透過本機代理」，請再測一次。",
+          t: `同源代理已失效，已自動改為${m === "server" ? "代理" : "直連"}模式，請再測一次。`,
           ok: null
         });
       }
@@ -2742,7 +2763,7 @@ function CryptoScreener() {
       ok: cfg.key ? true : null
     });
     setDiag(out);
-  }, [cfg]);
+  }, [cfg, detectProxy]);
 
   /* ── 雷達掃描 ── */
   const scan = useCallback(async list => {
@@ -3060,7 +3081,7 @@ function CryptoScreener() {
       setChainTokens(list.map(p => byPool[p.pool] || p));
       setChainAt(new Date());
     } catch (e) {
-      setChainErr(e.message === "BLOCKED" ? "瀏覽器擋下了對 GeckoTerminal 或 GoPlus 的請求。若已啟動 screener_server.py，請在連線設定勾選「透過本機代理」。" : e.message === "RATE" ? "鏈上資料來源額度已滿，等一分鐘再試。" : `鏈上資料讀取失敗（${e.message}）。`);
+      setChainErr(e.message === "BLOCKED" ? "瀏覽器擋下了對 GeckoTerminal 或 GoPlus 的請求。若你有部署伺服器版本，按連線設定裡的「重新偵測」讓它改走同源代理。" : e.message === "RATE" ? "鏈上資料來源額度已滿，等一分鐘再試。" : `鏈上資料讀取失敗（${e.message}）。`);
     } finally {
       setChainBusy(null);
     }
@@ -3718,7 +3739,11 @@ function CryptoScreener() {
     style: {
       color: source === "live" ? C.teal : C.gold
     }
-  }, "· ", source === "live" ? "即時資料" : source === "demo" ? "示範資料（非真實行情）" : "尚未載入")), showConn && /*#__PURE__*/React.createElement("div", {
+  }, "· ", source === "live" ? "即時資料" : source === "demo" ? "示範資料（非真實行情）" : "尚未載入"), /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: C.muted
+    }
+  }, "· ", local ? "伺服器代理" : "瀏覽器直連")), showConn && /*#__PURE__*/React.createElement("div", {
     className: "w-full rounded p-3 grid gap-2.5",
     style: {
       background: C.panel,
@@ -3747,19 +3772,23 @@ function CryptoScreener() {
     style: {
       accentColor: C.gold
     }
-  }), "Pro 金鑰"), /*#__PURE__*/React.createElement("label", {
-    className: "flex items-center gap-1.5 cursor-pointer",
+  }), "Pro 金鑰"), /*#__PURE__*/React.createElement("span", {
+    className: "px-2 py-1.5 rounded",
     style: {
-      color: local ? C.teal : C.bone
+      fontSize: 11.5,
+      color: local ? C.teal : C.muted,
+      border: `1px solid ${local ? C.teal : C.line}`
     }
-  }, /*#__PURE__*/React.createElement("input", {
-    type: "checkbox",
-    checked: local,
-    onChange: e => setLocal(e.target.checked),
+  }, proxyMode === "detecting" ? "偵測連線方式…" : local ? "已連上伺服器代理" : "直連 CoinGecko"), /*#__PURE__*/React.createElement("button", {
+    onClick: detectProxy,
+    className: "px-2.5 py-1.5 rounded",
     style: {
-      accentColor: C.teal
+      background: C.panel2,
+      border: `1px solid ${C.line}`,
+      color: C.muted,
+      fontSize: 12
     }
-  }), "透過本機代理"), /*#__PURE__*/React.createElement("button", {
+  }, "重新偵測"), /*#__PURE__*/React.createElement("button", {
     onClick: runDiag,
     className: "px-3 py-1.5 rounded",
     style: {
