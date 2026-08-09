@@ -385,7 +385,7 @@ def main():
     if not os.path.exists(page):
         print(f"  ! 找不到 crypto-screener.html，請把它放到 {HERE}")
 
-    with Server(("127.0.0.1", args.port), Handler) as httpd:
+    with Server(("0.0.0.0", args.port), Handler) as httpd:
         print(f"\n  開啟瀏覽器 → http://localhost:{args.port}")
         if ok:
             print("  頁面上的「透過本機代理」會自動勾選，按重新整理就會載入即時行情。")
