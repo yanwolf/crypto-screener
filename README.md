@@ -38,10 +38,11 @@ git push -u origin main
 | `CG_API_KEY` | 你的 Demo Key | 額度從 5–15 拉到 30 次/分 |
 | `PREFETCH` | `300` | 背景預抓前 300 檔，這項最有感 |
 | `PREFETCH_TTL` | `12` | 資料保鮮時數 |
-| `TG_TOKEN` | Bot Token | Telegram 推播（選填） |
-| `TG_CHAT` | Chat ID | Telegram 推播（選填） |
+| `ADMIN_KEY` | 自訂字串 | 選填。設了之後，只有知道這組金鑰的人能更換機器人 |
 
 `PORT` 不用設，Zeabur 會自動注入。設完按 **Redeploy**。
+
+Telegram 不需要環境變數，改在網頁上設定（見下方）。
 
 ## 四、綁定網域
 
@@ -59,6 +60,20 @@ Networking → Domains → 輸入想要的子網域 → Generate。
 Volumes → Add Volume → Mount Path 填 `/app/cache`，
 再新增環境變數 `CACHE_DIR` = `/app/cache`。
 沒掛 Volume 的話，每次重新部署快取會清空，預抓得重跑一輪。
+
+## 七、設定 Telegram 推播
+
+全部在網頁的「提醒設定 → 通知管道」完成：
+
+1. **建立機器人**：Telegram 搜尋 `@BotFather` → 送出 `/newbot` → 取名字 →
+   複製它給的 Token → 貼進網頁按「驗證並儲存」。Token 存在伺服器，不會留在瀏覽器。
+2. **配對聊天室**：按「開始配對」→ 網頁給你一組六碼 →
+   點「在 Telegram 開啟」，Telegram 會自動帶入代碼，按 START 即可。
+   幾秒後網頁會顯示配對成功，機器人也會回一則確認訊息。
+3. 想收到通知的人各自做一次步驟二，可以配對多個聊天室（也支援群組：
+   把機器人加進群組後在群裡送 `/start 代碼`）。
+
+配對結果存在伺服器的快取目錄，重新部署後若有掛 Volume 就不會消失。
 
 ## 注意
 

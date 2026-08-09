@@ -119,14 +119,169 @@ NOTIFY = {"tg_token": "", "tg_chat": "", "discord": "",
           "smtp_host": "", "smtp_port": 587, "smtp_user": "", "smtp_pass": "", "mail_to": ""}
 
 
+
+
+# ════════════════════════════════════════════════════════════
+#  Telegram 機器人配對
+#  網頁產生一次性代碼 → 使用者在 Telegram 送出 /start 代碼
+#  → 伺服器用 getUpdates 比對後記住 chat_id
+#  全程不需要使用者自己查 chat id，權杖也不會經過瀏覽器儲存
+# ════════════════════════════════════════════════════════════
+_tg = {"token": "", "bot": "", "chats": [], "offset": 0}
+_tg_lock = threading.Lock()
+_pending = {}          # code -> {"ts": float, "chat": dict|None}
+
+
+def tg_file():
+    return os.path.join(CACHE_DIR, "telegram.json")
+
+
+def tg_load():
+    try:
+        with open(tg_file(), "r") as f:
+            _tg.update(json.load(f))
+    except Exception:
+        pass
+    if not _tg["token"] and NOTIFY["tg_token"]:
+        _tg["token"] = NOTIFY["tg_token"]          # 環境變數設定的權杖
+    if NOTIFY["tg_chat"] and not any(c["id"] == NOTIFY["tg_chat"] for c in _tg["chats"]):
+        _tg["chats"].append({"id": NOTIFY["tg_chat"], "name": "環境變數設定", "ts": time.time()})
+
+
+def tg_save():
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        with open(tg_file(), "w") as f:
+            json.dump(_tg, f)
+    except Exception:
+        pass
+
+
+def tg_api(method, params=None, timeout=30):
+    if not _tg["token"]:
+        raise RuntimeError("尚未設定 Bot Token")
+    url = f"https://api.telegram.org/bot{_tg['token']}/{method}"
+    data = urllib.parse.urlencode(params or {}).encode()
+    req = urllib.request.Request(url, data=data)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read())
+
+
+def tg_admin_ok(payload):
+    need = os.environ.get("ADMIN_KEY", "").strip()
+    return (not need) or str(payload.get("admin", "")).strip() == need
+
+
+def pair_poller(deadline):
+    """在配對有效期間輪詢 getUpdates，找出送來對應代碼的聊天室"""
+    while time.time() < deadline:
+        if not any(v["chat"] is None for v in _pending.values()):
+            return
+        try:
+            j = tg_api("getUpdates", {"offset": _tg["offset"], "timeout": 20}, timeout=35)
+        except Exception:
+            time.sleep(3)
+            continue
+        for u in j.get("result", []):
+            _tg["offset"] = max(_tg["offset"], u.get("update_id", 0) + 1)
+            msg = u.get("message") or {}
+            text = (msg.get("text") or "").strip()
+            chat = msg.get("chat") or {}
+            if not text.startswith("/start"):
+                continue
+            parts = text.split(maxsplit=1)
+            code = parts[1].strip().upper() if len(parts) > 1 else ""
+            info = _pending.get(code)
+            if not info or info["chat"] is not None:
+                continue
+            entry = {"id": str(chat.get("id")),
+                     "name": chat.get("first_name") or chat.get("title") or "Telegram",
+                     "ts": time.time()}
+            info["chat"] = entry
+            with _tg_lock:
+                if not any(c["id"] == entry["id"] for c in _tg["chats"]):
+                    _tg["chats"].append(entry)
+                tg_save()
+            try:
+                tg_api("sendMessage", {"chat_id": entry["id"],
+                                       "text": "配對成功，之後的訊號提醒會送到這裡。"})
+            except Exception:
+                pass
+        tg_save()
+
+
+def tg_handle(path, payload):
+    """回傳 (status_code, dict)"""
+    if path == "/api/tg/status":
+        return 200, {"hasToken": bool(_tg["token"]), "bot": _tg["bot"],
+                     "chats": _tg["chats"], "adminRequired": bool(os.environ.get("ADMIN_KEY", "").strip())}
+
+    if path == "/api/tg/setup":
+        if not tg_admin_ok(payload):
+            return 403, {"error": "admin_key_required"}
+        token = str(payload.get("token", "")).strip()
+        if not token:
+            return 400, {"error": "empty_token"}
+        old = _tg["token"]
+        _tg["token"] = token
+        try:
+            me = tg_api("getMe", timeout=15)
+            if not me.get("ok"):
+                raise RuntimeError("getMe 失敗")
+            _tg["bot"] = me["result"].get("username", "")
+            try:
+                tg_api("deleteWebhook", timeout=15)      # 確保 getUpdates 可用
+            except Exception:
+                pass
+            tg_save()
+            return 200, {"ok": True, "bot": _tg["bot"]}
+        except Exception as e:
+            _tg["token"] = old
+            return 400, {"error": "invalid_token", "detail": str(e)}
+
+    if path == "/api/tg/pair":
+        if not _tg["token"]:
+            return 400, {"error": "no_token"}
+        code = "".join(__import__("random").choice("ABCDEFGHJKLMNPQRSTUVWXYZ23456789") for _ in range(6))
+        _pending[code] = {"ts": time.time(), "chat": None}
+        for k in [k for k, v in _pending.items() if time.time() - v["ts"] > 900]:
+            _pending.pop(k, None)
+        threading.Thread(target=pair_poller, args=(time.time() + 600,), daemon=True).start()
+        return 200, {"code": code, "bot": _tg["bot"],
+                     "link": f"https://t.me/{_tg['bot']}?start={code}", "expiresIn": 600}
+
+    if path == "/api/tg/pair/status":
+        code = str(payload.get("code", "")).strip().upper()
+        info = _pending.get(code)
+        if not info:
+            return 200, {"state": "expired"}
+        if info["chat"]:
+            return 200, {"state": "paired", "chat": info["chat"]}
+        return 200, {"state": "waiting", "left": int(900 - (time.time() - info["ts"]))}
+
+    if path == "/api/tg/unpair":
+        if not tg_admin_ok(payload):
+            return 403, {"error": "admin_key_required"}
+        cid = str(payload.get("id", ""))
+        with _tg_lock:
+            _tg["chats"] = [c for c in _tg["chats"] if c["id"] != cid]
+            tg_save()
+        return 200, {"ok": True, "chats": _tg["chats"]}
+
+    return 404, {"error": "not_found"}
+
+
 def notify_telegram(title, text):
-    if not (NOTIFY["tg_token"] and NOTIFY["tg_chat"]):
+    if not (_tg["token"] and _tg["chats"]):
         return None
-    url = f"https://api.telegram.org/bot{NOTIFY['tg_token']}/sendMessage"
-    data = urllib.parse.urlencode({
-        "chat_id": NOTIFY["tg_chat"], "text": f"{title}\n{text}"}).encode()
-    with urllib.request.urlopen(urllib.request.Request(url, data=data), timeout=20):
-        return "Telegram"
+    sent = 0
+    for c in list(_tg["chats"]):
+        try:
+            tg_api("sendMessage", {"chat_id": c["id"], "text": f"{title}\n{text}"}, timeout=20)
+            sent += 1
+        except Exception:
+            pass
+    return f"Telegram×{sent}" if sent else None
 
 
 def notify_discord(title, text):
@@ -217,6 +372,9 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
     # ── 路由 ──────────────────────────────────────────────
     def do_GET(self):
+        if self.path.split("?")[0].startswith("/api/tg/"):
+            code, body = tg_handle(self.path.split("?")[0], {})
+            return self.send_json(code, json.dumps(body, ensure_ascii=False).encode())
         for prefix in UPSTREAMS:
             if self.path.startswith(prefix + "/"):
                 return self.handle_proxy(prefix)
@@ -225,13 +383,18 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         return super().do_GET()
 
     def do_POST(self):
-        if self.path != "/api/notify":
-            return self.send_json(404, b'{"error":"not_found"}')
         try:
             n = int(self.headers.get("Content-Length", 0))
             payload = json.loads(self.rfile.read(n) or b"{}")
         except Exception:
             return self.send_json(400, b'{"error":"bad_json"}')
+
+        if self.path.startswith("/api/tg/"):
+            code, body = tg_handle(self.path, payload)
+            return self.send_json(code, json.dumps(body, ensure_ascii=False).encode())
+
+        if self.path != "/api/notify":
+            return self.send_json(404, b'{"error":"not_found"}')
         title = str(payload.get("title", "訊號提醒"))
         text = str(payload.get("text", ""))
         sent, failed = [], []
@@ -390,10 +553,14 @@ def main():
     print(f"  節流　每 {CFG['gap']} 秒最多一次上游請求，行情快取 {int(CACHE_TTL)} 秒、K 線 {int(OHLC_TTL/60)} 分鐘")
     print("  鏈上　/api/gt 轉發 GeckoTerminal、/api/gp 轉發 GoPlus，另用一組節流閘")
 
-    chans = [n for n, v in (("Telegram", NOTIFY["tg_token"] and NOTIFY["tg_chat"]),
+    tg_load()
+    chans = [n for n, v in (("Telegram", _tg["token"]),
                             ("Discord", NOTIFY["discord"]),
                             ("電子郵件", NOTIFY["smtp_host"] and NOTIFY["mail_to"])) if v]
-    print(f"  通知　{'、'.join(chans) if chans else '未設定，僅能用瀏覽器通知'}")
+    print(f"  通知　{'、'.join(chans) if chans else '未設定，僅能用瀏覽器通知'}"
+          + (f"　已配對 {len(_tg['chats'])} 個聊天室" if _tg["chats"] else ""))
+    if _tg["token"] and not _tg["chats"]:
+        print("        Bot 已設定但尚未配對，請到網頁的提醒設定按「開始配對」")
 
     ok = selftest()
 
