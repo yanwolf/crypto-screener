@@ -271,6 +271,153 @@ def tg_handle(path, payload):
     return 404, {"error": "not_found"}
 
 
+
+
+# ════════════════════════════════════════════════════════════
+#  背景訊號監控
+#  把前端的評分引擎搬到伺服器，網頁關掉後仍持續運作。
+#  觀察清單與門檻由網頁同步過來，存在磁碟。
+# ════════════════════════════════════════════════════════════
+try:
+    import engine
+except Exception:                       # 缺少 engine.py 時只停用監控，其他功能照常
+    engine = None
+
+MON = {"on": False, "watch": [], "cfg": None, "states": {},
+       "history": [], "lastRun": None, "lastCount": 0, "lastError": None}
+_mon_lock = threading.Lock()
+
+
+def mon_file():
+    return os.path.join(CACHE_DIR, "monitor.json")
+
+
+def mon_load():
+    try:
+        with open(mon_file(), "r") as f:
+            MON.update(json.load(f))
+    except Exception:
+        pass
+
+
+def mon_save():
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        with open(mon_file(), "w") as f:
+            json.dump({k: MON[k] for k in ("on", "watch", "cfg", "states", "history",
+                                           "lastRun", "lastCount")}, f)
+    except Exception:
+        pass
+
+
+def mon_fetch_json(path):
+    st, body = fetch_upstream(path)
+    if st != 200:
+        raise RuntimeError(f"上游回應 {st}")
+    return json.loads(body)
+
+
+def mon_run_once():
+    """跑一輪：抓行情 → 取歷史 → 評分 → 判斷訊號 → 發通知"""
+    if not (engine and MON["cfg"] and MON["watch"]):
+        return 0
+    ids = MON["watch"]
+    markets = mon_fetch_json(
+        "/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=250&page=1"
+        "&sparkline=false&price_change_percentage=24h,7d,30d&ids=" + ",".join(ids[:250]))
+    rows = []
+    for c in markets:
+        path = f"/coins/{c['id']}/market_chart?vs_currency=usd&days=90"
+        key = "/api/v3" + path
+        body = cache_get(key, 12 * 3600)
+        if body is None:
+            st, body = fetch_upstream(path)
+            if st != 200:
+                continue
+            cache_put(key, body)
+        try:
+            chart = json.loads(body)
+        except Exception:
+            continue
+        base = {
+            "id": c["id"], "sym": (c.get("symbol") or "").upper(), "name": c.get("name", ""),
+            "price": c.get("current_price"), "vol": c.get("total_volume") or 0,
+            "mcap": c.get("market_cap") or 0,
+            "m24": c.get("price_change_percentage_24h_in_currency"),
+            "m7": c.get("price_change_percentage_7d_in_currency"),
+            "m30": c.get("price_change_percentage_30d_in_currency"),
+        }
+        base["turn"] = (base["vol"] / base["mcap"] * 100) if base["mcap"] else None
+        try:
+            rows.append(engine.analyze(base, engine.extract_scan(chart, base["vol"])))
+        except Exception:
+            continue
+
+    now_ms = time.time() * 1000
+    events, states = engine.evaluate(rows, MON["cfg"], MON["states"], now_ms)
+    with _mon_lock:
+        MON["states"] = states
+        MON["lastRun"] = now_ms
+        MON["lastCount"] = len(rows)
+        if events:
+            MON["history"] = (events + MON["history"])[:400]
+        mon_save()
+
+    for e in events:
+        title, text = engine.alert_text(e)
+        for fn in (notify_telegram, notify_discord, notify_email):
+            try:
+                fn(title, text)
+            except Exception:
+                pass
+    if events:
+        sys.stderr.write(f"  ! 背景監控觸發 {len(events)} 則："
+                         f"{'、'.join(x['sym'] + '/' + x['side'] for x in events)}\n")
+    return len(events)
+
+
+def monitor_worker(interval_min):
+    time.sleep(8)
+    while True:
+        try:
+            if MON["on"]:
+                mon_run_once()
+                MON["lastError"] = None
+        except Exception as e:
+            MON["lastError"] = str(e)
+            sys.stderr.write(f"  ! 背景監控失敗：{e}\n")
+        time.sleep(max(60, interval_min * 60))
+
+
+def mon_handle(path, payload):
+    if path == "/api/monitor/status":
+        return 200, {"on": MON["on"], "watch": MON["watch"], "hasCfg": bool(MON["cfg"]),
+                     "lastRun": MON["lastRun"], "lastCount": MON["lastCount"],
+                     "lastError": MON["lastError"], "engine": bool(engine),
+                     "historyCount": len(MON["history"])}
+    if path == "/api/monitor/config":
+        if not tg_admin_ok(payload):
+            return 403, {"error": "admin_key_required"}
+        with _mon_lock:
+            if "watch" in payload:
+                MON["watch"] = [str(x) for x in payload["watch"]][:250]
+            if "cfg" in payload:
+                MON["cfg"] = payload["cfg"]
+            if "on" in payload:
+                MON["on"] = bool(payload["on"])
+            mon_save()
+        return 200, {"ok": True, "on": MON["on"], "watch": len(MON["watch"])}
+    if path == "/api/monitor/history":
+        return 200, {"history": MON["history"][:200]}
+    if path == "/api/monitor/run":
+        try:
+            n = mon_run_once()
+            return 200, {"ok": True, "fired": n, "checked": MON["lastCount"]}
+        except Exception as e:
+            return 500, {"error": str(e)}
+    return 404, {"error": "not_found"}
+
+
 def notify_telegram(title, text):
     if not (_tg["token"] and _tg["chats"]):
         return None
@@ -372,8 +519,12 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
     # ── 路由 ──────────────────────────────────────────────
     def do_GET(self):
-        if self.path.split("?")[0].startswith("/api/tg/"):
-            code, body = tg_handle(self.path.split("?")[0], {})
+        p = self.path.split("?")[0]
+        if p.startswith("/api/tg/"):
+            code, body = tg_handle(p, {})
+            return self.send_json(code, json.dumps(body, ensure_ascii=False).encode())
+        if p.startswith("/api/monitor/"):
+            code, body = mon_handle(p, {})
             return self.send_json(code, json.dumps(body, ensure_ascii=False).encode())
         for prefix in UPSTREAMS:
             if self.path.startswith(prefix + "/"):
@@ -391,6 +542,10 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
         if self.path.startswith("/api/tg/"):
             code, body = tg_handle(self.path, payload)
+            return self.send_json(code, json.dumps(body, ensure_ascii=False).encode())
+
+        if self.path.startswith("/api/monitor/"):
+            code, body = mon_handle(self.path, payload)
             return self.send_json(code, json.dumps(body, ensure_ascii=False).encode())
 
         if self.path != "/api/notify":
@@ -525,6 +680,8 @@ def main():
     ap.add_argument("--smtp-user", default=os.environ.get("SMTP_USER", ""))
     ap.add_argument("--smtp-pass", default=os.environ.get("SMTP_PASS", ""), help="建議用應用程式密碼")
     ap.add_argument("--mail-to", default=os.environ.get("MAIL_TO", ""), help="收件信箱")
+    ap.add_argument("--monitor-every", type=float, default=float(os.environ.get("MONITOR_EVERY", 5)),
+                    metavar="M", help="背景訊號監控的間隔分鐘數，預設 5（等同環境變數 MONITOR_EVERY）")
     ap.add_argument("--prefetch", type=int, default=int(os.environ.get("PREFETCH", 0)), metavar="N",
                     help="背景預抓市值前 N 檔的 90 日資料（等同環境變數 PREFETCH）")
     ap.add_argument("--prefetch-ttl", type=float, default=float(os.environ.get("PREFETCH_TTL", 12)),
@@ -554,6 +711,7 @@ def main():
     print("  鏈上　/api/gt 轉發 GeckoTerminal、/api/gp 轉發 GoPlus，另用一組節流閘")
 
     tg_load()
+    mon_load()
     chans = [n for n, v in (("Telegram", _tg["token"]),
                             ("Discord", NOTIFY["discord"]),
                             ("電子郵件", NOTIFY["smtp_host"] and NOTIFY["mail_to"])) if v]
@@ -563,6 +721,14 @@ def main():
         print("        Bot 已設定但尚未配對，請到網頁的提醒設定按「開始配對」")
 
     ok = selftest()
+
+    if engine is None:
+        print("  監控　找不到 engine.py，背景訊號監控停用")
+    else:
+        print(f"  監控　每 {args.monitor_every:.0f} 分鐘檢查一次"
+              + (f"，目前監控 {len(MON['watch'])} 檔，狀態：開啟" if MON["on"] and MON["watch"]
+                 else "，尚未從網頁同步設定"))
+        threading.Thread(target=monitor_worker, args=(args.monitor_every,), daemon=True).start()
 
     if args.prefetch:
         n_cached = len([f for f in os.listdir(CACHE_DIR)]) if os.path.isdir(CACHE_DIR) else 0
