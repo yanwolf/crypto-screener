@@ -646,6 +646,20 @@ const QUICK_BULL = [{
   desc: "市值 20 億以上、強過大盤、位置仍在高檔附近",
   test: r => r.mcap >= 2e9 && r.rs > 0 && r.d90 >= -12 && r.rvol7 >= 1.2
 }, {
+  id: "blade_long",
+  name: "三刀流多方攻擊",
+  need: true,
+  sort: "radar",
+  desc: "60 分 K 站上小綠與小橘、小藍正斜率，三把刀同方向往上",
+  test: r => r.bladeState === "attackLong"
+}, {
+  id: "blade_pull",
+  name: "多方回踩小綠",
+  need: true,
+  sort: "radar",
+  desc: "方向仍偏多，價格回到小綠附近，是三刀流較理想的進場位置",
+  test: r => (r.bladeState === "attackLong" || r.bladeState === "correction") && r.dGreen != null && r.dGreen > -2.5 && r.dGreen < 2.5
+}, {
   id: "hot",
   name: "高風險過熱幣",
   need: true,
@@ -679,6 +693,18 @@ const QUICK_BEAR = [{
   sort: "bear",
   desc: "市值 10 億美元以上、流動性足夠，但趨勢已經轉空",
   test: r => r.mcap >= 1e9 && r.bearStage !== "none" && r.liq >= 50
+}, {
+  id: "blade_short",
+  name: "三刀流空方攻擊",
+  sort: "bear",
+  desc: "60 分 K 跌破小綠與小橘、小藍負斜率，三把刀同方向往下",
+  test: r => r.bladeState === "attackShort"
+}, {
+  id: "blade_bounce",
+  name: "空方反彈到小綠",
+  sort: "bear",
+  desc: "空方架構下反彈到小綠附近，是三刀流的加空位置",
+  test: r => r.bladeState === "attackShort" && r.dGreen != null && r.dGreen > -2.5 && r.dGreen < 1
 }, {
   id: "oversold",
   name: "超跌勿追（警示）",
@@ -884,6 +910,103 @@ function pivots(bars, k = 3) {
   };
 }
 
+/* ════ 均線三刀流（60 分 K：20／60／240MA） ══════════════
+   240MA 小橘 劉備 — 決定方向，多空分水嶺
+   60MA  小綠 關羽 — 負責進出，站上做多、跌破做空
+   20MA  小藍 張飛 — 負責收尾，斜率翻負多單下車、翻正空單回補
+   ════════════════════════════════════════════════════════ */
+const BLADE = {
+  attackLong: {
+    label: "多方攻擊",
+    color: C.red,
+    short: "三刀多攻",
+    say: "站上小綠也站上小橘，小藍還是正斜率，三把刀同方向，多單續抱。"
+  },
+  takeLong: {
+    label: "多單停利",
+    color: C.gold,
+    short: "多單停利",
+    say: "還在小綠之上，但小藍斜率翻負——張飛在收尾了，多單該分批下車。"
+  },
+  correction: {
+    label: "修正",
+    color: C.violet,
+    short: "修正中",
+    say: "跌破小綠但沒破小橘，方向還是多方，這只是修正。等站回小綠再找多單，不要反手做空。"
+  },
+  rebound: {
+    label: "反彈",
+    color: C.teal,
+    short: "只是反彈",
+    say: "站上小綠但沒站上小橘，大方向仍偏空，這只是反彈。不要當成多頭起漲，空單可以先退但別急著翻多。"
+  },
+  attackShort: {
+    label: "空方攻擊",
+    color: C.green,
+    short: "三刀空攻",
+    say: "跌破小綠也跌破小橘，小藍負斜率，三把刀同方向往下，空單續抱。"
+  },
+  coverShort: {
+    label: "空單回補",
+    color: C.gold,
+    short: "空單回補",
+    say: "還在小綠之下，但小藍斜率翻正——反彈要來了，空單先回補。"
+  },
+  none: {
+    label: "未掃描",
+    color: C.muted,
+    short: "—",
+    say: "尚未取得 60 分 K 資料。"
+  }
+};
+
+/* 逐時價格 → 60 分 K 收盤序列 */
+function toHourly(chart) {
+  const m = new Map();
+  (chart.prices || []).forEach(([t, p]) => {
+    if (p != null) m.set(Math.floor(t / 3600000), p);
+  });
+  return [...m.entries()].sort((a, b) => a[0] - b[0]).map(x => x[1]);
+}
+function smaAt(a, n, back = 0) {
+  const end = a.length - back;
+  if (end < n) return null;
+  let s = 0;
+  for (let i = end - n; i < end; i++) s += a[i];
+  return s / n;
+}
+function blades(chart) {
+  const H = toHourly(chart);
+  if (H.length < 250) return {}; // 240MA 至少要 240 根 60 分 K
+  const price = H[H.length - 1];
+  const ma20 = smaAt(H, 20),
+    ma60 = smaAt(H, 60),
+    ma240 = smaAt(H, 240);
+  const ma20b = smaAt(H, 20, 3),
+    ma60b = smaAt(H, 60, 6),
+    ma240b = smaAt(H, 240, 12);
+  const slope20 = ma20b ? (ma20 - ma20b) / ma20b * 100 : 0; // 近 3 根的斜率
+  const slope60 = ma60b ? (ma60 - ma60b) / ma60b * 100 : 0;
+  const slope240 = ma240b ? (ma240 - ma240b) / ma240b * 100 : 0;
+  const aboveOrange = price > ma240,
+    aboveGreen = price > ma60;
+  const state = aboveOrange && aboveGreen ? slope20 >= 0 ? "attackLong" : "takeLong" : aboveOrange && !aboveGreen ? "correction" : !aboveOrange && aboveGreen ? "rebound" : slope20 <= 0 ? "attackShort" : "coverShort";
+  return {
+    ma20,
+    ma60,
+    ma240,
+    slope20,
+    slope60,
+    slope240,
+    bladeState: state,
+    dGreen: (price / ma60 - 1) * 100,
+    dOrange: (price / ma240 - 1) * 100,
+    dBlue: (price / ma20 - 1) * 100,
+    // 小綠與小橘距離太近代表均線糾結，這種盤三刀流勝率會下降
+    tangle: Math.abs(ma60 - ma240) / price * 100 < 0.6
+  };
+}
+
 /* 趨勢結構：EMA、樞紐、下跌波段、回撤位置、分段量能 */
 function structure(bars) {
   if (bars.length < 35) return {};
@@ -1002,6 +1125,7 @@ function extractScan(chart, curVol) {
   const vola = stdev(rets.slice(-30)) * Math.sqrt(365) * 100;
   return {
     ...structure(toDaily(chart)),
+    ...blades(chart),
     base7,
     base30,
     rvol7: now / base7,
@@ -1027,6 +1151,7 @@ function analyze(r, sc) {
     ...o,
     stage: "unknown",
     bearStage: "unknown",
+    bladeState: "none",
     radar: null,
     bear: null,
     liq: null,
@@ -1145,7 +1270,77 @@ function analyze(r, sc) {
   if (o.d90 > -3) bits.push("貼近 90 日高");
   if (o.liq < 35) bits.push("流動性偏薄");
   o.why = bits.slice(0, 3).join(" · ");
+  o.bladePlan = bladePlan(o);
   return analyzeBear(o);
+}
+
+/* 依三刀流狀態產出具體的進出場計畫 */
+function bladePlan(o) {
+  if (!o.bladeState || o.bladeState === "none") return null;
+  const p = o.price,
+    g = o.ma60,
+    r = o.ma240,
+    b = o.ma20;
+  const st = o.bladeState;
+  const near = x => Math.abs((p / x - 1) * 100);
+  if (st === "attackLong") {
+    return {
+      side: "多",
+      action: "續抱／回踩小綠加碼",
+      entry: `回踩小綠 ${fmtPrice(g)} 附近不破就進場${near(g) < 1.5 ? "（現價已貼近小綠，是相對好的位置）" : `（現價高出小綠 ${o.dGreen.toFixed(1)}%，追進去成本偏高）`}`,
+      exit: `小藍 ${fmtPrice(b)} 斜率翻負就分批下車`,
+      stop: `跌破小橘 ${fmtPrice(r)} 代表方向錯了，全部出場`,
+      note: near(g) > 4 ? "離小綠太遠，這個位置追多的風險報酬不划算，等回踩。" : null
+    };
+  }
+  if (st === "takeLong") {
+    return {
+      side: "多",
+      action: "停利，不加碼",
+      entry: "不再新增多單",
+      exit: `小藍 ${fmtPrice(b)} 已翻負斜率，張飛在收尾，分批獲利了結`,
+      stop: `跌破小綠 ${fmtPrice(g)} 剩餘部位出清`,
+      note: "小藍轉負只是停利訊號，不是反手做空的訊號。"
+    };
+  }
+  if (st === "correction") {
+    return {
+      side: "觀望",
+      action: "等站回小綠",
+      entry: `站回小綠 ${fmtPrice(g)} 之上再進多單`,
+      exit: "—",
+      stop: `跌破小橘 ${fmtPrice(r)} 才改看空`,
+      note: "破綠不破橘叫修正，方向沒變。這裡反手做空是逆勢，勝率低。"
+    };
+  }
+  if (st === "rebound") {
+    return {
+      side: "觀望",
+      action: "不追多，等表態",
+      entry: `站上小橘 ${fmtPrice(r)} 且站穩，才考慮轉多`,
+      exit: "空單先退場觀望",
+      stop: "—",
+      note: "上綠不上橘叫反彈，大方向還在空方。這裡追多最容易被套在反彈末端。"
+    };
+  }
+  if (st === "attackShort") {
+    return {
+      side: "空",
+      action: "續抱／反彈到小綠加空",
+      entry: `反彈到小綠 ${fmtPrice(g)} 附近不站上就進場${near(g) < 1.5 ? "（現價已貼近小綠，位置理想）" : `（現價低於小綠 ${Math.abs(o.dGreen).toFixed(1)}%，追空成本偏高）`}`,
+      exit: `小藍 ${fmtPrice(b)} 斜率翻正就分批回補`,
+      stop: `站上小橘 ${fmtPrice(r)} 代表方向錯了，全部出場`,
+      note: near(g) > 4 ? "離小綠太遠，這個位置追空容易被反彈軋到，等反彈。" : null
+    };
+  }
+  return {
+    side: "空",
+    action: "回補，不加空",
+    entry: "不再新增空單",
+    exit: `小藍 ${fmtPrice(b)} 已翻正斜率，反彈將至，空單回補`,
+    stop: `站上小綠 ${fmtPrice(g)} 剩餘空單出清`,
+    note: "小藍轉正只是回補訊號，不代表可以直接翻多。"
+  };
 }
 
 /* ════ 空頭雷達評分 ══════════════════════════════════════ */
@@ -1331,14 +1526,16 @@ const DEFAULT_ALERT = {
     minRvol: 2,
     minLiq: 50,
     maxChase: 70,
-    minRadar: 65
+    minRadar: 65,
+    requireBlade: true
   },
   bear: {
     minStruct: 75,
     maxVolRatio: 0.8,
     minLiq: 50,
     maxStopPct: 12,
-    minBear: 60
+    minBear: 60,
+    requireBlade: true
   },
   ch: {
     browser: true,
@@ -1353,6 +1550,7 @@ const DEFAULT_ALERT = {
 /* ════ 提醒條件檢查 ══════════════════════════════════════ */
 function bullGate(r, c) {
   const checks = [["量能放大", r.rvol7 >= c.minRvol, `量能 ${fmtX(r.rvol7)}，門檻 ${c.minRvol}x`], ["價格走強", (r.m24 ?? 0) > 0 && (r.pcTag === "價漲量增" || r.brk20), `${r.pcTag}${r.brk20 ? " · 站上 20 日新高" : ""}`], ["流動性合格", (r.liq ?? 0) >= c.minLiq, `流動性 ${(r.liq ?? 0).toFixed(0)}，門檻 ${c.minLiq}`], ["追高風險可控", (r.riskChase ?? 100) <= c.maxChase, `追高風險 ${(r.riskChase ?? 0).toFixed(0)}，上限 ${c.maxChase}`], ["雷達分數達標", (r.radar ?? 0) >= c.minRadar, `雷達分數 ${(r.radar ?? 0).toFixed(0)}，門檻 ${c.minRadar}`]];
+  if (c.requireBlade) checks.push(["三刀流站上綠橘", r.bladeState === "attackLong" || r.bladeState === "takeLong", `三刀流 ${(BLADE[r.bladeState] || BLADE.none).label}`]);
   return {
     pass: checks.every(x => x[1]),
     checks,
@@ -1362,6 +1560,7 @@ function bullGate(r, c) {
 function bearGate(r, c) {
   const rebFail = r.bearStage === "rebound" ? r.volRatio != null && r.volRatio < c.maxVolRatio : r.bearStage === "drop" && r.volExpand >= 1.1;
   const checks = [["趨勢向下", (r.structScore ?? 0) >= c.minStruct, `空頭結構 ${(r.structScore ?? 0).toFixed(0)}/100`], ["反彈失敗或賣壓延續", rebFail, r.bearStage === "rebound" ? `反彈量僅下跌量的 ${(r.volRatio != null ? r.volRatio * 100 : 0).toFixed(0)}%` : `下跌量能 ${(r.volExpand ?? 0).toFixed(2)} 倍`], ["流動性合格", (r.liq ?? 0) >= c.minLiq, `流動性 ${(r.liq ?? 0).toFixed(0)}，門檻 ${c.minLiq}`], ["止損位置清晰", r.stop != null && r.stopPct != null && r.stopPct <= c.maxStopPct, r.stopPct != null ? `止損距入場 ${r.stopPct.toFixed(1)}%，上限 ${c.maxStopPct}%` : "無有效止損位"], ["空頭評分達標", (r.bear ?? 0) >= c.minBear, `空頭評分 ${(r.bear ?? 0).toFixed(0)}，門檻 ${c.minBear}`]];
+  if (c.requireBlade) checks.push(["三刀流跌破綠橘", r.bladeState === "attackShort" || r.bladeState === "coverShort", `三刀流 ${(BLADE[r.bladeState] || BLADE.none).label}`]);
   return {
     pass: checks.every(x => x[1]),
     checks,
@@ -2171,6 +2370,22 @@ function BearMap({
     }
   }, "量比低於 1 代表反彈的量比下跌時小")));
 }
+function BladeTag({
+  state,
+  tangle
+}) {
+  const b = BLADE[state] || BLADE.none;
+  return /*#__PURE__*/React.createElement("span", {
+    className: "px-1.5 py-0.5 rounded whitespace-nowrap",
+    style: {
+      fontSize: 11,
+      color: b.color,
+      border: `1px solid ${b.color}`,
+      opacity: state === "none" ? 0.5 : 1
+    },
+    title: b.say
+  }, b.label, tangle ? " ·糾結" : "");
+}
 function RiskTag({
   r
 }) {
@@ -2708,6 +2923,9 @@ function CoinCard({
     stage: r.stage
   }) : /*#__PURE__*/React.createElement(BearTag, {
     stage: r.bearStage
+  }), /*#__PURE__*/React.createElement(BladeTag, {
+    state: r.bladeState || "none",
+    tangle: r.tangle
   }), /*#__PURE__*/React.createElement("div", {
     className: "flex-1 h-1.5 rounded-sm",
     style: {
@@ -2750,7 +2968,11 @@ function CoinCard({
     style: {
       color: C.bone
     }
-  }, r.liq == null ? "—" : r.liq.toFixed(0)))) : /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("span", null, "距 EMA20 ", /*#__PURE__*/React.createElement("span", {
+  }, r.liq == null ? "—" : r.liq.toFixed(0))), /*#__PURE__*/React.createElement("span", null, "距小綠 ", /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: r.dGreen == null ? C.muted : r.dGreen > 0 ? UP : DOWN
+    }
+  }, r.dGreen == null ? "—" : fmtPct(r.dGreen)))) : /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("span", null, "距 EMA20 ", /*#__PURE__*/React.createElement("span", {
     style: {
       color: tone(r.distEma)
     }
@@ -3716,6 +3938,9 @@ function CryptoScreener() {
     k: "stage",
     t: "階段"
   }, {
+    k: "bladeState",
+    t: "三刀流"
+  }, {
     k: "d90",
     t: "90 日位置"
   }, {
@@ -3774,6 +3999,12 @@ function CryptoScreener() {
     k: "liq",
     t: "流動性"
   }, {
+    k: "bladeState",
+    t: "三刀流"
+  }, {
+    k: "dGreen",
+    t: "距小綠"
+  }, {
     k: "spark",
     t: "7 日"
   }, {
@@ -3801,6 +4032,9 @@ function CryptoScreener() {
   }, {
     k: "bearStage",
     t: "階段"
+  }, {
+    k: "bladeState",
+    t: "三刀流"
   }, {
     k: "distEma",
     t: "距 EMA20"
@@ -3839,7 +4073,7 @@ function CryptoScreener() {
     t: "白話解讀"
   }];
   const COLS = side === "bear" ? COLS_BEAR : view === "radar" ? COLS_RADAR : COLS_FULL;
-  const noSort = new Set(["star", "name", "spark", "why", "pcTag", "stage", "bearStage", "bearWhy", "resistance"]);
+  const noSort = new Set(["star", "name", "spark", "why", "pcTag", "stage", "bearStage", "bearWhy", "resistance", "bladeState"]);
   const cell = (r, k) => {
     switch (k) {
       case "star":
@@ -3917,6 +4151,18 @@ function CryptoScreener() {
         return /*#__PURE__*/React.createElement(StageTag, {
           stage: r.stage
         });
+      case "bladeState":
+        return /*#__PURE__*/React.createElement(BladeTag, {
+          state: r.bladeState || "none",
+          tangle: r.tangle
+        });
+      case "dGreen":
+        return /*#__PURE__*/React.createElement("span", {
+          style: {
+            fontFamily: FONT.data,
+            color: r.dGreen == null ? C.muted : r.dGreen > 0 ? UP : DOWN
+          }
+        }, r.dGreen == null ? "—" : fmtPct(r.dGreen));
       case "d90":
         return /*#__PURE__*/React.createElement(RangeBar, {
           low: r.l90,
@@ -5865,7 +6111,30 @@ function CryptoScreener() {
       margin: "4px 0 8px",
       lineHeight: 1.7
     }
-  }, "量能放大、價格走強、流動性合格、追高風險不過高，四項缺一不可，再加上雷達分數門檻。"), [["minRvol", "量能倍數至少", 1, 6, 0.5, "x"], ["minRadar", "雷達分數至少", 40, 95, 5, ""], ["minLiq", "流動性至少", 20, 90, 5, ""], ["maxChase", "追高風險上限", 30, 100, 5, ""]].map(([k, lab, lo, hi, st, unit]) => /*#__PURE__*/React.createElement("div", {
+  }, "量能放大、價格走強、流動性合格、追高風險不過高，四項缺一不可，再加上雷達分數門檻。"), /*#__PURE__*/React.createElement("label", {
+    className: "flex items-center gap-1.5 cursor-pointer mb-2",
+    style: {
+      fontSize: 12
+    }
+  }, /*#__PURE__*/React.createElement("input", {
+    type: "checkbox",
+    checked: alertCfg.bull.requireBlade,
+    style: {
+      accentColor: UP
+    },
+    onChange: e => setAlertCfg({
+      ...alertCfg,
+      bull: {
+        ...alertCfg.bull,
+        requireBlade: e.target.checked
+      }
+    })
+  }), "另需三刀流站上小綠與小橘", /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: C.muted,
+      fontSize: 11
+    }
+  }, "60 分 K 方向確認，避免逆勢進場")), [["minRvol", "量能倍數至少", 1, 6, 0.5, "x"], ["minRadar", "雷達分數至少", 40, 95, 5, ""], ["minLiq", "流動性至少", 20, 90, 5, ""], ["maxChase", "追高風險上限", 30, 100, 5, ""]].map(([k, lab, lo, hi, st, unit]) => /*#__PURE__*/React.createElement("div", {
     key: k,
     className: "flex items-center gap-2.5 mb-1.5"
   }, /*#__PURE__*/React.createElement("span", {
@@ -5917,7 +6186,30 @@ function CryptoScreener() {
       margin: "4px 0 8px",
       lineHeight: 1.7
     }
-  }, "趨勢向下、反彈失敗或賣壓延續、流動性合格、止損位置清晰，四項缺一不可，再加上空頭評分門檻。"), [["minStruct", "空頭結構至少", 50, 100, 5, ""], ["maxVolRatio", "反彈量比上限", 0.4, 1, 0.05, "x"], ["minLiq", "流動性至少", 20, 90, 5, ""], ["maxStopPct", "止損距離上限", 4, 25, 1, "%"], ["minBear", "空頭評分至少", 40, 95, 5, ""]].map(([k, lab, lo, hi, st, unit]) => /*#__PURE__*/React.createElement("div", {
+  }, "趨勢向下、反彈失敗或賣壓延續、流動性合格、止損位置清晰，四項缺一不可，再加上空頭評分門檻。"), /*#__PURE__*/React.createElement("label", {
+    className: "flex items-center gap-1.5 cursor-pointer mb-2",
+    style: {
+      fontSize: 12
+    }
+  }, /*#__PURE__*/React.createElement("input", {
+    type: "checkbox",
+    checked: alertCfg.bear.requireBlade,
+    style: {
+      accentColor: DOWN
+    },
+    onChange: e => setAlertCfg({
+      ...alertCfg,
+      bear: {
+        ...alertCfg.bear,
+        requireBlade: e.target.checked
+      }
+    })
+  }), "另需三刀流跌破小綠與小橘", /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: C.muted,
+      fontSize: 11
+    }
+  }, "60 分 K 方向確認")), [["minStruct", "空頭結構至少", 50, 100, 5, ""], ["maxVolRatio", "反彈量比上限", 0.4, 1, 0.05, "x"], ["minLiq", "流動性至少", 20, 90, 5, ""], ["maxStopPct", "止損距離上限", 4, 25, 1, "%"], ["minBear", "空頭評分至少", 40, 95, 5, ""]].map(([k, lab, lo, hi, st, unit]) => /*#__PURE__*/React.createElement("div", {
     key: k,
     className: "flex items-center gap-2.5 mb-1.5"
   }, /*#__PURE__*/React.createElement("span", {
@@ -6819,7 +7111,105 @@ function CryptoScreener() {
     style: {
       color: C.muted
     }
-  }, "量能百分位 "), detail.volPct.toFixed(0))))), detail.scanned && detail.bearStage !== "none" && detail.bearStage !== "unknown" && /*#__PURE__*/React.createElement("div", {
+  }, "量能百分位 "), detail.volPct.toFixed(0))))), detail.scanned && detail.bladeState && detail.bladeState !== "none" && /*#__PURE__*/React.createElement("div", {
+    className: "mt-3 rounded p-3",
+    style: {
+      background: C.panel2,
+      border: `1px solid ${BLADE[detail.bladeState].color}`
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "flex flex-wrap items-center gap-2 mb-2"
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontFamily: FONT.display,
+      fontSize: 15
+    }
+  }, "均線三刀流"), /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 10.5,
+      color: C.muted
+    }
+  }, "60 分 K"), /*#__PURE__*/React.createElement(BladeTag, {
+    state: detail.bladeState,
+    tangle: detail.tangle
+  })), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12.5,
+      lineHeight: 1.8,
+      marginBottom: 8
+    }
+  }, BLADE[detail.bladeState].say), /*#__PURE__*/React.createElement("div", {
+    className: "grid gap-1.5 mb-2"
+  }, [["小橘 240MA", detail.ma240, detail.dOrange, detail.slope240, "劉備 · 決定方向", "#E08A3C"], ["小綠 60MA", detail.ma60, detail.dGreen, detail.slope60, "關羽 · 負責進出", C.green], ["小藍 20MA", detail.ma20, detail.dBlue, detail.slope20, "張飛 · 負責收尾", C.teal]].map(([lab, v, d, sl, role, col]) => /*#__PURE__*/React.createElement("div", {
+    key: lab,
+    className: "flex items-center gap-2",
+    style: {
+      fontSize: 12
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: col,
+      width: 82
+    }
+  }, lab), /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontFamily: FONT.data,
+      width: 82
+    }
+  }, fmtPrice(v)), /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontFamily: FONT.data,
+      color: d > 0 ? UP : DOWN,
+      width: 62
+    }
+  }, fmtPct(d)), /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontFamily: FONT.data,
+      fontSize: 11,
+      color: sl > 0 ? UP : sl < 0 ? DOWN : C.muted,
+      width: 68
+    }
+  }, "斜率 ", sl > 0 ? "正" : sl < 0 ? "負" : "平"), /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 10.5,
+      color: C.muted
+    }
+  }, role)))), detail.tangle && /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11.5,
+      color: C.gold,
+      lineHeight: 1.7,
+      marginBottom: 6
+    }
+  }, "小綠與小橘距離不到 0.6%，均線糾結。這種盤三刀流會反覆假訊號，建議等均線拉開再操作。"), detail.bladePlan && /*#__PURE__*/React.createElement("div", {
+    className: "rounded p-2.5",
+    style: {
+      background: C.panel,
+      fontSize: 12,
+      lineHeight: 1.9
+    }
+  }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: C.gold
+    }
+  }, "建議動作\u3000"), detail.bladePlan.side, "\u3000", detail.bladePlan.action), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: C.teal
+    }
+  }, "進場參考\u3000"), detail.bladePlan.entry), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: C.gold
+    }
+  }, "出場條件\u3000"), detail.bladePlan.exit), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: C.red
+    }
+  }, "停損參考\u3000"), detail.bladePlan.stop), detail.bladePlan.note && /*#__PURE__*/React.createElement("div", {
+    style: {
+      color: C.muted,
+      marginTop: 4
+    }
+  }, detail.bladePlan.note))), detail.scanned && detail.bearStage !== "none" && detail.bearStage !== "unknown" && /*#__PURE__*/React.createElement("div", {
     className: "mt-3 rounded p-3",
     style: {
       background: "#1B1416",

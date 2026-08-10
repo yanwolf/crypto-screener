@@ -171,6 +171,61 @@ def structure(bars):
     }
 
 
+
+# ── 均線三刀流（60 分 K：20／60／240MA） ────────────────────
+# 240MA 小橘 決定方向 / 60MA 小綠 負責進出 / 20MA 小藍 負責收尾
+BLADE_LABEL = {"attackLong": "多方攻擊", "takeLong": "多單停利", "correction": "修正",
+               "rebound": "反彈", "attackShort": "空方攻擊", "coverShort": "空單回補",
+               "none": "未掃描"}
+
+
+def to_hourly(chart):
+    m = {}
+    for t, p in chart.get("prices", []):
+        if p is not None:
+            m[int(t // 3600000)] = p
+    return [m[k] for k in sorted(m)]
+
+
+def sma_at(a, n, back=0):
+    end = len(a) - back
+    if end < n:
+        return None
+    return sum(a[end - n:end]) / n
+
+
+def blades(chart):
+    H = to_hourly(chart)
+    if len(H) < 250:
+        return {}
+    price = H[-1]
+    ma20, ma60, ma240 = sma_at(H, 20), sma_at(H, 60), sma_at(H, 240)
+    ma20b, ma60b, ma240b = sma_at(H, 20, 3), sma_at(H, 60, 6), sma_at(H, 240, 12)
+    slope20 = ((ma20 - ma20b) / ma20b * 100) if ma20b else 0.0
+    slope60 = ((ma60 - ma60b) / ma60b * 100) if ma60b else 0.0
+    slope240 = ((ma240 - ma240b) / ma240b * 100) if ma240b else 0.0
+
+    above_orange, above_green = price > ma240, price > ma60
+    if above_orange and above_green:
+        state = "attackLong" if slope20 >= 0 else "takeLong"
+    elif above_orange:
+        state = "correction"
+    elif above_green:
+        state = "rebound"
+    else:
+        state = "attackShort" if slope20 <= 0 else "coverShort"
+
+    return {
+        "ma20": ma20, "ma60": ma60, "ma240": ma240,
+        "slope20": slope20, "slope60": slope60, "slope240": slope240,
+        "bladeState": state,
+        "dGreen": (price / ma60 - 1) * 100,
+        "dOrange": (price / ma240 - 1) * 100,
+        "dBlue": (price / ma20 - 1) * 100,
+        "tangle": abs(ma60 - ma240) / price * 100 < 0.6,
+    }
+
+
 def extract_scan(chart, cur_vol=None):
     P = [p for _, p in chart.get("prices", []) if p is not None]
     V = [v for _, v in chart.get("total_volumes", []) if v is not None]
@@ -200,6 +255,7 @@ def extract_scan(chart, cur_vol=None):
     vola = stdev(rets[-30:]) * math.sqrt(365) * 100
 
     out = dict(structure(to_daily(chart)))
+    out.update(blades(chart))
     out.update({
         "base7": base7, "base30": base30, "rvol7": now / base7, "rvol30": now / base30,
         "volPct": vol_pct, "volCV": vol_cv, "h90": max(P), "l90": min(P),
@@ -378,6 +434,10 @@ def bull_gate(r, c):
         ("雷達分數達標", (r.get("radar") or 0) >= c["minRadar"],
          f"雷達分數 {(r.get('radar') or 0):.0f}，門檻 {c['minRadar']}"),
     ]
+    if c.get("requireBlade"):
+        checks.append(("三刀流站上綠橘",
+                       r.get("bladeState") in ("attackLong", "takeLong"),
+                       f"三刀流 {BLADE_LABEL.get(r.get('bladeState'), '未知')}"))
     return all(x[1] for x in checks), checks, (r.get("radar") or 0)
 
 
@@ -396,6 +456,10 @@ def bear_gate(r, c):
          f"止損距入場 {r['stopPct']:.1f}%，上限 {c['maxStopPct']}%" if r.get("stopPct") is not None else "無有效止損位"),
         ("空頭評分達標", (r.get("bear") or 0) >= c["minBear"], f"空頭評分 {(r.get('bear') or 0):.0f}，門檻 {c['minBear']}"),
     ]
+    if c.get("requireBlade"):
+        checks.append(("三刀流跌破綠橘",
+                       r.get("bladeState") in ("attackShort", "coverShort"),
+                       f"三刀流 {BLADE_LABEL.get(r.get('bladeState'), '未知')}"))
     return all(x[1] for x in checks), checks, (r.get("bear") or 0)
 
 
@@ -453,6 +517,10 @@ def evaluate(rows, cfg, states, now_ms):
                 "stage": STAGE_LABEL.get(r.get("stage"), "") if side == "bull"
                          else BEAR_LABEL.get(r.get("bearStage"), ""),
                 "checks": [c[2] for c in checks],
+                "blade": ({"state": r.get("bladeState"), "ma20": r.get("ma20"),
+                           "ma60": r.get("ma60"), "ma240": r.get("ma240"),
+                           "dGreen": r.get("dGreen"), "slope20": r.get("slope20")}
+                          if r.get("bladeState") else None),
                 "entryLo": r.get("entryLo"), "entryHi": r.get("entryHi"), "stop": r.get("stop"),
                 "firstTs": nxt[key]["firstTs"], "firstPrice": nxt[key]["firstPrice"],
                 "firstScore": nxt[key]["firstScore"],
@@ -481,6 +549,11 @@ def alert_text(e):
         f"階段：{e['stage']}　評分：{e['score']:.0f}",
         *["· " + c for c in e["checks"]],
     ]
+    if e.get("blade"):
+        b = e["blade"]
+        lines.append(f"三刀流：{BLADE_LABEL.get(b['state'], '')}　"
+                     f"小綠 {fmt_price(b['ma60'])}　小橘 {fmt_price(b['ma240'])}　小藍 {fmt_price(b['ma20'])}")
+        lines.append(f"　距小綠 {b['dGreen']:+.1f}%　小藍斜率{'正' if b['slope20'] >= 0 else '負'}")
     if e.get("entryLo"):
         lines.append(f"參考區間：{fmt_price(e['entryLo'])}–{fmt_price(e['entryHi'])}　止損：{fmt_price(e['stop'])}")
     if e["type"] != "first":
