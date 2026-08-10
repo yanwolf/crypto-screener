@@ -2844,7 +2844,7 @@ function CryptoScreener() {
   const [notifyLog, setNotifyLog] = useState([]);
   const [tg, setTg] = useState(null); // 伺服器端的 Telegram 狀態
   const [tgToken, setTgToken] = useState("");
-  const [tgAdmin, setTgAdmin] = useState("");
+  const [tgAdmin, setTgAdmin] = useState(() => store.get("adminKey", ""));
   const [tgMsg, setTgMsg] = useState(null);
   const [pair, setPair] = useState(null); // {code, link, state, left}
   const [mon, setMon] = useState(null); // 伺服器背景監控狀態
@@ -2873,6 +2873,9 @@ function CryptoScreener() {
   useEffect(() => {
     store.set("scanTTL", scanTTL);
   }, [scanTTL]);
+  useEffect(() => {
+    store.set("adminKey", tgAdmin);
+  }, [tgAdmin]);
   const saveTimer = useRef(null);
   const scansRef = useRef(scans);
   const srcRef = useRef(source);
@@ -3255,7 +3258,7 @@ function CryptoScreener() {
     if (j.ok) {
       setMonMsg(["ok", on ? `已同步 ${j.watch} 檔並開啟背景監控` : "已停止背景監控"]);
       monRefresh();
-    } else setMonMsg(["err", j.error === "admin_key_required" ? "需要管理金鑰" : "同步失敗：" + j.error]);
+    } else setMonMsg(["err", j.error === "admin_key_required" ? "管理金鑰不正確或未填。請在下方欄位輸入 Zeabur 環境變數 ADMIN_KEY 的值。" : "同步失敗：" + j.error]);
   }, [watch, alertCfg, tgAdmin, tgCall, monRefresh]);
 
   /* ── 訊號評估：資料一更新就跑，狀態機負責去重 ── */
@@ -5728,7 +5731,32 @@ function CryptoScreener() {
       fontSize: 11.5,
       color: C.gold
     }
-  }, "觀察清單是空的，先去雷達頁加星號")), /*#__PURE__*/React.createElement("div", {
+  }, "觀察清單是空的，先去雷達頁加星號")), (mon.adminRequired || tg && tg.adminRequired) && /*#__PURE__*/React.createElement("div", {
+    className: "flex flex-wrap items-center gap-2 mt-2.5"
+  }, /*#__PURE__*/React.createElement("input", {
+    value: tgAdmin,
+    onChange: e => setTgAdmin(e.target.value),
+    type: "password",
+    placeholder: "管理金鑰",
+    className: "px-2 py-1.5 rounded",
+    style: {
+      background: C.panel2,
+      border: `1px solid ${tgAdmin ? C.line : C.gold}`,
+      color: C.bone,
+      fontSize: 12,
+      width: 180
+    }
+  }), /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 11,
+      color: C.muted,
+      lineHeight: 1.7
+    }
+  }, "這是你在 Zeabur 的 Variables 裡設定的 ", /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontFamily: FONT.data
+    }
+  }, "ADMIN_KEY"), "。 填一次就會記住。不想要的話，把那個環境變數刪掉再重新部署即可。")), /*#__PURE__*/React.createElement("div", {
     style: {
       fontSize: 11.5,
       color: C.muted,

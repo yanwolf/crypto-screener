@@ -394,7 +394,8 @@ def mon_handle(path, payload):
         return 200, {"on": MON["on"], "watch": MON["watch"], "hasCfg": bool(MON["cfg"]),
                      "lastRun": MON["lastRun"], "lastCount": MON["lastCount"],
                      "lastError": MON["lastError"], "engine": bool(engine),
-                     "historyCount": len(MON["history"])}
+                     "historyCount": len(MON["history"]),
+                     "adminRequired": bool(os.environ.get("ADMIN_KEY", "").strip())}
     if path == "/api/monitor/config":
         if not tg_admin_ok(payload):
             return 403, {"error": "admin_key_required"}
