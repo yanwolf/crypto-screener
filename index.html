@@ -2849,6 +2849,8 @@ function CryptoScreener() {
   const [pair, setPair] = useState(null); // {code, link, state, left}
   const [mon, setMon] = useState(null); // 伺服器背景監控狀態
   const [monMsg, setMonMsg] = useState(null);
+  const [monScope, setMonScope] = useState(() => store.get("monScope", "watch"));
+  const [monTopN, setMonTopN] = useState(() => store.get("monTopN", 100));
   const [srvHistory, setSrvHistory] = useState([]);
   const [lastEval, setLastEval] = useState(null);
   const [sortKey, setSortKey] = useState("radar");
@@ -2876,6 +2878,12 @@ function CryptoScreener() {
   useEffect(() => {
     store.set("adminKey", tgAdmin);
   }, [tgAdmin]);
+  useEffect(() => {
+    store.set("monScope", monScope);
+  }, [monScope]);
+  useEffect(() => {
+    store.set("monTopN", monTopN);
+  }, [monTopN]);
   const saveTimer = useRef(null);
   const scansRef = useRef(scans);
   const srcRef = useRef(source);
@@ -3245,6 +3253,8 @@ function CryptoScreener() {
     setMonMsg(null);
     const j = await tgCall("/api/monitor/config", {
       watch,
+      scope: monScope,
+      topN: monTopN,
       cfg: {
         bull: alertCfg.bull,
         bear: alertCfg.bear,
@@ -3256,10 +3266,10 @@ function CryptoScreener() {
       admin: tgAdmin.trim()
     });
     if (j.ok) {
-      setMonMsg(["ok", on ? `已同步 ${j.watch} 檔並開啟背景監控` : "已停止背景監控"]);
+      setMonMsg(["ok", on ? `已同步並啟動，監控範圍：${j.scope === "top" ? `市值前 ${j.topN} 檔` : `觀察清單 ${j.watch} 檔`}` : "已停止背景監控"]);
       monRefresh();
     } else setMonMsg(["err", j.error === "admin_key_required" ? "管理金鑰不正確或未填。請在下方欄位輸入 Zeabur 環境變數 ADMIN_KEY 的值。" : "同步失敗：" + j.error]);
-  }, [watch, alertCfg, tgAdmin, tgCall, monRefresh]);
+  }, [watch, alertCfg, tgAdmin, tgCall, monRefresh, monScope, monTopN]);
 
   /* ── 訊號評估：資料一更新就跑，狀態機負責去重 ── */
   const engineRef = useRef({});
@@ -5681,7 +5691,7 @@ function CryptoScreener() {
       fontSize: 11.5,
       color: mon.on ? C.teal : C.muted
     }
-  }, mon.on ? `運作中　監控 ${mon.watch.length} 檔` : "尚未啟動", mon.lastRun ? `　上次檢查 ${new Date(mon.lastRun).toLocaleTimeString("zh-TW")}（${mon.lastCount} 檔）` : "")), /*#__PURE__*/React.createElement("p", {
+  }, mon.on ? `運作中　${mon.scope === "top" ? `市值前 ${mon.topN} 檔` : `觀察清單 ${mon.watch.length} 檔`}` : "尚未啟動", mon.lastRun ? `　上次檢查 ${new Date(mon.lastRun).toLocaleTimeString("zh-TW")}（${mon.lastCount} 檔）` : "")), /*#__PURE__*/React.createElement("p", {
     style: {
       fontSize: 11.5,
       color: C.muted,
@@ -5692,14 +5702,69 @@ function CryptoScreener() {
       color: C.bone
     }
   }, "手機關掉、App 關掉都照常運作"), "。 伺服器用的是與網頁完全相同的評分公式，所以推播的分數和你在畫面上看到的一致。"), local && mon && mon.engine && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
-    className: "flex flex-wrap items-center gap-2 mt-3"
+    className: "flex flex-wrap items-center gap-2 mt-3",
+    style: {
+      fontSize: 12
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: C.muted
+    }
+  }, "伺服器監控範圍"), /*#__PURE__*/React.createElement("select", {
+    value: monScope,
+    onChange: e => setMonScope(e.target.value),
+    className: "px-2 py-1 rounded",
+    style: {
+      background: C.panel2,
+      border: `1px solid ${C.line}`,
+      color: C.bone
+    }
+  }, /*#__PURE__*/React.createElement("option", {
+    value: "watch"
+  }, "觀察清單（", watch.length, " 檔）"), /*#__PURE__*/React.createElement("option", {
+    value: "top"
+  }, "市值前 N 檔")), monScope === "top" && /*#__PURE__*/React.createElement("select", {
+    value: monTopN,
+    onChange: e => setMonTopN(+e.target.value),
+    className: "px-2 py-1 rounded",
+    style: {
+      background: C.panel2,
+      border: `1px solid ${C.line}`,
+      color: C.bone
+    }
+  }, /*#__PURE__*/React.createElement("option", {
+    value: 50
+  }, "前 50"), /*#__PURE__*/React.createElement("option", {
+    value: 100
+  }, "前 100"), /*#__PURE__*/React.createElement("option", {
+    value: 150
+  }, "前 150"), /*#__PURE__*/React.createElement("option", {
+    value: 250
+  }, "前 250"))), alertCfg.scope === "scanned" && monScope === "watch" && /*#__PURE__*/React.createElement("div", {
+    className: "mt-2 px-2.5 py-2 rounded",
+    style: {
+      background: "#241A1A",
+      border: `1px solid ${C.gold}`,
+      fontSize: 11.5,
+      lineHeight: 1.8
+    }
+  }, "上面的「訊號監控」範圍選了", /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: C.bone
+    }
+  }, "全部已掃描的幣"), "，但伺服器這裡是觀察清單，兩邊監控的標的不一樣。 「已掃描」是瀏覽器端的概念，伺服器有自己的快取，無法對應同一批幣，所以伺服器改用", /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: C.bone
+    }
+  }, "市值前 N 檔"), "來表達「全部」。 要讓兩邊一致，請把這裡改成「市值前 N 檔」。"), /*#__PURE__*/React.createElement("div", {
+    className: "flex flex-wrap items-center gap-2 mt-2"
   }, /*#__PURE__*/React.createElement("button", {
     onClick: () => monSync(true),
-    disabled: !watch.length,
+    disabled: monScope === "watch" && !watch.length,
     className: "px-3 py-1.5 rounded",
     style: {
-      background: watch.length ? C.teal : C.panel2,
-      color: watch.length ? C.ink : C.muted,
+      background: monScope === "top" || watch.length ? C.teal : C.panel2,
+      color: monScope === "top" || watch.length ? C.ink : C.muted,
       fontSize: 12
     }
   }, mon.on ? "重新同步設定" : "同步並啟動背景監控"), mon.on && /*#__PURE__*/React.createElement("button", {
@@ -5726,7 +5791,7 @@ function CryptoScreener() {
       color: C.bone,
       fontSize: 12
     }
-  }, "立即執行一次"), !watch.length && /*#__PURE__*/React.createElement("span", {
+  }, "立即執行一次"), monScope === "watch" && !watch.length && /*#__PURE__*/React.createElement("span", {
     style: {
       fontSize: 11.5,
       color: C.gold
@@ -5767,7 +5832,7 @@ function CryptoScreener() {
     style: {
       color: C.bone
     }
-  }, "目前的觀察清單（", watch.length, " 檔）與上面設定的多空門檻"), "。 之後改了條件或增減觀察清單，要再按一次「重新同步設定」才會生效。 通知走伺服器已配對的 Telegram 聊天室，所以請先完成下方的機器人配對。"), mon.lastError && /*#__PURE__*/React.createElement("div", {
+  }, monScope === "top" ? `市值前 ${monTopN} 檔` : `目前的觀察清單（${watch.length} 檔）`, "與上面設定的多空門檻"), "。", monScope === "top" && "　範圍越大首輪要抓的歷史資料越多，建議搭配環境變數 PREFETCH 讓伺服器先把快取養起來。", "之後改了條件或增減觀察清單，要再按一次「重新同步設定」才會生效。 通知走伺服器已配對的 Telegram 聊天室，所以請先完成下方的機器人配對。"), mon.lastError && /*#__PURE__*/React.createElement("div", {
     style: {
       fontSize: 11.5,
       color: C.red,

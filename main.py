@@ -283,7 +283,7 @@ try:
 except Exception:                       # 缺少 engine.py 時只停用監控，其他功能照常
     engine = None
 
-MON = {"on": False, "watch": [], "cfg": None, "states": {},
+MON = {"on": False, "watch": [], "cfg": None, "states": {}, "scope": "watch", "topN": 100,
        "history": [], "lastRun": None, "lastCount": 0, "lastError": None}
 _mon_lock = threading.Lock()
 
@@ -305,7 +305,7 @@ def mon_save():
         os.makedirs(CACHE_DIR, exist_ok=True)
         with open(mon_file(), "w") as f:
             json.dump({k: MON[k] for k in ("on", "watch", "cfg", "states", "history",
-                                           "lastRun", "lastCount")}, f)
+                                           "lastRun", "lastCount", "scope", "topN")}, f)
     except Exception:
         pass
 
@@ -319,12 +319,23 @@ def mon_fetch_json(path):
 
 def mon_run_once():
     """跑一輪：抓行情 → 取歷史 → 評分 → 判斷訊號 → 發通知"""
-    if not (engine and MON["cfg"] and MON["watch"]):
+    if not (engine and MON["cfg"]):
         return 0
-    ids = MON["watch"]
-    markets = mon_fetch_json(
-        "/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=250&page=1"
-        "&sparkline=false&price_change_percentage=24h,7d,30d&ids=" + ",".join(ids[:250]))
+    if MON["scope"] != "top" and not MON["watch"]:
+        return 0
+    # 監控範圍：觀察清單，或市值前 N 檔
+    if MON["scope"] == "top":
+        n = max(10, min(250, int(MON.get("topN") or 100)))
+        markets = mon_fetch_json(
+            f"/coins/markets?vs_currency=usd&order=market_cap_desc&per_page={n}&page=1"
+            "&sparkline=false&price_change_percentage=24h,7d,30d")[:n]
+    else:
+        ids = MON["watch"]
+        if not ids:
+            return 0
+        markets = mon_fetch_json(
+            "/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=250&page=1"
+            "&sparkline=false&price_change_percentage=24h,7d,30d&ids=" + ",".join(ids[:250]))
     rows = []
     for c in markets:
         path = f"/coins/{c['id']}/market_chart?vs_currency=usd&days=90"
@@ -395,6 +406,7 @@ def mon_handle(path, payload):
                      "lastRun": MON["lastRun"], "lastCount": MON["lastCount"],
                      "lastError": MON["lastError"], "engine": bool(engine),
                      "historyCount": len(MON["history"]),
+                     "scope": MON["scope"], "topN": MON["topN"],
                      "adminRequired": bool(os.environ.get("ADMIN_KEY", "").strip())}
     if path == "/api/monitor/config":
         if not tg_admin_ok(payload):
@@ -402,12 +414,17 @@ def mon_handle(path, payload):
         with _mon_lock:
             if "watch" in payload:
                 MON["watch"] = [str(x) for x in payload["watch"]][:250]
+            if "scope" in payload:
+                MON["scope"] = "top" if payload["scope"] == "top" else "watch"
+            if "topN" in payload:
+                MON["topN"] = max(10, min(250, int(payload["topN"])))
             if "cfg" in payload:
                 MON["cfg"] = payload["cfg"]
             if "on" in payload:
                 MON["on"] = bool(payload["on"])
             mon_save()
-        return 200, {"ok": True, "on": MON["on"], "watch": len(MON["watch"])}
+        return 200, {"ok": True, "on": MON["on"], "watch": len(MON["watch"]),
+                     "scope": MON["scope"], "topN": MON["topN"]}
     if path == "/api/monitor/history":
         return 200, {"history": MON["history"][:200]}
     if path == "/api/monitor/run":
@@ -727,8 +744,8 @@ def main():
         print("  監控　找不到 engine.py，背景訊號監控停用")
     else:
         print(f"  監控　每 {args.monitor_every:.0f} 分鐘檢查一次"
-              + (f"，目前監控 {len(MON['watch'])} 檔，狀態：開啟" if MON["on"] and MON["watch"]
-                 else "，尚未從網頁同步設定"))
+              + (f"，範圍：{'市值前 ' + str(MON['topN']) + ' 檔' if MON['scope'] == 'top' else '觀察清單 ' + str(len(MON['watch'])) + ' 檔'}，狀態：開啟"
+                 if MON["on"] and MON["cfg"] else "，尚未從網頁同步設定"))
         threading.Thread(target=monitor_worker, args=(args.monitor_every,), daemon=True).start()
 
     if args.prefetch:
