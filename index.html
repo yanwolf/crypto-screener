@@ -1639,9 +1639,19 @@ function evaluateSignals(rows, cfg, states, now) {
         score: g.score,
         stage: side === "bull" ? STAGES[r.stage].label : BEAR_STAGES[r.bearStage].label,
         checks: g.checks.map(c => c[2]),
-        entryLo: r.entryLo ?? null,
-        entryHi: r.entryHi ?? null,
-        stop: r.stop ?? null,
+        // 空頭的進場區／止損只屬於空頭訊號；多頭改帶三刀流的多方計畫
+        entryLo: side === "bear" ? r.entryLo ?? null : null,
+        entryHi: side === "bear" ? r.entryHi ?? null : null,
+        stop: side === "bear" ? r.stop ?? null : null,
+        plan: r.bladePlan && (side === "bull" && r.bladePlan.side === "多" || side === "bear" && r.bladePlan.side === "空") ? r.bladePlan : null,
+        blade: r.bladeState ? {
+          state: r.bladeState,
+          ma20: r.ma20,
+          ma60: r.ma60,
+          ma240: r.ma240,
+          dGreen: r.dGreen,
+          slope20: r.slope20
+        } : null,
         firstTs: next[key].firstTs,
         firstPrice: next[key].firstPrice,
         firstScore: next[key].firstScore,
@@ -1658,15 +1668,21 @@ function evaluateSignals(rows, cfg, states, now) {
   };
 }
 function alertText(e) {
-  const dir = e.side === "bull" ? "多頭" : "空頭";
-  const title = `${e.sym} ${dir}訊號 · ${EVENT[e.type].label}`;
-  const lines = [`${e.name}（${e.sym}）　${fmtPrice(e.price)}`, `階段：${e.stage}　評分：${e.score.toFixed(0)}`, ...e.checks.map(c => "· " + c)];
-  if (e.entryLo) lines.push(`參考區間：${fmtPrice(e.entryLo)}–${fmtPrice(e.entryHi)}　止損：${fmtPrice(e.stop)}`);
-  if (e.type !== "first") lines.push(`首次觸發於 ${new Date(e.firstTs).toLocaleString("zh-TW")}，當時 ${fmtPrice(e.firstPrice)} / ${e.firstScore.toFixed(0)} 分`);
-  lines.push("僅供技術分析參考，不構成投資建議。");
+  const bull = e.side === "bull";
+  const title = `${e.sym} ${bull ? "多頭" : "空頭"} · ${EVENT[e.type].label}`;
+  const L = [`${bull ? "▲ 做多方向" : "▼ 做空方向"}　${e.sym}　${fmtPrice(e.price)}`, e.name, "", `評分 ${e.score.toFixed(0)}　階段 ${e.stage}`];
+  if (e.blade) {
+    L.push(`三刀流 ${(BLADE[e.blade.state] || BLADE.none).label}` + `（距小綠 ${e.blade.dGreen >= 0 ? "+" : ""}${e.blade.dGreen.toFixed(1)}%，小藍斜率${e.blade.slope20 >= 0 ? "正" : "負"}）`);
+  }
+  L.push("", "── 進出場參考 ──");
+  if (e.plan) L.push(`進場　${e.plan.entry}`, `出場　${e.plan.exit}`, `停損　${e.plan.stop}`);else if (e.entryLo) L.push(`進場　${fmtPrice(e.entryLo)}–${fmtPrice(e.entryHi)}`, `停損　${fmtPrice(e.stop)}`);else L.push("三刀流未給明確位置，先觀望");
+  if (e.blade) L.push(`均線　小綠 ${fmtPrice(e.blade.ma60)}　小橘 ${fmtPrice(e.blade.ma240)}　小藍 ${fmtPrice(e.blade.ma20)}`);
+  L.push("", "── 觸發條件 ──", ...e.checks.map(c => "· " + c));
+  if (e.type !== "first") L.push("", `首次觸發 ${fmtPrice(e.firstPrice)} / ${e.firstScore.toFixed(0)} 分`);
+  L.push("", "僅供技術分析參考，不構成投資建議。");
   return {
     title,
-    text: lines.join("\n")
+    text: L.join("\n")
   };
 }
 
@@ -5763,10 +5779,13 @@ function CryptoScreener() {
         fontSize: 12.5
       }
     }, /*#__PURE__*/React.createElement("span", {
+      className: "px-1.5 py-0.5 rounded",
       style: {
-        color: e.side === "bull" ? UP : DOWN
+        fontSize: 11,
+        color: C.ink,
+        background: e.side === "bull" ? UP : DOWN
       }
-    }, e.side === "bull" ? "多" : "空"), /*#__PURE__*/React.createElement("span", {
+    }, e.side === "bull" ? "▲ 多" : "▼ 空"), /*#__PURE__*/React.createElement("span", {
       style: {
         fontFamily: FONT.data
       }
@@ -5820,7 +5839,7 @@ function CryptoScreener() {
         marginTop: 3,
         lineHeight: 1.7
       }
-    }, e.checks.join("　·　"), e.entryLo ? `　·　參考區 ${fmtPrice(e.entryLo)}–${fmtPrice(e.entryHi)}　止損 ${fmtPrice(e.stop)}` : "", e.verdict !== "open" ? `　·　最大順向 ${e.maxUp.toFixed(1)}%　最大逆向 ${e.maxDown.toFixed(1)}%` : ""));
+    }, e.checks.join("　·　"), e.plan ? `　·　進場 ${e.plan.entry}　停損 ${e.plan.stop}` : e.entryLo ? `　·　進場區 ${fmtPrice(e.entryLo)}–${fmtPrice(e.entryHi)}　止損 ${fmtPrice(e.stop)}` : "", e.verdict !== "open" ? `　·　最大順向 ${e.maxUp.toFixed(1)}%　最大逆向 ${e.maxDown.toFixed(1)}%` : ""));
   })))), page === "alerts" && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("section", {
     className: "rounded p-3.5",
     style: {

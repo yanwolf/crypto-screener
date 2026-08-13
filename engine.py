@@ -521,7 +521,11 @@ def evaluate(rows, cfg, states, now_ms):
                            "ma60": r.get("ma60"), "ma240": r.get("ma240"),
                            "dGreen": r.get("dGreen"), "slope20": r.get("slope20")}
                           if r.get("bladeState") else None),
-                "entryLo": r.get("entryLo"), "entryHi": r.get("entryHi"), "stop": r.get("stop"),
+                # 空頭的進場區／止損只屬於空頭訊號，多頭訊號帶三刀流的多方計畫
+                "entryLo": r.get("entryLo") if side == "bear" else None,
+                "entryHi": r.get("entryHi") if side == "bear" else None,
+                "stop": r.get("stop") if side == "bear" else None,
+                "plan": blade_plan(r, side),
                 "firstTs": nxt[key]["firstTs"], "firstPrice": nxt[key]["firstPrice"],
                 "firstScore": nxt[key]["firstScore"],
                 "maxUp": 0, "maxDown": 0, "verdict": "open", "source": "server",
@@ -541,22 +545,66 @@ def fmt_price(v):
     return f"${v:.3g}"
 
 
+
+def blade_plan(r, side):
+    """依三刀流狀態給出該方向的進出場價位；方向與三刀流不符時回 None"""
+    st = r.get("bladeState")
+    g, o_, b = r.get("ma60"), r.get("ma240"), r.get("ma20")
+    if not st or g is None:
+        return None
+    if side == "bull":
+        if st == "attackLong":
+            return {"entry": f"回踩小綠 {fmt_price(g)} 附近不破",
+                    "exit": f"小藍 {fmt_price(b)} 斜率翻負分批下車",
+                    "stop": f"跌破小橘 {fmt_price(o_)} 全部出場"}
+        if st == "takeLong":
+            return {"entry": "不再新增多單",
+                    "exit": f"小藍 {fmt_price(b)} 已翻負，分批停利",
+                    "stop": f"跌破小綠 {fmt_price(g)} 出清"}
+        return None
+    if st == "attackShort":
+        return {"entry": f"反彈到小綠 {fmt_price(g)} 附近不站上",
+                "exit": f"小藍 {fmt_price(b)} 斜率翻正分批回補",
+                "stop": f"站上小橘 {fmt_price(o_)} 全部出場"}
+    if st == "coverShort":
+        return {"entry": "不再新增空單",
+                "exit": f"小藍 {fmt_price(b)} 已翻正，空單回補",
+                "stop": f"站上小綠 {fmt_price(g)} 出清"}
+    return None
+
+
 def alert_text(e):
-    dirn = "多頭" if e["side"] == "bull" else "空頭"
-    title = f"{e['sym']} {dirn}訊號 · {EVENT_LABEL[e['type']]}"
-    lines = [
-        f"{e['name']}（{e['sym']}）　{fmt_price(e['price'])}",
-        f"階段：{e['stage']}　評分：{e['score']:.0f}",
-        *["· " + c for c in e["checks"]],
-    ]
-    if e.get("blade"):
-        b = e["blade"]
-        lines.append(f"三刀流：{BLADE_LABEL.get(b['state'], '')}　"
-                     f"小綠 {fmt_price(b['ma60'])}　小橘 {fmt_price(b['ma240'])}　小藍 {fmt_price(b['ma20'])}")
-        lines.append(f"　距小綠 {b['dGreen']:+.1f}%　小藍斜率{'正' if b['slope20'] >= 0 else '負'}")
-    if e.get("entryLo"):
-        lines.append(f"參考區間：{fmt_price(e['entryLo'])}–{fmt_price(e['entryHi'])}　止損：{fmt_price(e['stop'])}")
+    """推播文字：方向先講清楚，數字分段呈現，不混入另一個方向的欄位"""
+    bull = e["side"] == "bull"
+    arrow = "▲ 做多方向" if bull else "▼ 做空方向"
+    title = f"{e['sym']} {'多頭' if bull else '空頭'} · {EVENT_LABEL[e['type']]}"
+
+    L = [f"{arrow}　{e['sym']}　{fmt_price(e['price'])}",
+         f"{e.get('name', '')}",
+         "",
+         f"評分 {e['score']:.0f}　階段 {e['stage']}"]
+
+    b = e.get("blade")
+    if b:
+        L.append(f"三刀流 {BLADE_LABEL.get(b['state'], '')}"
+                 f"（距小綠 {b['dGreen']:+.1f}%，小藍斜率{'正' if b['slope20'] >= 0 else '負'}）")
+
+    L += ["", "── 進出場參考 ──"]
+    plan = e.get("plan")
+    if plan:
+        L += [f"進場　{plan['entry']}", f"出場　{plan['exit']}", f"停損　{plan['stop']}"]
+    elif e.get("entryLo"):
+        L += [f"進場　{fmt_price(e['entryLo'])}–{fmt_price(e['entryHi'])}",
+              f"停損　{fmt_price(e['stop'])}"]
+    else:
+        L.append("三刀流未給明確位置，先觀望")
+
+    if b:
+        L.append(f"均線　小綠 {fmt_price(b['ma60'])}　小橘 {fmt_price(b['ma240'])}　小藍 {fmt_price(b['ma20'])}")
+
+    L += ["", "── 觸發條件 ──"] + ["· " + c for c in e["checks"]]
+
     if e["type"] != "first":
-        lines.append(f"首次觸發時 {fmt_price(e['firstPrice'])} / {e['firstScore']:.0f} 分")
-    lines.append("由伺服器背景監控發出，僅供技術分析參考，不構成投資建議。")
-    return title, "\n".join(lines)
+        L += ["", f"首次觸發 {fmt_price(e['firstPrice'])} / {e['firstScore']:.0f} 分"]
+    L += ["", "僅供技術分析參考，不構成投資建議。"]
+    return title, "\n".join(L)
