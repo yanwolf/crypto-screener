@@ -431,7 +431,7 @@ async function cgFetch(path, cfg) {
   }, minGap);
 }
 const ERR_MSG = {
-  BLOCKED: "瀏覽器沒有把請求送出去，請求在送出前就被攔下。可能是：頁面在沙箱環境中被限制外部網域、以 file:// 開啟、廣告攔截或防毒擴充功能攔截、公司網路封鎖。",
+  BLOCKED: "瀏覽器沒有把請求送出去。這個網路擋掉了 api.coingecko.com，但你目前的網址還開得起來——到「連線設定」勾選「強制走伺服器」，改由伺服器代抓資料就能繞過去。",
   RATE: "CoinGecko 回 429，額度已滿。無金鑰時每分鐘只有 5–15 次；等一分鐘再試，或填入免費 Demo API Key 提高到每分鐘 30 次。",
   AUTH: "API Key 被拒絕。確認金鑰沒打錯，且 Pro 金鑰才需勾選 Pro。",
   SERVER: "CoinGecko 伺服器暫時異常，稍後重試。",
@@ -3048,6 +3048,7 @@ function CryptoScreener() {
   const [proxy, setProxy] = useState("");
   /* 同源是否有代理伺服器，開頁時自動探測一次，使用者不必自己勾 */
   const [proxyMode, setProxyMode] = useState(() => store.get("proxyMode", "detecting"));
+  const [proxyForce, setProxyForce] = useState(() => store.get("proxyForce", false));
   const [autoRefresh, setAutoRefresh] = useState(false);
   const [showConn, setShowConn] = useState(false);
   const [showWeights, setShowWeights] = useState(false);
@@ -3168,6 +3169,7 @@ function CryptoScreener() {
     setWatch(w => w.includes(id) ? w.filter(x => x !== id) : [...w, id]);
   }, []);
   const local = proxyMode === "server";
+  const loadRef = useRef(null); // 供 loadMarkets 內部自我重試使用
   const cfg = useMemo(() => ({
     key: apiKey.trim(),
     pro,
@@ -3204,25 +3206,46 @@ function CryptoScreener() {
       setSource("live");
       setUpdated(new Date());
     } catch (e) {
+      // 直連被網路環境擋掉時，先試試同源代理再放棄
+      if (e.message === "BLOCKED" && !cfg.local && !store.get("proxyTried", false)) {
+        store.set("proxyTried", true);
+        const m = await detectProxy({
+          ignoreForce: true
+        });
+        if (m === "server") {
+          setError("直連被這個網路擋下，已自動改走伺服器代理，正在重新載入…");
+          setTimeout(() => loadRef.current(p), 300);
+          setLoading(false);
+          return;
+        }
+      }
       setError(errText(e));
       if (!rawRef.current.length) loadDemo();
     } finally {
       setLoading(false);
     }
-  }, [pages, cfg, loadDemo]);
-  const loadRef = useRef(null);
+  }, [pages, cfg, loadDemo, detectProxy]);
   loadRef.current = loadMarkets;
-  const detectProxy = useCallback(async () => {
+  const detectProxy = useCallback(async opts => {
+    if (store.get("proxyForce", false) && !(opts && opts.ignoreForce)) {
+      setProxyMode("server"); // 使用者手動指定，不再自動判定
+      return "server";
+    }
     let mode = "direct";
     try {
       if (location.protocol.startsWith("http")) {
-        const r = await fetch("/api/v3/ping", {
+        // 健康檢查不依賴上游，伺服器就算連不到 CoinGecko 也會回 200
+        const r = await fetch("/api/health", {
           cache: "no-store"
         });
-        // 自家代理一定會帶 X-Cache；靜態主機的 404 或其他頁面不會
-        if (r.ok && r.headers.get("X-Cache")) mode = "server";
+        if (r.ok && r.headers.get("X-Screener-Server")) mode = "server";else {
+          const r2 = await fetch("/api/v3/ping", {
+            cache: "no-store"
+          });
+          if (r2.ok && r2.headers.get("X-Cache")) mode = "server";
+        }
       }
-    } catch (e) {/* 沒有代理就走直連 */}
+    } catch (e) {/* 兩個都失敗才視為沒有代理 */}
     setProxyMode(mode);
     store.set("proxyMode", mode);
     return mode;
@@ -4464,7 +4487,9 @@ function CryptoScreener() {
       border: `1px solid ${local ? C.teal : C.line}`
     }
   }, proxyMode === "detecting" ? "偵測連線方式…" : local ? "已連上伺服器代理" : "直連 CoinGecko"), /*#__PURE__*/React.createElement("button", {
-    onClick: detectProxy,
+    onClick: () => detectProxy({
+      ignoreForce: true
+    }),
     className: "px-2.5 py-1.5 rounded",
     style: {
       background: C.panel2,
@@ -4472,7 +4497,31 @@ function CryptoScreener() {
       color: C.muted,
       fontSize: 12
     }
-  }, "重新偵測"), /*#__PURE__*/React.createElement("button", {
+  }, "重新偵測"), /*#__PURE__*/React.createElement("label", {
+    className: "flex items-center gap-1.5 cursor-pointer",
+    style: {
+      fontSize: 12,
+      color: proxyForce ? C.teal : C.bone
+    }
+  }, /*#__PURE__*/React.createElement("input", {
+    type: "checkbox",
+    checked: proxyForce,
+    style: {
+      accentColor: C.teal
+    },
+    onChange: e => {
+      setProxyForce(e.target.checked);
+      store.set("proxyForce", e.target.checked);
+      if (e.target.checked) {
+        setProxyMode("server");
+        store.set("proxyMode", "server");
+      } else detectProxy({
+        ignoreForce: true
+      });
+      store.set("proxyTried", false);
+      setTimeout(() => loadRef.current(pages), 200);
+    }
+  }), "強制走伺服器"), /*#__PURE__*/React.createElement("button", {
     onClick: runDiag,
     className: "px-3 py-1.5 rounded",
     style: {

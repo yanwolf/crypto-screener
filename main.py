@@ -538,6 +538,25 @@ class Handler(http.server.SimpleHTTPRequestHandler):
     # ── 路由 ──────────────────────────────────────────────
     def do_GET(self):
         p = self.path.split("?")[0]
+        if p == "/api/health":
+            body = json.dumps({
+                "server": "crypto-screener", "proxy": True,
+                "hasKey": bool(CFG["key"]), "engine": bool(engine),
+                "monitor": MON["on"], "cached": len(_cache),
+            }, ensure_ascii=False).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Screener-Server", "1")
+            self.send_header("X-Cache", "LIVE")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            try:
+                self.wfile.write(body)
+            except BrokenPipeError:
+                pass
+            return
         if p.startswith("/api/tg/"):
             code, body = tg_handle(p, {})
             return self.send_json(code, json.dumps(body, ensure_ascii=False).encode())
