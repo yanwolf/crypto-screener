@@ -3170,6 +3170,7 @@ function CryptoScreener() {
   }, []);
   const local = proxyMode === "server";
   const loadRef = useRef(null); // 供 loadMarkets 內部自我重試使用
+  const detectRef = useRef(null); // 同上：detectProxy 定義在後面，透過 ref 取用
   const cfg = useMemo(() => ({
     key: apiKey.trim(),
     pro,
@@ -3209,9 +3210,9 @@ function CryptoScreener() {
       // 直連被網路環境擋掉時，先試試同源代理再放棄
       if (e.message === "BLOCKED" && !cfg.local && !store.get("proxyTried", false)) {
         store.set("proxyTried", true);
-        const m = await detectProxy({
+        const m = detectRef.current ? await detectRef.current({
           ignoreForce: true
-        });
+        }) : "direct";
         if (m === "server") {
           setError("直連被這個網路擋下，已自動改走伺服器代理，正在重新載入…");
           setTimeout(() => loadRef.current(p), 300);
@@ -3224,7 +3225,7 @@ function CryptoScreener() {
     } finally {
       setLoading(false);
     }
-  }, [pages, cfg, loadDemo, detectProxy]);
+  }, [pages, cfg, loadDemo]);
   loadRef.current = loadMarkets;
   const detectProxy = useCallback(async opts => {
     if (store.get("proxyForce", false) && !(opts && opts.ignoreForce)) {
@@ -3250,6 +3251,7 @@ function CryptoScreener() {
     store.set("proxyMode", mode);
     return mode;
   }, []);
+  detectRef.current = detectProxy;
   useEffect(() => {
     let dead = false;
     (async () => {
