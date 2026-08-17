@@ -3314,11 +3314,25 @@ function CryptoScreener() {
       step("檢查伺服器是否在線…");
       try {
         const t0 = Date.now();
-        const r = await withTimeout(fetch("/api/health", {
+        const r = await withTimeout(fetch("/api/health?probe=1", {
           cache: "no-store"
-        }), 8000, "health");
+        }), 20000, "health");
         const j = await r.json();
-        push(`伺服器在線（${Date.now() - t0}ms）　金鑰${j.hasKey ? "已設定" : "未設定"}　` + `背景監控${j.monitor ? "運作中" : "未啟動"}　快取 ${j.cached} 筆`, true);
+        push(`伺服器在線（${Date.now() - t0}ms）　金鑰${j.hasKey ? `已設定（${j.keyLen} 字元${j.pro ? " · Pro" : ""}）` : "未設定"}　` + `記憶體快取 ${j.cached} 筆　磁碟快取 ${j.disk ?? "?"} 筆　已運行 ${Math.floor((j.uptime || 0) / 60)} 分`, true);
+
+        /* 伺服器自己連往上游的結果：這一步能直接分辨是誰連不上 */
+        (j.probe || []).forEach(p => {
+          if (p.ok) push(`伺服器 → ${p.name}：通過（HTTP ${p.code}，${p.ms}ms）`, true);else {
+            const hint = p.code === 403 && /allowlist|egress/i.test(p.detail || "") ? "Zeabur 的網路出口限制擋掉了這個網域，需要在服務設定裡放行。" : p.code === 429 ? "額度已滿，等一分鐘後會自行恢復。" : p.code === 401 || p.code === 403 ? "金鑰被拒絕，確認 CG_API_KEY 是否正確、有沒有多餘空白。" : p.code === 0 ? "連線層失敗（DNS 或逾時），伺服器出不了網。" : `HTTP ${p.code}`;
+            push(`伺服器 → ${p.name}：失敗（${p.ms}ms）　${hint}`, false);
+            if (p.detail) push(`　　上游回應：${String(p.detail).slice(0, 160)}`, null);
+          }
+        });
+        if ((j.probe || []).some(p => p.name === "CoinGecko" && !p.ok)) {
+          push("結論：問題在伺服器連往 CoinGecko 這一段，不是你的手機網路。後續步驟略過。", null);
+          setDiagBusy(false);
+          return;
+        }
       } catch (e) {
         push(String(e.message).startsWith("TIMEOUT") ? "伺服器沒有回應（8 秒逾時）。Zeabur 可能正在重新部署或休眠，稍後再試。" : "連不到伺服器。你的網路可能連這個網址也擋掉了，或服務已停止。", false);
         setDiagBusy(false);

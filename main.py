@@ -67,6 +67,7 @@ UPSTREAMS = {
 CACHE_TTL = 45.0          # 行情快取秒數，重新整理不會重複打 API
 OHLC_TTL = 1800.0         # 90 日 K 線快取半小時，這種資料不會秒變
 
+START_TS = time.time()
 _cache = {}
 _cache_lock = threading.Lock()
 CACHE_DIR = os.path.join(HERE, ".screener_cache")
@@ -436,6 +437,37 @@ def mon_handle(path, payload):
     return 404, {"error": "not_found"}
 
 
+
+def upstream_probe():
+    """伺服器自己試連各上游，回報狀態碼與耗時，讓前端能分辨是誰連不上"""
+    out = []
+    targets = [
+        ("CoinGecko", (PRO_BASE if CFG["pro"] else PUBLIC_BASE) + "/ping"
+         + (("?" + ("x_cg_pro_api_key=" if CFG["pro"] else "x_cg_demo_api_key=")
+             + urllib.parse.quote(CFG["key"])) if CFG["key"] else "")),
+        ("GeckoTerminal", UPSTREAMS["/api/gt"] + "/networks"),
+    ]
+    for name, url in targets:
+        t0 = time.time()
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "local-crypto-screener/1.0"})
+            with urllib.request.urlopen(req, timeout=12) as r:
+                out.append({"name": name, "ok": True, "code": r.status,
+                            "ms": int((time.time() - t0) * 1000)})
+        except urllib.error.HTTPError as e:
+            body = ""
+            try:
+                body = e.read().decode()[:180]
+            except Exception:
+                pass
+            out.append({"name": name, "ok": False, "code": e.code,
+                        "ms": int((time.time() - t0) * 1000), "detail": body})
+        except Exception as e:
+            out.append({"name": name, "ok": False, "code": 0,
+                        "ms": int((time.time() - t0) * 1000), "detail": str(e)[:180]})
+    return out
+
+
 def notify_telegram(title, text):
     if not (_tg["token"] and _tg["chats"]):
         return None
@@ -539,11 +571,17 @@ class Handler(http.server.SimpleHTTPRequestHandler):
     def do_GET(self):
         p = self.path.split("?")[0]
         if p == "/api/health":
-            body = json.dumps({
+            info = {
                 "server": "crypto-screener", "proxy": True,
-                "hasKey": bool(CFG["key"]), "engine": bool(engine),
+                "hasKey": bool(CFG["key"]), "keyLen": len(CFG["key"]),
+                "pro": CFG["pro"], "engine": bool(engine),
                 "monitor": MON["on"], "cached": len(_cache),
-            }, ensure_ascii=False).encode()
+                "disk": (len(os.listdir(CACHE_DIR)) if os.path.isdir(CACHE_DIR) else 0),
+                "gap": CFG["gap"], "uptime": int(time.time() - START_TS),
+            }
+            if "probe=1" in (self.path.split("?", 1)[1] if "?" in self.path else ""):
+                info["probe"] = upstream_probe()
+            body = json.dumps(info, ensure_ascii=False).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Access-Control-Allow-Origin", "*")
