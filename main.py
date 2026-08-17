@@ -403,8 +403,8 @@ def monitor_worker(interval_min):
     time.sleep(8)
     while True:
         try:
-            if MON["on"] and not QUOTA["exhausted"]:
-                mon_run_once()
+            if MON["on"]:
+                mon_run_once()          # 額度用盡會自動降級為無金鑰，仍可續跑
                 MON["lastError"] = None
         except Exception as e:
             MON["lastError"] = str(e)
@@ -525,10 +525,23 @@ def notify_email(title, text):
     return "電子郵件"
 
 
+def keyless_now() -> bool:
+    """Demo 金鑰的每月額度用盡時，自動改走無金鑰公開端點。
+    公開端點沒有月額度，只有較嚴的每分鐘限制，所以是降速而非停擺。
+    每 6 小時會試著切回金鑰，跨月重置後便自動恢復。"""
+    if not QUOTA["exhausted"]:
+        return False
+    if time.time() - QUOTA["ts"] > 6 * 3600:
+        QUOTA["exhausted"] = False          # 到期重試一次，成功就切回金鑰
+        return False
+    return True
+
+
 def upstream_url(path_qs: str) -> str:
-    base = PRO_BASE if CFG["pro"] else PUBLIC_BASE
+    keyless = keyless_now()
+    base = PRO_BASE if (CFG["pro"] and not keyless) else PUBLIC_BASE
     url = base + path_qs
-    if CFG["key"]:
+    if CFG["key"] and not keyless:
         sep = "&" if "?" in url else "?"
         param = "x_cg_pro_api_key" if CFG["pro"] else "x_cg_demo_api_key"
         url += f"{sep}{param}={urllib.parse.quote(CFG['key'])}"
@@ -599,7 +612,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 "hasKey": bool(CFG["key"]), "keyLen": len(CFG["key"]),
                 "pro": CFG["pro"], "engine": bool(engine),
                 "monitor": MON["on"], "cached": len(_cache),
-                "quotaExhausted": QUOTA["exhausted"],
+                "quotaExhausted": QUOTA["exhausted"], "keyless": keyless_now(),
                 "disk": (len(os.listdir(CACHE_DIR)) if os.path.isdir(CACHE_DIR) else 0),
                 "gap": CFG["gap"], "uptime": int(time.time() - START_TS),
             }
@@ -725,7 +738,7 @@ def prefetch_worker(count: int, ttl_h: float):
                     skipped += 1
                     continue
                 if QUOTA["exhausted"]:
-                    sys.stderr.write("  ~ 額度已用盡，背景預抓暫停\n")
+                    sys.stderr.write("  ~ 額度已用盡，預抓暫停（監控仍以無金鑰模式續跑）\n")
                     break
                 st, b = fetch_upstream(path)
                 if st == 200:

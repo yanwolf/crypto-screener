@@ -3319,6 +3319,7 @@ function CryptoScreener() {
           cache: "no-store"
         }), 20000, "health");
         const j = await r.json();
+        if (j.keyless) push("目前為無金鑰降級模式：Demo 月額度已用盡，改走公開端點（無月額度，但每分鐘僅 5–15 次）。每 6 小時會自動試著切回金鑰。", null);
         push(`伺服器在線（${Date.now() - t0}ms）　金鑰${j.hasKey ? `已設定（${j.keyLen} 字元${j.pro ? " · Pro" : ""}）` : "未設定"}　` + `記憶體快取 ${j.cached} 筆　磁碟快取 ${j.disk ?? "?"} 筆　已運行 ${Math.floor((j.uptime || 0) / 60)} 分`, true);
 
         /* 伺服器自己連往上游的結果：這一步能直接分辨是誰連不上 */
