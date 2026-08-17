@@ -68,6 +68,7 @@ CACHE_TTL = 45.0          # 行情快取秒數，重新整理不會重複打 API
 OHLC_TTL = 1800.0         # 90 日 K 線快取半小時，這種資料不會秒變
 
 START_TS = time.time()
+QUOTA = {"exhausted": False, "ts": 0}
 _cache = {}
 _cache_lock = threading.Lock()
 CACHE_DIR = os.path.join(HERE, ".screener_cache")
@@ -285,7 +286,8 @@ except Exception:                       # 缺少 engine.py 時只停用監控，
     engine = None
 
 MON = {"on": False, "watch": [], "cfg": None, "states": {}, "scope": "watch", "topN": 100,
-       "history": [], "lastRun": None, "lastCount": 0, "lastError": None}
+       "history": [], "lastRun": None, "lastCount": 0, "lastError": None,
+       "histTTL": 12, "maxRefresh": 8, "lastRefreshed": 0, "callsToday": 0}
 _mon_lock = threading.Lock()
 
 
@@ -306,7 +308,8 @@ def mon_save():
         os.makedirs(CACHE_DIR, exist_ok=True)
         with open(mon_file(), "w") as f:
             json.dump({k: MON[k] for k in ("on", "watch", "cfg", "states", "history",
-                                           "lastRun", "lastCount", "scope", "topN")}, f)
+                                           "lastRun", "lastCount", "scope", "topN",
+                                           "histTTL", "maxRefresh", "callsToday")}, f)
     except Exception:
         pass
 
@@ -338,15 +341,21 @@ def mon_run_once():
             "/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=250&page=1"
             "&sparkline=false&price_change_percentage=24h,7d,30d&ids=" + ",".join(ids[:250]))
     rows = []
+    refreshed = [0]                 # 本輪實際向上游補抓的檔數
     for c in markets:
         path = f"/coins/{c['id']}/market_chart?vs_currency=usd&days=90"
         key = "/api/v3" + path
-        body = cache_get(key, 12 * 3600)
+        # 90 天歷史一天內不會有意義的變化，快取沿用到 TTL 到期為止。
+        # 量能倍數是用「快取基準量 ÷ 即時成交量」現算的，所以訊號仍然即時。
+        body = cache_get(key, MON.get("histTTL", 12) * 3600)
         if body is None:
+            if refreshed[0] >= MON.get("maxRefresh", 8):
+                continue                      # 單輪補抓上限，避免一次把額度用光
             st, body = fetch_upstream(path)
             if st != 200:
                 continue
             cache_put(key, body)
+            refreshed[0] += 1
         try:
             chart = json.loads(body)
         except Exception:
@@ -371,6 +380,8 @@ def mon_run_once():
         MON["states"] = states
         MON["lastRun"] = now_ms
         MON["lastCount"] = len(rows)
+        MON["lastRefreshed"] = refreshed[0]
+        MON["callsToday"] = MON.get("callsToday", 0) + 1 + refreshed[0]
         if events:
             MON["history"] = (events + MON["history"])[:400]
         mon_save()
@@ -392,7 +403,7 @@ def monitor_worker(interval_min):
     time.sleep(8)
     while True:
         try:
-            if MON["on"]:
+            if MON["on"] and not QUOTA["exhausted"]:
                 mon_run_once()
                 MON["lastError"] = None
         except Exception as e:
@@ -407,6 +418,9 @@ def mon_handle(path, payload):
                      "lastRun": MON["lastRun"], "lastCount": MON["lastCount"],
                      "lastError": MON["lastError"], "engine": bool(engine),
                      "historyCount": len(MON["history"]),
+                     "lastRefreshed": MON.get("lastRefreshed", 0),
+                     "callsToday": MON.get("callsToday", 0),
+                     "histTTL": MON.get("histTTL", 12), "maxRefresh": MON.get("maxRefresh", 8),
                      "scope": MON["scope"], "topN": MON["topN"],
                      "adminRequired": bool(os.environ.get("ADMIN_KEY", "").strip())}
     if path == "/api/monitor/config":
@@ -419,6 +433,10 @@ def mon_handle(path, payload):
                 MON["scope"] = "top" if payload["scope"] == "top" else "watch"
             if "topN" in payload:
                 MON["topN"] = max(10, min(250, int(payload["topN"])))
+            if "histTTL" in payload:
+                MON["histTTL"] = max(2, min(72, float(payload["histTTL"])))
+            if "maxRefresh" in payload:
+                MON["maxRefresh"] = max(0, min(50, int(payload["maxRefresh"])))
             if "cfg" in payload:
                 MON["cfg"] = payload["cfg"]
             if "on" in payload:
@@ -546,6 +564,11 @@ def fetch_upstream(path_qs: str, prefix: str = "/api/v3"):
                 return 200, r.read()
         except urllib.error.HTTPError as e:
             body = e.read()
+            # error_code 10006 是「每月總額度用盡」，重試沒有意義，直接放棄
+            if b"10006" in body or b"calls limit" in body:
+                QUOTA["exhausted"] = True
+                QUOTA["ts"] = time.time()
+                return e.code, body
             if e.code == 429 and attempt < 2:
                 time.sleep(6 * (attempt + 1))
                 continue
@@ -576,6 +599,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 "hasKey": bool(CFG["key"]), "keyLen": len(CFG["key"]),
                 "pro": CFG["pro"], "engine": bool(engine),
                 "monitor": MON["on"], "cached": len(_cache),
+                "quotaExhausted": QUOTA["exhausted"],
                 "disk": (len(os.listdir(CACHE_DIR)) if os.path.isdir(CACHE_DIR) else 0),
                 "gap": CFG["gap"], "uptime": int(time.time() - START_TS),
             }
@@ -700,6 +724,9 @@ def prefetch_worker(count: int, ttl_h: float):
                 if cache_get(key, ttl_h * 3600) is not None:
                     skipped += 1
                     continue
+                if QUOTA["exhausted"]:
+                    sys.stderr.write("  ~ 額度已用盡，背景預抓暫停\n")
+                    break
                 st, b = fetch_upstream(path)
                 if st == 200:
                     cache_put(key, b)
@@ -709,7 +736,7 @@ def prefetch_worker(count: int, ttl_h: float):
             sys.stderr.write(f"  ~ 背景預抓完成一輪：新增 {done} 檔、快取命中 {skipped} 檔\n")
         except Exception as e:
             sys.stderr.write(f"  ~ 背景預抓中斷：{e}\n")
-        time.sleep(300)
+        time.sleep(3600)      # 預抓每小時跑一輪就夠，快取命中不耗額度
 
 
 def lan_ip():
@@ -755,11 +782,13 @@ def main():
     ap.add_argument("--smtp-user", default=os.environ.get("SMTP_USER", ""))
     ap.add_argument("--smtp-pass", default=os.environ.get("SMTP_PASS", ""), help="建議用應用程式密碼")
     ap.add_argument("--mail-to", default=os.environ.get("MAIL_TO", ""), help="收件信箱")
-    ap.add_argument("--monitor-every", type=float, default=float(os.environ.get("MONITOR_EVERY", 5)),
-                    metavar="M", help="背景訊號監控的間隔分鐘數，預設 5（等同環境變數 MONITOR_EVERY）")
+    ap.add_argument("--monitor-every", type=float, default=float(os.environ.get("MONITOR_EVERY", 30)),
+                    metavar="M", help="背景訊號監控的間隔分鐘數，預設 30（免費 Demo Key 每月僅 1 萬次，"
+                       "設太密會很快用完；等同環境變數 MONITOR_EVERY）")
     ap.add_argument("--prefetch", type=int, default=int(os.environ.get("PREFETCH", 0)), metavar="N",
-                    help="背景預抓市值前 N 檔的 90 日資料（等同環境變數 PREFETCH）")
-    ap.add_argument("--prefetch-ttl", type=float, default=float(os.environ.get("PREFETCH_TTL", 12)),
+                    help="背景預抓市值前 N 檔的 90 日資料。Demo Key 每月僅 1 萬次，"
+                         "建議 0 或 50 以內（等同環境變數 PREFETCH）")
+    ap.add_argument("--prefetch-ttl", type=float, default=float(os.environ.get("PREFETCH_TTL", 24)),
                     metavar="H", help="預抓資料的保鮮時數，預設 12（等同環境變數 PREFETCH_TTL）")
     ap.add_argument("--cache-dir", default=os.environ.get("CACHE_DIR", ""),
                     help="快取目錄，雲端掛載 Volume 時指定（等同環境變數 CACHE_DIR）")

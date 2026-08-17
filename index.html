@@ -438,6 +438,7 @@ async function cgFetch(path, cfg) {
 const ERR_MSG = {
   BLOCKED: "瀏覽器沒有把請求送出去。這個網路擋掉了 api.coingecko.com，但你目前的網址還開得起來——到「連線設定」勾選「強制走伺服器」，改由伺服器代抓資料就能繞過去。",
   RATE: "CoinGecko 回 429，額度已滿。無金鑰時每分鐘只有 5–15 次；等一分鐘再試，或填入免費 Demo API Key 提高到每分鐘 30 次。",
+  QUOTA: "Demo Key 的每月 10,000 次總額度已用盡（error_code 10006）。等一分鐘沒有用，要等到下個月重置。請調高監控間隔、關閉自動更新，或升級 CoinGecko 方案。",
   AUTH: "API Key 被拒絕。確認金鑰沒打錯，且 Pro 金鑰才需勾選 Pro。",
   SERVER: "CoinGecko 伺服器暫時異常，稍後重試。",
   TIMEOUT: "請求超過 25 秒沒有回應。若走伺服器代理，通常是伺服器正在等額度或重新部署；按「執行連線診斷」可以看出卡在哪一步。",
@@ -3323,7 +3324,7 @@ function CryptoScreener() {
         /* 伺服器自己連往上游的結果：這一步能直接分辨是誰連不上 */
         (j.probe || []).forEach(p => {
           if (p.ok) push(`伺服器 → ${p.name}：通過（HTTP ${p.code}，${p.ms}ms）`, true);else {
-            const hint = p.code === 403 && /allowlist|egress/i.test(p.detail || "") ? "Zeabur 的網路出口限制擋掉了這個網域，需要在服務設定裡放行。" : p.code === 429 ? "額度已滿，等一分鐘後會自行恢復。" : p.code === 401 || p.code === 403 ? "金鑰被拒絕，確認 CG_API_KEY 是否正確、有沒有多餘空白。" : p.code === 0 ? "連線層失敗（DNS 或逾時），伺服器出不了網。" : `HTTP ${p.code}`;
+            const hint = p.code === 403 && /allowlist|egress/i.test(p.detail || "") ? "Zeabur 的網路出口限制擋掉了這個網域，需要在服務設定裡放行。" : /10006|calls limit/i.test(p.detail || "") ? "每月 10,000 次總額度已用盡，等一分鐘沒有用，要等下個月重置或升級方案。" : p.code === 429 ? "每分鐘速率上限，等一分鐘後會自行恢復。" : p.code === 401 || p.code === 403 ? "金鑰被拒絕，確認 CG_API_KEY 是否正確、有沒有多餘空白。" : p.code === 0 ? "連線層失敗（DNS 或逾時），伺服器出不了網。" : `HTTP ${p.code}`;
             push(`伺服器 → ${p.name}：失敗（${p.ms}ms）　${hint}`, false);
             if (p.detail) push(`　　上游回應：${String(p.detail).slice(0, 160)}`, null);
           }
@@ -6215,7 +6216,36 @@ function CryptoScreener() {
     style: {
       color: C.bone
     }
-  }, monScope === "top" ? `市值前 ${monTopN} 檔` : `目前的觀察清單（${watch.length} 檔）`, "與上面設定的多空門檻"), "。", monScope === "top" && "　範圍越大首輪要抓的歷史資料越多，建議搭配環境變數 PREFETCH 讓伺服器先把快取養起來。", "之後改了條件或增減觀察清單，要再按一次「重新同步設定」才會生效。 通知走伺服器已配對的 Telegram 聊天室，所以請先完成下方的機器人配對。"), mon.lastError && /*#__PURE__*/React.createElement("div", {
+  }, monScope === "top" ? `市值前 ${monTopN} 檔` : `目前的觀察清單（${watch.length} 檔）`, "與上面設定的多空門檻"), "。", monScope === "top" && "　範圍越大首輪要抓的歷史資料越多，建議搭配環境變數 PREFETCH 讓伺服器先把快取養起來。", "之後改了條件或增減觀察清單，要再按一次「重新同步設定」才會生效。 通知走伺服器已配對的 Telegram 聊天室，所以請先完成下方的機器人配對。"), (() => {
+    const every = scanEvery && mon.on ? scanEvery : 30;
+    const perMonth = Math.round(1440 / every * 30 * (1 + (mon.maxRefresh ?? 8) * 0.3) + (autoRefresh ? 86400 / 90 * 30 : 0));
+    const over = perMonth > 9000;
+    return /*#__PURE__*/React.createElement("div", {
+      className: "mt-2 px-2.5 py-2 rounded",
+      style: {
+        background: over ? "#241A1A" : C.panel2,
+        border: `1px solid ${over ? C.red : C.line}`,
+        fontSize: 11.5,
+        lineHeight: 1.8
+      }
+    }, /*#__PURE__*/React.createElement("span", {
+      style: {
+        color: over ? C.red : C.teal
+      }
+    }, "額度預估\u3000每月約 ", perMonth.toLocaleString(), " 次"), /*#__PURE__*/React.createElement("span", {
+      style: {
+        color: C.muted
+      }
+    }, "\u3000免費 Demo Key 上限 10,000 次／月"), over && /*#__PURE__*/React.createElement("div", {
+      style: {
+        color: C.red
+      }
+    }, "超過免費額度。把伺服器的 MONITOR_EVERY 調到 30 分鐘以上、關閉標題列的「自動更新」，或升級 CoinGecko 方案。"), /*#__PURE__*/React.createElement("div", {
+      style: {
+        color: C.muted
+      }
+    }, "歷史資料在 ", mon.histTTL ?? 12, " 小時內不重抓，每輪最多補抓 ", mon.maxRefresh ?? 8, " 檔； 上一輪實際補抓 ", mon.lastRefreshed ?? 0, " 檔。"));
+  })(), mon.lastError && /*#__PURE__*/React.createElement("div", {
     style: {
       fontSize: 11.5,
       color: C.red,
