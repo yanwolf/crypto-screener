@@ -3941,21 +3941,30 @@ function CryptoScreener() {
       count: 0
     }
   });
+  const adminRef = useRef(""); // 與提醒設定頁共用同一組 ADMIN_KEY
+  adminRef.current = tgAdmin;
   const [tradeMsg, setTradeMsg] = useState(null);
   const [tradeBusy, setTradeBusy] = useState(false);
   const tradeCall = useCallback(async (ep, payload) => {
     setTradeBusy(true);
     try {
-      const r = await fetch("/api/trade/" + ep, payload ? {
+      const body = payload ? {
+        ...payload,
+        adminKey: adminRef.current
+      } : null;
+      const r = await fetch("/api/trade/" + ep, body ? {
         method: "POST",
         headers: {
           "Content-Type": "application/json"
         },
-        body: JSON.stringify(payload)
+        body: JSON.stringify(body)
       } : {
         cache: "no-store"
       });
       const j = await r.json();
+      if (j && j.error === "admin_key_required") {
+        setTradeMsg(["err", adminRef.current ? "管理金鑰不正確，與伺服器的 ADMIN_KEY 環境變數不符。" : "這個動作需要管理金鑰。到「模擬單」分頁最上方填入伺服器設定的 ADMIN_KEY。"]);
+      }
       return j;
     } catch (e) {
       setTradeMsg(["err", "連不到伺服器：" + e.message]);
@@ -6108,7 +6117,45 @@ function CryptoScreener() {
       color: C.muted,
       fontSize: 11.5
     }
-  }, "與交易所對帳")), tradeMsg && /*#__PURE__*/React.createElement("div", {
+  }, "與交易所對帳")), /*#__PURE__*/React.createElement("div", {
+    className: "mt-2 rounded p-3",
+    style: {
+      background: C.panel2,
+      border: `1px solid ${tgAdmin || trade.adminRequired === false ? C.line : C.gold}`
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "flex items-center gap-2 flex-wrap"
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 12,
+      color: C.bone
+    }
+  }, "管理金鑰"), /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 11,
+      color: tgAdmin ? C.teal : trade.adminRequired === false ? C.muted : C.gold
+    }
+  }, tgAdmin ? "已填寫" : trade.adminRequired === false ? "伺服器未設 ADMIN_KEY，可留白" : "未填寫，下單與平倉會被拒絕")), /*#__PURE__*/React.createElement("input", {
+    type: "password",
+    value: tgAdmin,
+    onChange: e => setTgAdmin(e.target.value),
+    placeholder: "伺服器 ADMIN_KEY 環境變數的值",
+    className: "mt-2 w-full px-2.5 py-1.5 rounded",
+    style: {
+      background: C.panel,
+      border: `1px solid ${C.line}`,
+      color: C.bone,
+      fontSize: 12,
+      fontFamily: FONT.data
+    }
+  }), /*#__PURE__*/React.createElement("div", {
+    className: "mt-1.5",
+    style: {
+      fontSize: 10.5,
+      color: C.muted,
+      lineHeight: 1.6
+    }
+  }, "這是你在 Zeabur 設定的 ADMIN_KEY，用來防止別人透過你的網址下單。 只存在這台裝置的瀏覽器，不會送到別的地方。與「提醒設定」頁共用同一組。 若伺服器沒有設 ADMIN_KEY，留白即可。")), tradeMsg && /*#__PURE__*/React.createElement("div", {
     className: "mt-2 px-3 py-2 rounded",
     style: {
       fontSize: 12,
@@ -7717,7 +7764,7 @@ function CryptoScreener() {
         color: C.muted,
         lineHeight: 1.7
       }
-    }, "對", side === "bear" ? "空頭" : "多頭", "評分的影響：", detail.score ?? "—", " → ", /*#__PURE__*/React.createElement("span", {
+    }, "對", side === "bear" ? "空頭" : "多頭", "評分的影響：", detail.score == null ? "—" : r1(detail.score), " → ", /*#__PURE__*/React.createElement("span", {
       style: {
         color: adjB > (detail.score ?? 50) ? UP : adjB < (detail.score ?? 50) ? DOWN : C.bone
       }
@@ -7795,7 +7842,14 @@ function CryptoScreener() {
         color: C.ink,
         fontSize: 12
       }
-    }, tradeBusy ? "送出中…" : `送模擬單（${bear ? "做空" : "做多"}）`), /*#__PURE__*/React.createElement("div", {
+    }, tradeBusy ? "送出中…" : `送模擬單（${bear ? "做空" : "做多"}）`), !tgAdmin && trade.adminRequired !== false && /*#__PURE__*/React.createElement("div", {
+      className: "mt-1.5",
+      style: {
+        fontSize: 11,
+        color: C.gold,
+        lineHeight: 1.6
+      }
+    }, "尚未填管理金鑰。若伺服器有設 ADMIN_KEY，請先到「模擬單」分頁填入，否則會被拒絕。"), /*#__PURE__*/React.createElement("div", {
       className: "mt-2",
       style: {
         fontSize: 10.5,

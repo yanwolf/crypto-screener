@@ -427,7 +427,9 @@ def trade_handle(path, payload):
         return 500, {"error": "trader_module_missing"}
 
     if path == "/api/trade/status":
-        return 200, trader.status()
+        st = trader.status()
+        st["adminRequired"] = bool(os.environ.get("ADMIN_KEY", "").strip())
+        return 200, st
 
     if path == "/api/trade/check":
         base = str(payload.get("symbol", "")).strip()
