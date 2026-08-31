@@ -3084,6 +3084,7 @@ function CryptoScreener() {
   const [detail, setDetail] = useState(null);
   const [deriv, setDeriv] = useState({}); // id → 衍生品分析結果
   const [derivBusy, setDerivBusy] = useState(false);
+  const [tradeSide, setTradeSide] = useState(null); // null = 跟著分頁
   const [view, setView] = useState("radar");
   const [batch, setBatch] = useState({
     running: false,
@@ -3159,6 +3160,7 @@ function CryptoScreener() {
      全表掃描會白白浪費請求。結果快取 5 分鐘。 */
   useEffect(() => {
     if (!detail) return;
+    setTradeSide(null); // 換一檔就重設方向
     const id = detail.id;
     const hit = deriv[id];
     if (hit && Date.now() - (hit.updated || 0) < 300000) return;
@@ -3393,6 +3395,53 @@ function CryptoScreener() {
     push(cfg.key ? cfg.pro ? "金鑰：Pro" : "金鑰：Demo，每分鐘 30 次" : cfg.local ? "金鑰：瀏覽器未填。若已在 Zeabur 設定 CG_API_KEY，走代理時仍會生效。" : "金鑰：未填，每分鐘僅 5–15 次", cfg.key ? true : null);
     setDiagBusy(false);
   }, [cfg]);
+
+  /* 進場前的證據檢查：按鈕方向來自分頁，但方向對不對要看證據。
+     回傳 { blocks, warns }。blocks 非空就不該送單。 */
+  function tradeGate(detail, dv, bear) {
+    const blocks = [],
+      warns = [];
+    const score = detail.score;
+
+    // 衍生品方向與下單方向相反，是最強的反證
+    if (dv && dv.quadrant && dv.bias != null) {
+      const want = bear ? -1 : 1;
+      if (dv.bias * want < -0.5) {
+        blocks.push(`合約結構顯示「${dv.quadrant}」，與${bear ? "做空" : "做多"}方向相反`);
+      } else if (dv.bias * want < 0) {
+        warns.push(`合約結構偏「${dv.quadrant}」，與下單方向不一致`);
+      }
+    }
+
+    // 雷達分數過低代表現在沒有值得進場的資金動作
+    if (score != null) {
+      if (score < 45) blocks.push(`雷達分數只有 ${r1(score)}，目前沒有明顯的資金動作`);else if (score < 58) warns.push(`雷達分數 ${r1(score)} 偏低，訊號不算強`);
+    }
+
+    // 沉寂整理或退潮低迷時進場，等於在沒有動能的地方押注
+    if (!bear && ["沉寂整理", "退潮低迷"].includes(detail.stage)) {
+      blocks.push(`目前階段是「${detail.stage}」，量能與價格都沒有啟動`);
+    }
+    if (bear && ["加速上漲", "剛啟動"].includes(detail.stage)) {
+      blocks.push(`目前階段是「${detail.stage}」，逆勢做空風險高`);
+    }
+
+    // 量能沒有放大，多方進場缺少基本條件
+    if (!bear && detail.rvol7 != null && detail.rvol7 < 1.3) {
+      warns.push(`量能只有平常的 ${detail.rvol7.toFixed(2)} 倍，沒有放量`);
+    }
+
+    // 同方向過度擁擠
+    if (dv && (dv.crowd ?? 0) > 70) {
+      const fuel = dv.fuel || 0;
+      const want = bear ? -1 : 1;
+      if (fuel * want < 0) warns.push(`同方向部位擁擠度 ${dv.crowd}，反轉風險偏高`);
+    }
+    return {
+      blocks,
+      warns
+    };
+  }
 
   /* ── Binance 衍生品資料抓取 ────────────────────────────────
      公開端點免金鑰。瀏覽器直連時 Binance 有 CORS 允許，
@@ -7777,11 +7826,16 @@ function CryptoScreener() {
       }
     }, "資料為 Binance 公開端點，與現貨雷達的量價結論獨立。兩者一致時訊號較可靠，衝突時以量價結構為主。"));
   })(), (() => {
-    const bear = side === "bear";
+    const dv0 = deriv[detail.id];
+    const dvOk = dv0 && !dv0.none ? dv0 : null;
+    // 預設方向跟著分頁，但衍生品明確指向反向時，改推薦反向
+    const suggest = dvOk && dvOk.bias != null && Math.abs(dvOk.bias) >= 1 ? dvOk.bias > 0 ? "bull" : "bear" : null;
+    const bear = tradeSide != null ? tradeSide === "bear" : side === "bear";
     const plan = bear ? detail.bear : null;
     // 停損來源：空頭用結構停損，多頭用三刀流的綠線或 ATR 推算
     const stop = bear ? plan?.stop : detail.blades?.ma60 ? detail.blades.ma60 * 0.995 : detail.price ? detail.price * 0.94 : null;
     const ok = stop != null && detail.price != null && (bear ? stop > detail.price : stop < detail.price);
+    const gate = tradeGate(detail, dvOk, bear);
     return /*#__PURE__*/React.createElement("div", {
       className: "mt-3 rounded p-3",
       style: {
@@ -7795,12 +7849,60 @@ function CryptoScreener() {
         fontFamily: FONT.display,
         fontSize: 13
       }
-    }, "模擬單"), /*#__PURE__*/React.createElement("span", {
+    }, "模擬單"), /*#__PURE__*/React.createElement("div", {
+      className: "flex rounded overflow-hidden",
+      style: {
+        border: `1px solid ${C.line}`
+      }
+    }, [["bull", "做多"], ["bear", "做空"]].map(([v, t]) => /*#__PURE__*/React.createElement("button", {
+      key: v,
+      onClick: () => setTradeSide(v),
+      className: "px-2.5 py-1",
+      style: {
+        background: v === "bear" === bear ? v === "bear" ? DOWN : UP : "transparent",
+        color: v === "bear" === bear ? C.ink : C.muted,
+        fontSize: 11.5
+      }
+    }, t))), /*#__PURE__*/React.createElement("span", {
       style: {
         fontSize: 11,
         color: C.muted
       }
-    }, bear ? "做空" : "做多", "\u3000停損 ", stop ? fmtPrice(stop) : "—")), !ok ? /*#__PURE__*/React.createElement("div", {
+    }, "停損 ", stop ? fmtPrice(stop) : "—")), suggest && suggest === "bear" !== bear && /*#__PURE__*/React.createElement("div", {
+      className: "mt-2 px-2.5 py-1.5 rounded",
+      style: {
+        background: C.panel,
+        border: `1px solid ${C.gold}`,
+        fontSize: 11.5,
+        color: C.gold,
+        lineHeight: 1.7
+      }
+    }, "合約結構其實指向", suggest === "bear" ? "空方" : "多方", "（", dvOk.quadrant, "）。", /*#__PURE__*/React.createElement("button", {
+      onClick: () => setTradeSide(suggest),
+      className: "ml-1 underline"
+    }, "切換為", suggest === "bear" ? "做空" : "做多")), gate.blocks.length > 0 && /*#__PURE__*/React.createElement("div", {
+      className: "mt-2 px-2.5 py-2 rounded",
+      style: {
+        background: "#241A1A",
+        border: `1px solid ${C.red}`,
+        fontSize: 11.5,
+        color: C.red,
+        lineHeight: 1.8
+      }
+    }, "不建議進場：", gate.blocks.map((b, i) => /*#__PURE__*/React.createElement("div", {
+      key: i
+    }, "· ", b))), gate.blocks.length === 0 && gate.warns.length > 0 && /*#__PURE__*/React.createElement("div", {
+      className: "mt-2 px-2.5 py-2 rounded",
+      style: {
+        background: C.panel,
+        border: `1px solid ${C.gold}`,
+        fontSize: 11.5,
+        color: C.gold,
+        lineHeight: 1.8
+      }
+    }, "需留意：", gate.warns.map((w, i) => /*#__PURE__*/React.createElement("div", {
+      key: i
+    }, "· ", w))), !ok ? /*#__PURE__*/React.createElement("div", {
       className: "mt-2",
       style: {
         fontSize: 11.5,
@@ -7835,14 +7937,15 @@ function CryptoScreener() {
           setTradeMsg(["err", j?.error || "下單失敗"]);
         }
       },
-      disabled: tradeBusy,
+      disabled: tradeBusy || gate.blocks.length > 0,
       className: "mt-2 px-3 py-1.5 rounded",
       style: {
-        background: bear ? DOWN : UP,
-        color: C.ink,
-        fontSize: 12
+        background: gate.blocks.length > 0 ? C.panel : bear ? DOWN : UP,
+        color: gate.blocks.length > 0 ? C.muted : C.ink,
+        fontSize: 12,
+        border: gate.blocks.length > 0 ? `1px solid ${C.line}` : "none"
       }
-    }, tradeBusy ? "送出中…" : `送模擬單（${bear ? "做空" : "做多"}）`), !tgAdmin && trade.adminRequired !== false && /*#__PURE__*/React.createElement("div", {
+    }, tradeBusy ? "送出中…" : gate.blocks.length > 0 ? "證據不足，已停用" : `送模擬單（${bear ? "做空" : "做多"}）`), !tgAdmin && trade.adminRequired !== false && /*#__PURE__*/React.createElement("div", {
       className: "mt-1.5",
       style: {
         fontSize: 11,
