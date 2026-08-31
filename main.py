@@ -541,6 +541,12 @@ def keyless_now() -> bool:
     return True
 
 
+def effective_gap() -> float:
+    """無金鑰公開端點官方標示 5–15 次/分，取保守值 6 秒一次；
+    有金鑰時沿用設定值。"""
+    return max(CFG["gap"], 6.0) if keyless_now() else CFG["gap"]
+
+
 def upstream_url(path_qs: str) -> str:
     keyless = keyless_now()
     base = PRO_BASE if (CFG["pro"] and not keyless) else PUBLIC_BASE
