@@ -66,6 +66,7 @@ UPSTREAMS = {
 }
 
 CACHE_TTL = 45.0          # 行情快取秒數，重新整理不會重複打 API
+STALE_GRACE = 600.0       # 過期後仍可先送舊資料的寬限秒數（背景同時更新）
 OHLC_TTL = 1800.0         # 90 日 K 線快取半小時，這種資料不會秒變
 
 START_TS = time.time()
@@ -81,6 +82,52 @@ DISK_TTL = 12 * 3600.0          # 深度資料寫入磁碟，重啟後仍可用
 
 def _disk_path(key: str) -> str:
     return os.path.join(CACHE_DIR, hashlib.sha1(key.encode()).hexdigest() + ".json")
+
+
+def cache_peek(key: str):
+    """不管 TTL，取出快取內容與年齡（秒）。找不到回 (None, None)。"""
+    now = time.time()
+    with _cache_lock:
+        hit = _cache.get(key)
+    if hit:
+        return hit[1], now - hit[0]
+    p = _disk_path(key)
+    if os.path.exists(p):
+        try:
+            with open(p, "rb") as f:
+                blob = json.loads(f.read())
+            body = blob["body"].encode()
+            with _cache_lock:
+                _cache[key] = (blob["ts"], body)
+            return body, now - blob["ts"]
+        except Exception:
+            pass
+    return None, None
+
+
+_revalidating = set()
+_reval_lock = threading.Lock()
+
+
+def revalidate_async(path_qs, prefix, key):
+    """背景更新快取。同一個 key 同時只跑一輪，避免重複打上游。"""
+    with _reval_lock:
+        if key in _revalidating:
+            return
+        _revalidating.add(key)
+
+    def run():
+        try:
+            st, body = fetch_upstream(path_qs, prefix)
+            if st == 200:
+                cache_put(key, body)
+        except Exception:
+            pass
+        finally:
+            with _reval_lock:
+                _revalidating.discard(key)
+
+    threading.Thread(target=run, daemon=True).start()
 
 
 def cache_get(key: str, ttl: float):
@@ -954,19 +1001,31 @@ class Handler(http.server.SimpleHTTPRequestHandler):
     def handle_proxy(self, prefix="/api/v3"):
         path_qs = self.path[len(prefix):]
         key = prefix + path_qs
-        cached = cache_get(key, ttl_for(path_qs))
+        ttl = ttl_for(path_qs)
+
+        cached = cache_get(key, ttl)
         if cached is not None:
             return self.send_json(200, cached, cached=True)
+
+        # 快取過期但還在寬限期內：先把舊資料送出去，背景再更新。
+        # 節流閘與重試會讓同步等待長達十幾秒，這段等待對使用者沒有價值——
+        # 行情差幾十秒不影響量能倍數的判讀，畫面卡住才是問題。
+        stale, age = cache_peek(key)
+        if stale is not None and age is not None and age < ttl + STALE_GRACE:
+            revalidate_async(path_qs, prefix, key)
+            return self.send_json(200, stale, cached=True, stale=int(age))
 
         status, body = fetch_upstream(path_qs, prefix)
         if status == 200:
             cache_put(key, body)
         self.send_json(status, body)
 
-    def send_json(self, code, body, cached=False):
+    def send_json(self, code, body, cached=False, stale=None):
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Access-Control-Allow-Origin", "*")
+        if stale is not None:
+            self.send_header("X-Stale-Age", str(stale))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Cache", "HIT" if cached else "MISS")
         self.send_header("Content-Length", str(len(body)))

@@ -352,6 +352,10 @@ const gate = {
   last: 0,
   chain: Promise.resolve()
 };
+const lastStale = {
+  age: null
+}; // 伺服器回舊資料時的年齡（秒）
+
 function buildUrl(path, {
   key,
   pro,
@@ -410,6 +414,8 @@ async function cgFetch(path, cfg) {
         throw new Error("SERVER");
       }
       if (!res.ok) throw new Error("HTTP " + res.status);
+      const sa = res.headers.get("X-Stale-Age");
+      lastStale.age = sa ? parseInt(sa, 10) : null; // 伺服器標示這份是舊快取
       return res.json();
     }
   }, minGap);
@@ -1805,6 +1811,8 @@ async function chainFetch(kind, path, cfg) {
         throw new Error("RATE");
       }
       if (!res.ok) throw new Error("HTTP " + res.status);
+      const sa = res.headers.get("X-Stale-Age");
+      lastStale.age = sa ? parseInt(sa, 10) : null; // 伺服器標示這份是舊快取
       return res.json();
     }
   }, 2200);
@@ -3026,6 +3034,7 @@ function CryptoScreener() {
   const [bgScan, setBgScan] = useState(false);
   const [loading, setLoading] = useState(false);
   const [loadSec, setLoadSec] = useState(0);
+  const [staleAge, setStaleAge] = useState(null);
   const [error, setError] = useState(null);
   const [updated, setUpdated] = useState(null);
   const [source, setSource] = useState(null);
@@ -3253,6 +3262,7 @@ function CryptoScreener() {
       if (!rawRef.current.length) loadDemo();
     } finally {
       setLoading(false);
+      setStaleAge(lastStale.age);
     }
   }, [pages, cfg, loadDemo]);
   loadRef.current = loadMarkets;
@@ -4818,7 +4828,11 @@ function CryptoScreener() {
     style: {
       color: C.muted
     }
-  }, "· ", local ? "伺服器代理" : "瀏覽器直連")), showConn && /*#__PURE__*/React.createElement("div", {
+  }, "· ", local ? "伺服器代理" : "瀏覽器直連"), staleAge != null && staleAge > 60 && /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: C.gold
+    }
+  }, "· 行情為 ", staleAge < 120 ? "約 1 分鐘" : Math.round(staleAge / 60) + " 分鐘", "前的快取，背景更新中")), showConn && /*#__PURE__*/React.createElement("div", {
     className: "w-full rounded p-3 grid gap-2.5",
     style: {
       background: C.panel,

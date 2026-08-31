@@ -324,6 +324,29 @@ def set_leverage(symbol, lev):
     return _request("POST", "/fapi/v1/leverage", {"symbol": symbol, "leverage": int(lev)}, signed=True)
 
 
+
+
+def wait_position(symbol, want_qty, tries=12, gap=0.5):
+    """等部位出現在帳戶上，回傳 (實際數量, 進場均價)。
+
+    市價單成交與 positionRisk 更新之間有延遲，直接掛條件單會被拒。
+    這裡輪詢到部位出現為止，最多約 6 秒。
+    """
+    for i in range(tries):
+        st, d = _request("GET", "/fapi/v2/positionRisk", {"symbol": symbol}, signed=True)
+        if st == 200 and isinstance(d, list):
+            for p in d:
+                try:
+                    amt = abs(float(p.get("positionAmt") or 0))
+                    ep = float(p.get("entryPrice") or 0)
+                except Exception:
+                    continue
+                if amt > 0:
+                    return amt, (ep or None)
+        time.sleep(gap)
+    return 0.0, None
+
+
 def open_position(symbol_base, side, entry_hint, stop, info=None, note=""):
     """進場：市價單 + 停損單 + 部分停利 + 移動停利。
 
@@ -356,11 +379,25 @@ def open_position(symbol_base, side, entry_hint, stop, info=None, note=""):
     order_side = "BUY" if side == "LONG" else "SELL"
     close_side = "SELL" if side == "LONG" else "BUY"
 
+    # newOrderRespType=RESULT 讓市價單回傳成交結果而非只回 ACK，
+    # 這樣才拿得到實際成交均價。
     st, entry_res = _request("POST", "/fapi/v1/order", {
         "symbol": sym, "side": order_side, "type": "MARKET", "quantity": qty,
+        "newOrderRespType": "RESULT",
     }, signed=True)
     if st != 200:
         return {"ok": False, "error": f"進場失敗：{entry_res.get('msg') or entry_res}"}
+
+    # 等部位真的出現在帳戶上再掛條件單。
+    # 幣安的成交與部位更新之間有延遲，太早掛 closePosition=true 的單會被拒，
+    # 錯誤訊息是「TIF GTE can only be used with open positions」。
+    actual_qty, actual_entry = wait_position(sym, qty)
+    if actual_qty <= 0:
+        return {"ok": False, "error": "進場單已送出，但 6 秒內查不到部位，請到幣安確認後手動處理"}
+    qty = actual_qty
+    if actual_entry:
+        px = actual_entry            # 用實際成交均價重算出場位階
+        exits = plan_exits(px, stop, side)
 
     tick = (info or {}).get("tick") or 0.01
     stop_px = round_step(stop, tick)
