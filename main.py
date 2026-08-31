@@ -62,6 +62,7 @@ UPSTREAMS = {
     "/api/v3": None,                                    # CoinGecko，另有金鑰處理
     "/api/gt": "https://api.geckoterminal.com/api/v2",
     "/api/gp": "https://api.gopluslabs.io/api/v1",
+    "/api/bn": "https://fapi.binance.com",              # Binance USDT 永續合約，公開端點免金鑰
 }
 
 CACHE_TTL = 45.0          # 行情快取秒數，重新整理不會重複打 API
@@ -115,6 +116,8 @@ _gate_lock = threading.Lock()
 _chain_lock = threading.Lock()
 _last_call = [0.0]
 _last_chain = [0.0]
+_bn_lock = threading.Lock()
+_last_bn = [0.0]
 
 CFG = {"key": "", "pro": False, "gap": 2.4}
 NOTIFY = {"tg_token": "", "tg_chat": "", "discord": "",
@@ -464,6 +467,7 @@ def upstream_probe():
          + (("?" + ("x_cg_pro_api_key=" if CFG["pro"] else "x_cg_demo_api_key=")
              + urllib.parse.quote(CFG["key"])) if CFG["key"] else "")),
         ("GeckoTerminal", UPSTREAMS["/api/gt"] + "/networks"),
+        ("Binance 合約", UPSTREAMS["/api/bn"] + "/fapi/v1/ping"),
     ]
     for name, url in targets:
         t0 = time.time()
@@ -549,6 +553,12 @@ def upstream_url(path_qs: str) -> str:
 
 
 def ttl_for(path_qs: str) -> float:
+    if "/futures/data/" in path_qs:
+        return 240.0            # 未平倉量／多空比每 5 分鐘一根，快取 4 分鐘
+    if "/premiumIndex" in path_qs:
+        return 60.0             # 資金費率變動慢
+    if "/fundingRate" in path_qs or "/exchangeInfo" in path_qs:
+        return 1800.0
     if "/token_security" in path_qs:
         return 900.0            # 合約檢查結果變動慢
     if "/trades" in path_qs or "_pools" in path_qs:
@@ -563,9 +573,12 @@ def fetch_upstream(path_qs: str, prefix: str = "/api/v3"):
         "User-Agent": "local-crypto-screener/1.0",
         "Accept": "application/json",
     })
-    gap = CFG["gap"] if prefix == "/api/v3" else 2.2
-    lock = _gate_lock if prefix == "/api/v3" else _chain_lock
-    slot = _last_call if prefix == "/api/v3" else _last_chain
+    if prefix == "/api/v3":
+        gap, lock, slot = effective_gap(), _gate_lock, _last_call
+    elif prefix == "/api/bn":
+        gap, lock, slot = 0.25, _bn_lock, _last_bn     # Binance 權重制，可較密集
+    else:
+        gap, lock, slot = 2.2, _chain_lock, _last_chain
     for attempt in range(3):
         with lock:
             wait = gap - (time.time() - slot[0])

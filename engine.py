@@ -608,3 +608,138 @@ def alert_text(e):
         L += ["", f"首次觸發 {fmt_price(e['firstPrice'])} / {e['firstScore']:.0f} 分"]
     L += ["", "僅供技術分析參考，不構成投資建議。"]
     return title, "\n".join(L)
+
+
+# ── 衍生品指標（Binance USDT 永續合約）────────────────────────
+#
+# 資料來源都是免金鑰的公開端點：
+#   /futures/data/openInterestHist          未平倉合約量歷史
+#   /futures/data/globalLongShortAccountRatio 全市場多空帳戶比
+#   /futures/data/takerlongshortRatio       主動買賣量比
+#   /fapi/v1/premiumIndex                   現時資金費率
+#
+# 這裡不做「熱力圖」那種二維結構，改用可量化成分數的時間序列。
+# 修改門檻時，core.jsx 的 derivAnalyze 必須同步。
+
+
+def _pct_rank_of(arr, v):
+    """v 在 arr 中的百分位（0–100），用來判斷「相對於自己的歷史是否極端」"""
+    a = [x for x in arr if x is not None and math.isfinite(x)]
+    if len(a) < 5 or v is None or not math.isfinite(v):
+        return None
+    below = sum(1 for x in a if x < v)
+    return 100.0 * below / len(a)
+
+
+def deriv_analyze(d):
+    """d 內含 oi（未平倉量序列）、ls（多空帳戶比序列）、taker（主動買賣比序列）、
+    funding（現時資金費率）、fundingHist（歷史資金費率）、chg24（24 小時漲跌 %）。
+    回傳可直接進評分的欄位。"""
+    oi = [x for x in (d.get("oi") or []) if x is not None and math.isfinite(x)]
+    ls = [x for x in (d.get("ls") or []) if x is not None and math.isfinite(x)]
+    tk = [x for x in (d.get("taker") or []) if x is not None and math.isfinite(x)]
+    fh = [x for x in (d.get("fundingHist") or []) if x is not None and math.isfinite(x)]
+    fund = d.get("funding")
+    chg24 = d.get("chg24")
+
+    out = {
+        "oiChg4h": None, "oiChg24h": None, "oiNow": (oi[-1] if oi else None),
+        "funding": fund, "fundingApr": None, "fundingRank": None,
+        "lsRatio": (ls[-1] if ls else None), "lsChg": None,
+        "taker": (tk[-1] if tk else None),
+        "quadrant": None, "crowd": None, "fuel": None, "note": None, "bias": 0.0,
+    }
+
+    # 未平倉量變化：資料為每小時一根
+    if len(oi) >= 5 and oi[-5] > 0:
+        out["oiChg4h"] = 100.0 * (oi[-1] - oi[-5]) / oi[-5]
+    if len(oi) >= 25 and oi[-25] > 0:
+        out["oiChg24h"] = 100.0 * (oi[-1] - oi[-25]) / oi[-25]
+    if len(ls) >= 25 and ls[-25] > 0:
+        out["lsChg"] = 100.0 * (ls[-1] - ls[-25]) / ls[-25]
+
+    if fund is not None and math.isfinite(fund):
+        out["fundingApr"] = fund * 3 * 365 * 100.0      # 每 8 小時結算一次
+        out["fundingRank"] = _pct_rank_of(fh, fund)
+
+    oc = out["oiChg24h"]
+    # ── 價格 × 未平倉量 四象限 ──
+    # 這是衍生品分析的核心：同樣的漲跌，資金性質完全不同。
+    if oc is not None and chg24 is not None:
+        rising = chg24 > 0.5
+        falling = chg24 < -0.5
+        oi_up = oc > 1.5
+        oi_dn = oc < -1.5
+        if rising and oi_up:
+            out["quadrant"] = "多方新倉"
+            out["note"] = "價漲且未平倉量增加，是新資金做多，趨勢有底氣。"
+            out["bias"] = 1.0
+        elif rising and oi_dn:
+            out["quadrant"] = "空單回補"
+            out["note"] = "價漲但未平倉量減少，是空單認賠推升，軋空行情續航力較弱。"
+            out["bias"] = 0.3
+        elif falling and oi_up:
+            out["quadrant"] = "空方新倉"
+            out["note"] = "價跌且未平倉量增加，是新資金做空，下跌有延續性。"
+            out["bias"] = -1.0
+        elif falling and oi_dn:
+            out["quadrant"] = "多單出場"
+            out["note"] = "價跌但未平倉量減少，是多單平倉或被清算，賣壓可能接近尾聲。"
+            out["bias"] = -0.3
+        else:
+            out["quadrant"] = "盤整"
+            out["note"] = "價格與未平倉量都沒有明確方向。"
+            out["bias"] = 0.0
+
+    # ── 擁擠度：某一方是否過度集中（0–100，越高越擁擠）──
+    crowd = 0.0
+    if out["fundingApr"] is not None:
+        # 年化資金費率 50% 以上視為明顯偏多擁擠
+        crowd += clamp(abs(out["fundingApr"]) / 50.0, 0, 1) * 45
+    if out["fundingRank"] is not None:
+        crowd += clamp(abs(out["fundingRank"] - 50) / 50.0, 0, 1) * 25
+    if out["lsRatio"] is not None:
+        crowd += clamp(abs(out["lsRatio"] - 1.0) / 1.2, 0, 1) * 30
+    out["crowd"] = round(clamp(crowd, 0, 100), 1)
+
+    # ── 軋空／軋多燃料：擁擠方向與未平倉量的乘積 ──
+    # 正值代表空方擁擠（軋空燃料），負值代表多方擁擠（回調燃料）。
+    if fund is not None and math.isfinite(fund):
+        side = -1.0 if fund > 0 else 1.0        # 資金費率為正＝多方付錢＝多方擁擠
+        mag = clamp(abs(out["fundingApr"] or 0) / 60.0, 0, 1)
+        if oc is not None:
+            mag *= clamp(0.5 + oc / 20.0, 0.3, 1.5)
+        out["fuel"] = round(clamp(side * mag * 100, -100, 100), 1)
+
+    return out
+
+
+def deriv_score_adjust(base, dv, side="bull"):
+    """把衍生品結論回饋到雷達分數。刻意做成小幅調整而非主導，
+    因為衍生品是輔助證據，主結構仍由量價與均線決定。"""
+    if not dv or dv.get("quadrant") is None:
+        return base, None
+    bias = dv.get("bias") or 0.0
+    crowd = dv.get("crowd") or 0.0
+    adj, why = 0.0, []
+
+    want = 1.0 if side == "bull" else -1.0
+    if bias * want > 0:
+        adj += 6.0 * abs(bias)
+        why.append(f"{dv['quadrant']}，與方向一致")
+    elif bias * want < 0:
+        adj -= 8.0 * abs(bias)
+        why.append(f"{dv['quadrant']}，與方向相反")
+
+    # 同方向過度擁擠要扣分：這是反轉風險，不是助力。
+    # 門檻壓到 55 且加重權重，讓極端資金費率足以抵銷順勢加分。
+    if crowd > 55:
+        fuel = dv.get("fuel") or 0.0
+        if fuel * want < 0:              # 自己這方擁擠
+            adj -= clamp((crowd - 55) / 45.0, 0, 1) * 16.0
+            why.append("同方向部位過度擁擠，反轉風險升高")
+        else:
+            adj += clamp((crowd - 55) / 45.0, 0, 1) * 8.0
+            why.append("對手方擁擠，具備軋倉燃料")
+
+    return round(clamp(base + adj, 0, 100), 1), "；".join(why) if why else None

@@ -1,34 +1,14 @@
 <!DOCTYPE html>
-<html lang="zh-Hant">
-<head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-<title>加密貨幣量能雷達</title>
-<meta name="theme-color" content="#0C1418" />
-<meta name="color-scheme" content="dark" />
-<link rel="manifest" href="./manifest.webmanifest" />
-<link rel="apple-touch-icon" href="./apple-touch-icon.png" />
-<meta name="apple-mobile-web-app-capable" content="yes" />
-<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
-<meta name="apple-mobile-web-app-title" content="量能雷達" />
-<meta name="mobile-web-app-capable" content="yes" />
-<style>*,:after,:before{--tw-border-spacing-x:0;--tw-border-spacing-y:0;--tw-translate-x:0;--tw-translate-y:0;--tw-rotate:0;--tw-skew-x:0;--tw-skew-y:0;--tw-scale-x:1;--tw-scale-y:1;--tw-pan-x: ;--tw-pan-y: ;--tw-pinch-zoom: ;--tw-scroll-snap-strictness:proximity;--tw-gradient-from-position: ;--tw-gradient-via-position: ;--tw-gradient-to-position: ;--tw-ordinal: ;--tw-slashed-zero: ;--tw-numeric-figure: ;--tw-numeric-spacing: ;--tw-numeric-fraction: ;--tw-ring-inset: ;--tw-ring-offset-width:0px;--tw-ring-offset-color:#fff;--tw-ring-color:rgba(59,130,246,.5);--tw-ring-offset-shadow:0 0 #0000;--tw-ring-shadow:0 0 #0000;--tw-shadow:0 0 #0000;--tw-shadow-colored:0 0 #0000;--tw-blur: ;--tw-brightness: ;--tw-contrast: ;--tw-grayscale: ;--tw-hue-rotate: ;--tw-invert: ;--tw-saturate: ;--tw-sepia: ;--tw-drop-shadow: ;--tw-backdrop-blur: ;--tw-backdrop-brightness: ;--tw-backdrop-contrast: ;--tw-backdrop-grayscale: ;--tw-backdrop-hue-rotate: ;--tw-backdrop-invert: ;--tw-backdrop-opacity: ;--tw-backdrop-saturate: ;--tw-backdrop-sepia: ;--tw-contain-size: ;--tw-contain-layout: ;--tw-contain-paint: ;--tw-contain-style: }::backdrop{--tw-border-spacing-x:0;--tw-border-spacing-y:0;--tw-translate-x:0;--tw-translate-y:0;--tw-rotate:0;--tw-skew-x:0;--tw-skew-y:0;--tw-scale-x:1;--tw-scale-y:1;--tw-pan-x: ;--tw-pan-y: ;--tw-pinch-zoom: ;--tw-scroll-snap-strictness:proximity;--tw-gradient-from-position: ;--tw-gradient-via-position: ;--tw-gradient-to-position: ;--tw-ordinal: ;--tw-slashed-zero: ;--tw-numeric-figure: ;--tw-numeric-spacing: ;--tw-numeric-fraction: ;--tw-ring-inset: ;--tw-ring-offset-width:0px;--tw-ring-offset-color:#fff;--tw-ring-color:rgba(59,130,246,.5);--tw-ring-offset-shadow:0 0 #0000;--tw-ring-shadow:0 0 #0000;--tw-shadow:0 0 #0000;--tw-shadow-colored:0 0 #0000;--tw-blur: ;--tw-brightness: ;--tw-contrast: ;--tw-grayscale: ;--tw-hue-rotate: ;--tw-invert: ;--tw-saturate: ;--tw-sepia: ;--tw-drop-shadow: ;--tw-backdrop-blur: ;--tw-backdrop-brightness: ;--tw-backdrop-contrast: ;--tw-backdrop-grayscale: ;--tw-backdrop-hue-rotate: ;--tw-backdrop-invert: ;--tw-backdrop-opacity: ;--tw-backdrop-saturate: ;--tw-backdrop-sepia: ;--tw-contain-size: ;--tw-contain-layout: ;--tw-contain-paint: ;--tw-contain-style: }/*! tailwindcss v3.4.17 | MIT License | https://tailwindcss.com*/*,:after,:before{box-sizing:border-box;border:0 solid #e5e7eb}:after,:before{--tw-content:""}:host,html{line-height:1.5;-webkit-text-size-adjust:100%;-moz-tab-size:4;-o-tab-size:4;tab-size:4;font-family:ui-sans-serif,system-ui,sans-serif,Apple Color Emoji,Segoe UI Emoji,Segoe UI Symbol,Noto Color Emoji;font-feature-settings:normal;font-variation-settings:normal;-webkit-tap-highlight-color:transparent}body{margin:0;line-height:inherit}hr{height:0;color:inherit;border-top-width:1px}abbr:where([title]){-webkit-text-decoration:underline dotted;text-decoration:underline dotted}h1,h2,h3,h4,h5,h6{font-size:inherit;font-weight:inherit}a{color:inherit;text-decoration:inherit}b,strong{font-weight:bolder}code,kbd,pre,samp{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,Liberation Mono,Courier New,monospace;font-feature-settings:normal;font-variation-settings:normal;font-size:1em}small{font-size:80%}sub,sup{font-size:75%;line-height:0;position:relative;vertical-align:baseline}sub{bottom:-.25em}sup{top:-.5em}table{text-indent:0;border-color:inherit;border-collapse:collapse}button,input,optgroup,select,textarea{font-family:inherit;font-feature-settings:inherit;font-variation-settings:inherit;font-size:100%;font-weight:inherit;line-height:inherit;letter-spacing:inherit;color:inherit;margin:0;padding:0}button,select{text-transform:none}button,input:where([type=button]),input:where([type=reset]),input:where([type=submit]){-webkit-appearance:button;background-color:transparent;background-image:none}:-moz-focusring{outline:auto}:-moz-ui-invalid{box-shadow:none}progress{vertical-align:baseline}::-webkit-inner-spin-button,::-webkit-outer-spin-button{height:auto}[type=search]{-webkit-appearance:textfield;outline-offset:-2px}::-webkit-search-decoration{-webkit-appearance:none}::-webkit-file-upload-button{-webkit-appearance:button;font:inherit}summary{display:list-item}blockquote,dd,dl,figure,h1,h2,h3,h4,h5,h6,hr,p,pre{margin:0}fieldset{margin:0}fieldset,legend{padding:0}menu,ol,ul{list-style:none;margin:0;padding:0}dialog{padding:0}textarea{resize:vertical}input::-moz-placeholder,textarea::-moz-placeholder{opacity:1;color:#9ca3af}input::placeholder,textarea::placeholder{opacity:1;color:#9ca3af}[role=button],button{cursor:pointer}:disabled{cursor:default}audio,canvas,embed,iframe,img,object,svg,video{display:block;vertical-align:middle}img,video{max-width:100%;height:auto}[hidden]:where(:not([hidden=until-found])){display:none}.collapse{visibility:collapse}.fixed{position:fixed}.sticky{position:sticky}.inset-0{inset:0}.top-0{top:0}.mx-4{margin-left:1rem;margin-right:1rem}.mb-1{margin-bottom:.25rem}.mb-1\.5{margin-bottom:.375rem}.mb-2{margin-bottom:.5rem}.mb-2\.5{margin-bottom:.625rem}.ml-1{margin-left:.25rem}.ml-2{margin-left:.5rem}.ml-auto{margin-left:auto}.mt-1{margin-top:.25rem}.mt-1\.5{margin-top:.375rem}.mt-2{margin-top:.5rem}.mt-2\.5{margin-top:.625rem}.mt-3{margin-top:.75rem}.mt-4{margin-top:1rem}.block{display:block}.inline-block{display:inline-block}.flex{display:flex}.table{display:table}.grid{display:grid}.hidden{display:none}.h-1\.5{height:.375rem}.w-12{width:3rem}.w-16{width:4rem}.w-5{width:1.25rem}.w-full{width:100%}.flex-1{flex:1 1 0%}.shrink-0{flex-shrink:0}.cursor-pointer{cursor:pointer}.select-none{-webkit-user-select:none;-moz-user-select:none;user-select:none}.resize{resize:both}.grid-cols-2{grid-template-columns:repeat(2,minmax(0,1fr))}.grid-cols-3{grid-template-columns:repeat(3,minmax(0,1fr))}.flex-col{flex-direction:column}.flex-wrap{flex-wrap:wrap}.items-start{align-items:flex-start}.items-end{align-items:flex-end}.items-center{align-items:center}.items-baseline{align-items:baseline}.justify-end{justify-content:flex-end}.justify-center{justify-content:center}.justify-between{justify-content:space-between}.gap-1{gap:.25rem}.gap-1\.5{gap:.375rem}.gap-2{gap:.5rem}.gap-2\.5{gap:.625rem}.gap-3{gap:.75rem}.gap-4{gap:1rem}.gap-x-3{-moz-column-gap:.75rem;column-gap:.75rem}.gap-x-4{-moz-column-gap:1rem;column-gap:1rem}.gap-x-6{-moz-column-gap:1.5rem;column-gap:1.5rem}.gap-y-1{row-gap:.25rem}.gap-y-1\.5{row-gap:.375rem}.gap-y-3{row-gap:.75rem}.self-start{align-self:flex-start}.self-center{align-self:center}.overflow-hidden{overflow:hidden}.overflow-x-auto{overflow-x:auto}.whitespace-nowrap{white-space:nowrap}.break-all{word-break:break-all}.rounded{border-radius:.25rem}.rounded-sm{border-radius:.125rem}.rounded-t{border-top-left-radius:.25rem;border-top-right-radius:.25rem}.rounded-t-lg{border-top-left-radius:.5rem;border-top-right-radius:.5rem}.border{border-width:1px}.p-0{padding:0}.p-2\.5{padding:.625rem}.p-3{padding:.75rem}.p-3\.5{padding:.875rem}.p-4{padding:1rem}.px-1\.5{padding-left:.375rem;padding-right:.375rem}.px-2{padding-left:.5rem;padding-right:.5rem}.px-2\.5{padding-left:.625rem;padding-right:.625rem}.px-3{padding-left:.75rem;padding-right:.75rem}.px-3\.5{padding-left:.875rem;padding-right:.875rem}.px-4{padding-left:1rem;padding-right:1rem}.py-0\.5{padding-top:.125rem;padding-bottom:.125rem}.py-1{padding-top:.25rem;padding-bottom:.25rem}.py-1\.5{padding-top:.375rem;padding-bottom:.375rem}.py-10{padding-top:2.5rem;padding-bottom:2.5rem}.py-2{padding-top:.5rem;padding-bottom:.5rem}.py-2\.5{padding-top:.625rem;padding-bottom:.625rem}.py-3{padding-top:.75rem;padding-bottom:.75rem}.py-4{padding-top:1rem;padding-bottom:1rem}.pt-2{padding-top:.5rem}.pt-3{padding-top:.75rem}.text-left{text-align:left}.text-center{text-align:center}.text-right{text-align:right}.underline{text-decoration-line:underline}.filter{filter:var(--tw-blur) var(--tw-brightness) var(--tw-contrast) var(--tw-grayscale) var(--tw-hue-rotate) var(--tw-invert) var(--tw-saturate) var(--tw-sepia) var(--tw-drop-shadow)}@media (min-width:768px){.md\:col-span-2{grid-column:span 2/span 2}.md\:mx-6{margin-left:1.5rem;margin-right:1.5rem}.md\:max-w-xl{max-width:36rem}.md\:grid-cols-2{grid-template-columns:repeat(2,minmax(0,1fr))}.md\:grid-cols-4{grid-template-columns:repeat(4,minmax(0,1fr))}.md\:grid-cols-5{grid-template-columns:repeat(5,minmax(0,1fr))}.md\:items-center{align-items:center}.md\:rounded-lg{border-radius:.5rem}.md\:p-6{padding:1.5rem}.md\:px-6{padding-left:1.5rem;padding-right:1.5rem}}</style>
-<style>
-  html,body{margin:0;background:#0C1418;-webkit-text-size-adjust:100%;}
-  /* 瀏海與底部手勢列的安全區 */
-  body{padding:env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);}
-  /* 安裝成 App 後停用整頁彈跳，避免下拉時看到白邊 */
-  @media (display-mode: standalone){ html,body{overscroll-behavior-y:none;} }
-  button,select,input,textarea{font-family:inherit;}
-  input,select,textarea{font-size:16px;}   /* 低於 16px 時 iOS 會自動放大整頁 */
-  ::-webkit-scrollbar{width:9px;height:9px}
-  ::-webkit-scrollbar-thumb{background:#22383F;border-radius:6px}
-  ::-webkit-scrollbar-track{background:#0C1418}
-  :focus-visible{outline:2px solid #D9A441;outline-offset:2px}
-  @media (prefers-reduced-motion: reduce){*{transition:none!important;animation:none!important}}
+<html lang="zh-Hant"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#070B0D">
+<title>加密貨幣量能異動雷達</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<style>*,:after,:before{--tw-border-spacing-x:0;--tw-border-spacing-y:0;--tw-translate-x:0;--tw-translate-y:0;--tw-rotate:0;--tw-skew-x:0;--tw-skew-y:0;--tw-scale-x:1;--tw-scale-y:1;--tw-pan-x: ;--tw-pan-y: ;--tw-pinch-zoom: ;--tw-scroll-snap-strictness:proximity;--tw-gradient-from-position: ;--tw-gradient-via-position: ;--tw-gradient-to-position: ;--tw-ordinal: ;--tw-slashed-zero: ;--tw-numeric-figure: ;--tw-numeric-spacing: ;--tw-numeric-fraction: ;--tw-ring-inset: ;--tw-ring-offset-width:0px;--tw-ring-offset-color:#fff;--tw-ring-color:rgba(59,130,246,.5);--tw-ring-offset-shadow:0 0 #0000;--tw-ring-shadow:0 0 #0000;--tw-shadow:0 0 #0000;--tw-shadow-colored:0 0 #0000;--tw-blur: ;--tw-brightness: ;--tw-contrast: ;--tw-grayscale: ;--tw-hue-rotate: ;--tw-invert: ;--tw-saturate: ;--tw-sepia: ;--tw-drop-shadow: ;--tw-backdrop-blur: ;--tw-backdrop-brightness: ;--tw-backdrop-contrast: ;--tw-backdrop-grayscale: ;--tw-backdrop-hue-rotate: ;--tw-backdrop-invert: ;--tw-backdrop-opacity: ;--tw-backdrop-saturate: ;--tw-backdrop-sepia: ;--tw-contain-size: ;--tw-contain-layout: ;--tw-contain-paint: ;--tw-contain-style: }::backdrop{--tw-border-spacing-x:0;--tw-border-spacing-y:0;--tw-translate-x:0;--tw-translate-y:0;--tw-rotate:0;--tw-skew-x:0;--tw-skew-y:0;--tw-scale-x:1;--tw-scale-y:1;--tw-pan-x: ;--tw-pan-y: ;--tw-pinch-zoom: ;--tw-scroll-snap-strictness:proximity;--tw-gradient-from-position: ;--tw-gradient-via-position: ;--tw-gradient-to-position: ;--tw-ordinal: ;--tw-slashed-zero: ;--tw-numeric-figure: ;--tw-numeric-spacing: ;--tw-numeric-fraction: ;--tw-ring-inset: ;--tw-ring-offset-width:0px;--tw-ring-offset-color:#fff;--tw-ring-color:rgba(59,130,246,.5);--tw-ring-offset-shadow:0 0 #0000;--tw-ring-shadow:0 0 #0000;--tw-shadow:0 0 #0000;--tw-shadow-colored:0 0 #0000;--tw-blur: ;--tw-brightness: ;--tw-contrast: ;--tw-grayscale: ;--tw-hue-rotate: ;--tw-invert: ;--tw-saturate: ;--tw-sepia: ;--tw-drop-shadow: ;--tw-backdrop-blur: ;--tw-backdrop-brightness: ;--tw-backdrop-contrast: ;--tw-backdrop-grayscale: ;--tw-backdrop-hue-rotate: ;--tw-backdrop-invert: ;--tw-backdrop-opacity: ;--tw-backdrop-saturate: ;--tw-backdrop-sepia: ;--tw-contain-size: ;--tw-contain-layout: ;--tw-contain-paint: ;--tw-contain-style: }/*! tailwindcss v3.4.19 | MIT License | https://tailwindcss.com*/*,:after,:before{box-sizing:border-box;border:0 solid #e5e7eb}:after,:before{--tw-content:""}:host,html{line-height:1.5;-webkit-text-size-adjust:100%;-moz-tab-size:4;-o-tab-size:4;tab-size:4;font-family:ui-sans-serif,system-ui,sans-serif,Apple Color Emoji,Segoe UI Emoji,Segoe UI Symbol,Noto Color Emoji;font-feature-settings:normal;font-variation-settings:normal;-webkit-tap-highlight-color:transparent}body{margin:0;line-height:inherit}hr{height:0;color:inherit;border-top-width:1px}abbr:where([title]){-webkit-text-decoration:underline dotted;text-decoration:underline dotted}h1,h2,h3,h4,h5,h6{font-size:inherit;font-weight:inherit}a{color:inherit;text-decoration:inherit}b,strong{font-weight:bolder}code,kbd,pre,samp{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,Liberation Mono,Courier New,monospace;font-feature-settings:normal;font-variation-settings:normal;font-size:1em}small{font-size:80%}sub,sup{font-size:75%;line-height:0;position:relative;vertical-align:baseline}sub{bottom:-.25em}sup{top:-.5em}table{text-indent:0;border-color:inherit;border-collapse:collapse}button,input,optgroup,select,textarea{font-family:inherit;font-feature-settings:inherit;font-variation-settings:inherit;font-size:100%;font-weight:inherit;line-height:inherit;letter-spacing:inherit;color:inherit;margin:0;padding:0}button,select{text-transform:none}button,input:where([type=button]),input:where([type=reset]),input:where([type=submit]){-webkit-appearance:button;background-color:transparent;background-image:none}:-moz-focusring{outline:auto}:-moz-ui-invalid{box-shadow:none}progress{vertical-align:baseline}::-webkit-inner-spin-button,::-webkit-outer-spin-button{height:auto}[type=search]{-webkit-appearance:textfield;outline-offset:-2px}::-webkit-search-decoration{-webkit-appearance:none}::-webkit-file-upload-button{-webkit-appearance:button;font:inherit}summary{display:list-item}blockquote,dd,dl,figure,h1,h2,h3,h4,h5,h6,hr,p,pre{margin:0}fieldset{margin:0}fieldset,legend{padding:0}menu,ol,ul{list-style:none;margin:0;padding:0}dialog{padding:0}textarea{resize:vertical}input::-moz-placeholder,textarea::-moz-placeholder{opacity:1;color:#9ca3af}input::placeholder,textarea::placeholder{opacity:1;color:#9ca3af}[role=button],button{cursor:pointer}:disabled{cursor:default}audio,canvas,embed,iframe,img,object,svg,video{display:block;vertical-align:middle}img,video{max-width:100%;height:auto}[hidden]:where(:not([hidden=until-found])){display:none}.collapse{visibility:collapse}.fixed{position:fixed}.sticky{position:sticky}.inset-0{inset:0}.top-0{top:0}.mx-4{margin-left:1rem;margin-right:1rem}.mb-1{margin-bottom:.25rem}.mb-1\.5{margin-bottom:.375rem}.mb-2{margin-bottom:.5rem}.mb-2\.5{margin-bottom:.625rem}.ml-1{margin-left:.25rem}.ml-2{margin-left:.5rem}.ml-auto{margin-left:auto}.mt-1{margin-top:.25rem}.mt-1\.5{margin-top:.375rem}.mt-2{margin-top:.5rem}.mt-2\.5{margin-top:.625rem}.mt-3{margin-top:.75rem}.mt-4{margin-top:1rem}.block{display:block}.inline-block{display:inline-block}.flex{display:flex}.table{display:table}.grid{display:grid}.hidden{display:none}.h-1\.5{height:.375rem}.w-12{width:3rem}.w-16{width:4rem}.w-5{width:1.25rem}.w-full{width:100%}.flex-1{flex:1 1 0%}.shrink-0{flex-shrink:0}.cursor-pointer{cursor:pointer}.select-none{-webkit-user-select:none;-moz-user-select:none;user-select:none}.resize{resize:both}.grid-cols-2{grid-template-columns:repeat(2,minmax(0,1fr))}.grid-cols-3{grid-template-columns:repeat(3,minmax(0,1fr))}.flex-col{flex-direction:column}.flex-wrap{flex-wrap:wrap}.items-start{align-items:flex-start}.items-end{align-items:flex-end}.items-center{align-items:center}.items-baseline{align-items:baseline}.justify-end{justify-content:flex-end}.justify-center{justify-content:center}.justify-between{justify-content:space-between}.gap-1{gap:.25rem}.gap-1\.5{gap:.375rem}.gap-2{gap:.5rem}.gap-2\.5{gap:.625rem}.gap-3{gap:.75rem}.gap-4{gap:1rem}.gap-x-3{-moz-column-gap:.75rem;column-gap:.75rem}.gap-x-4{-moz-column-gap:1rem;column-gap:1rem}.gap-x-6{-moz-column-gap:1.5rem;column-gap:1.5rem}.gap-y-1{row-gap:.25rem}.gap-y-1\.5{row-gap:.375rem}.gap-y-3{row-gap:.75rem}.self-start{align-self:flex-start}.self-center{align-self:center}.overflow-hidden{overflow:hidden}.overflow-x-auto{overflow-x:auto}.whitespace-nowrap{white-space:nowrap}.break-all{word-break:break-all}.rounded{border-radius:.25rem}.rounded-sm{border-radius:.125rem}.rounded-t{border-top-left-radius:.25rem;border-top-right-radius:.25rem}.rounded-t-lg{border-top-left-radius:.5rem;border-top-right-radius:.5rem}.border{border-width:1px}.p-0{padding:0}.p-2\.5{padding:.625rem}.p-3{padding:.75rem}.p-3\.5{padding:.875rem}.p-4{padding:1rem}.px-1\.5{padding-left:.375rem;padding-right:.375rem}.px-2{padding-left:.5rem;padding-right:.5rem}.px-2\.5{padding-left:.625rem;padding-right:.625rem}.px-3{padding-left:.75rem;padding-right:.75rem}.px-3\.5{padding-left:.875rem;padding-right:.875rem}.px-4{padding-left:1rem;padding-right:1rem}.py-0\.5{padding-top:.125rem;padding-bottom:.125rem}.py-1{padding-top:.25rem;padding-bottom:.25rem}.py-1\.5{padding-top:.375rem;padding-bottom:.375rem}.py-10{padding-top:2.5rem;padding-bottom:2.5rem}.py-2{padding-top:.5rem;padding-bottom:.5rem}.py-2\.5{padding-top:.625rem;padding-bottom:.625rem}.py-3{padding-top:.75rem;padding-bottom:.75rem}.py-4{padding-top:1rem;padding-bottom:1rem}.pt-2{padding-top:.5rem}.pt-3{padding-top:.75rem}.text-left{text-align:left}.text-center{text-align:center}.text-right{text-align:right}.underline{text-decoration-line:underline}.filter{filter:var(--tw-blur) var(--tw-brightness) var(--tw-contrast) var(--tw-grayscale) var(--tw-hue-rotate) var(--tw-invert) var(--tw-saturate) var(--tw-sepia) var(--tw-drop-shadow)}@media (min-width:768px){.md\:col-span-2{grid-column:span 2/span 2}.md\:mx-6{margin-left:1.5rem;margin-right:1.5rem}.md\:max-w-xl{max-width:36rem}.md\:grid-cols-2{grid-template-columns:repeat(2,minmax(0,1fr))}.md\:grid-cols-4{grid-template-columns:repeat(4,minmax(0,1fr))}.md\:grid-cols-5{grid-template-columns:repeat(5,minmax(0,1fr))}.md\:items-center{align-items:center}.md\:rounded-lg{border-radius:.5rem}.md\:p-6{padding:1.5rem}.md\:px-6{padding-left:1.5rem;padding-right:1.5rem}}
+html,body{background:#070B0D;margin:0}
 </style>
-</head>
-<body>
+</head><body>
 <div id="root"></div>
 <script>/**
  * @license React
@@ -330,8 +310,7 @@ var d=null!=c&&c.hydratedSources||null,e=!1,f="",g=aj;null!==c&&void 0!==c&&(!0=
 function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmountComponentAtNode=function(a){if(!Vd(a))throw Error(m(40));return a._reactRootContainer?(yb(function(){Wd(null,null,a,!1,function(){a._reactRootContainer=null;a[Ja]=null})}),!0):!1};Q.unstable_batchedUpdates=Tf;Q.unstable_renderSubtreeIntoContainer=function(a,b,c,d){if(!Vd(c))throw Error(m(200));if(null==a||void 0===a._reactInternals)throw Error(m(38));return Wd(a,b,c,!1,d)};Q.version="18.3.1-next-f1338f8080-20240426"});
 })();
 </script>
-<script>
-const {
+<script>const {
   useState,
   useEffect,
   useMemo,
@@ -3103,6 +3082,8 @@ function CryptoScreener() {
   const [sortKey, setSortKey] = useState("radar");
   const [sortDir, setSortDir] = useState(-1);
   const [detail, setDetail] = useState(null);
+  const [deriv, setDeriv] = useState({}); // id → 衍生品分析結果
+  const [derivBusy, setDerivBusy] = useState(false);
   const [view, setView] = useState("radar");
   const [batch, setBatch] = useState({
     running: false,
@@ -3173,6 +3154,42 @@ function CryptoScreener() {
   useEffect(() => {
     store.set("sigStates", sigStates);
   }, [sigStates]);
+
+  /* 開啟個股詳情時才抓衍生品資料：多數幣沒有永續合約，
+     全表掃描會白白浪費請求。結果快取 5 分鐘。 */
+  useEffect(() => {
+    if (!detail) return;
+    const id = detail.id;
+    const hit = deriv[id];
+    if (hit && Date.now() - (hit.updated || 0) < 300000) return;
+    let dead = false;
+    setDerivBusy(true);
+    fetchDeriv({
+      symbol: detail.sym,
+      price_change_percentage_24h: detail.m24
+    }, cfgRef.current).then(d => {
+      if (!dead) setDeriv(m => ({
+        ...m,
+        [id]: d || {
+          none: true,
+          updated: Date.now()
+        }
+      }));
+    }).catch(() => {
+      if (!dead) setDeriv(m => ({
+        ...m,
+        [id]: {
+          none: true,
+          updated: Date.now()
+        }
+      }));
+    }).finally(() => {
+      if (!dead) setDerivBusy(false);
+    });
+    return () => {
+      dead = true;
+    };
+  }, [detail]);
   const toggleWatch = useCallback(id => {
     setWatch(w => w.includes(id) ? w.filter(x => x !== id) : [...w, id]);
   }, []);
@@ -3185,6 +3202,8 @@ function CryptoScreener() {
     proxy: proxy.trim(),
     local
   }), [apiKey, pro, proxy, local]);
+  const cfgRef = useRef(cfg);
+  cfgRef.current = cfg;
   const UP = twColor ? C.red : C.green;
   const DOWN = twColor ? C.green : C.red;
   const tone = v => v == null ? C.muted : v > 0 ? UP : v < 0 ? DOWN : C.bone;
@@ -3319,7 +3338,6 @@ function CryptoScreener() {
           cache: "no-store"
         }), 20000, "health");
         const j = await r.json();
-        if (j.keyless) push("目前為無金鑰降級模式：Demo 月額度已用盡，改走公開端點（無月額度，但每分鐘僅 5–15 次）。每 6 小時會自動試著切回金鑰。", null);
         push(`伺服器在線（${Date.now() - t0}ms）　金鑰${j.hasKey ? `已設定（${j.keyLen} 字元${j.pro ? " · Pro" : ""}）` : "未設定"}　` + `記憶體快取 ${j.cached} 筆　磁碟快取 ${j.disk ?? "?"} 筆　已運行 ${Math.floor((j.uptime || 0) / 60)} 分`, true);
 
         /* 伺服器自己連往上游的結果：這一步能直接分辨是誰連不上 */
@@ -3375,6 +3393,204 @@ function CryptoScreener() {
     push(cfg.key ? cfg.pro ? "金鑰：Pro" : "金鑰：Demo，每分鐘 30 次" : cfg.local ? "金鑰：瀏覽器未填。若已在 Zeabur 設定 CG_API_KEY，走代理時仍會生效。" : "金鑰：未填，每分鐘僅 5–15 次", cfg.key ? true : null);
     setDiagBusy(false);
   }, [cfg]);
+
+  /* ── Binance 衍生品資料抓取 ────────────────────────────────
+     公開端點免金鑰。瀏覽器直連時 Binance 有 CORS 允許，
+     但部分地區的 IP 會被擋，所以走伺服器代理較穩。 */
+
+  const bnGate = {
+    last: 0,
+    chain: Promise.resolve()
+  };
+  async function bnFetch(path, cfg) {
+    const url = cfg.local ? "/api/bn" + path : "https://fapi.binance.com" + path;
+    const run = bnGate.chain.then(async () => {
+      const wait = Math.max(0, bnGate.last + 260 - Date.now());
+      if (wait) await sleep(wait);
+      bnGate.last = Date.now();
+      const ac = typeof AbortController !== "undefined" ? new AbortController() : null;
+      const tid = ac ? setTimeout(() => ac.abort(), 20000) : null;
+      try {
+        const r = await fetch(url, {
+          cache: "no-store",
+          signal: ac ? ac.signal : undefined
+        });
+        if (tid) clearTimeout(tid);
+        if (!r.ok) throw new Error("BN_" + r.status);
+        return r.json();
+      } catch (e) {
+        if (tid) clearTimeout(tid);
+        throw e;
+      }
+    });
+    bnGate.chain = run.catch(() => {});
+    return run;
+  }
+
+  /* 可用合約清單：CoinGecko 的 symbol 對到 Binance 的 USDT 永續 */
+  let bnSymbolCache = null;
+  async function bnSymbols(cfg) {
+    if (bnSymbolCache) return bnSymbolCache;
+    try {
+      const j = await bnFetch("/fapi/v1/exchangeInfo", cfg);
+      const set = new Set();
+      (j.symbols || []).forEach(x => {
+        if (x.contractType === "PERPETUAL" && x.quoteAsset === "USDT" && x.status === "TRADING") set.add(x.baseAsset.toUpperCase());
+      });
+      bnSymbolCache = set;
+      return set;
+    } catch (e) {
+      bnSymbolCache = new Set();
+      return bnSymbolCache;
+    }
+  }
+
+  /* 抓單一幣種的衍生品資料。找不到對應合約時回傳 null，不是錯誤 —
+     多數小市值幣本來就沒有永續合約。 */
+  async function fetchDeriv(coin, cfg) {
+    const base = String(coin.symbol || "").toUpperCase();
+    const avail = await bnSymbols(cfg);
+    if (!avail.has(base)) return null;
+    const sym = base + "USDT";
+    const q = `symbol=${sym}&period=1h&limit=30`;
+    try {
+      const [oiH, lsR, tkR, prem] = await Promise.all([bnFetch(`/futures/data/openInterestHist?${q}`, cfg).catch(() => null), bnFetch(`/futures/data/globalLongShortAccountRatio?${q}`, cfg).catch(() => null), bnFetch(`/futures/data/takerlongshortRatio?${q}`, cfg).catch(() => null), bnFetch(`/fapi/v1/premiumIndex?symbol=${sym}`, cfg).catch(() => null)]);
+      if (!oiH && !prem) return null;
+      const d = {
+        oi: (oiH || []).map(x => parseFloat(x.sumOpenInterestValue)),
+        ls: (lsR || []).map(x => parseFloat(x.longShortRatio)),
+        taker: (tkR || []).map(x => parseFloat(x.buySellRatio)),
+        funding: prem ? parseFloat(prem.lastFundingRate) : null,
+        fundingHist: [],
+        chg24: coin.price_change_percentage_24h ?? null
+      };
+      const a = derivAnalyze(d);
+      a.symbol = sym;
+      a.updated = Date.now();
+      return a;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  /* ── 衍生品指標（Binance USDT 永續合約）──────────────────────
+     資料來源皆為免金鑰公開端點。這裡不做熱力圖那種二維結構，
+     改用能量化成分數的時間序列。
+     修改門檻時，engine.py 的 deriv_analyze 必須同步。 */
+
+  const r1 = v => v == null || !Number.isFinite(v) ? v : Math.round(v * 10) / 10;
+  const pctRankOf = (arr, v) => {
+    // 單一數值在序列中的百分位（與上方 pctRank 不同，勿混用）
+    const a = (arr || []).filter(x => x != null && Number.isFinite(x));
+    if (a.length < 5 || v == null || !Number.isFinite(v)) return null;
+    return 100 * a.filter(x => x < v).length / a.length;
+  };
+  function derivAnalyze(d) {
+    const num = a => (a || []).filter(x => x != null && Number.isFinite(x));
+    const oi = num(d.oi),
+      ls = num(d.ls),
+      tk = num(d.taker),
+      fh = num(d.fundingHist);
+    const fund = d.funding,
+      chg24 = d.chg24;
+    const out = {
+      oiChg4h: null,
+      oiChg24h: null,
+      oiNow: oi.length ? oi[oi.length - 1] : null,
+      funding: fund,
+      fundingApr: null,
+      fundingRank: null,
+      lsRatio: ls.length ? ls[ls.length - 1] : null,
+      lsChg: null,
+      taker: tk.length ? tk[tk.length - 1] : null,
+      quadrant: null,
+      crowd: null,
+      fuel: null,
+      note: null,
+      bias: 0
+    };
+    if (oi.length >= 5 && oi[oi.length - 5] > 0) out.oiChg4h = 100 * (oi[oi.length - 1] - oi[oi.length - 5]) / oi[oi.length - 5];
+    if (oi.length >= 25 && oi[oi.length - 25] > 0) out.oiChg24h = 100 * (oi[oi.length - 1] - oi[oi.length - 25]) / oi[oi.length - 25];
+    if (ls.length >= 25 && ls[ls.length - 25] > 0) out.lsChg = 100 * (ls[ls.length - 1] - ls[ls.length - 25]) / ls[ls.length - 25];
+    if (fund != null && Number.isFinite(fund)) {
+      out.fundingApr = fund * 3 * 365 * 100; // 每 8 小時結算一次
+      out.fundingRank = pctRankOf(fh, fund);
+    }
+    const oc = out.oiChg24h;
+    /* 價格 × 未平倉量 四象限：同樣的漲跌，資金性質完全不同 */
+    if (oc != null && chg24 != null) {
+      const rising = chg24 > 0.5,
+        falling = chg24 < -0.5;
+      const oiUp = oc > 1.5,
+        oiDn = oc < -1.5;
+      if (rising && oiUp) {
+        out.quadrant = "多方新倉";
+        out.bias = 1;
+        out.note = "價漲且未平倉量增加，是新資金做多，趨勢有底氣。";
+      } else if (rising && oiDn) {
+        out.quadrant = "空單回補";
+        out.bias = 0.3;
+        out.note = "價漲但未平倉量減少，是空單認賠推升，軋空行情續航力較弱。";
+      } else if (falling && oiUp) {
+        out.quadrant = "空方新倉";
+        out.bias = -1;
+        out.note = "價跌且未平倉量增加，是新資金做空，下跌有延續性。";
+      } else if (falling && oiDn) {
+        out.quadrant = "多單出場";
+        out.bias = -0.3;
+        out.note = "價跌但未平倉量減少，是多單平倉或被清算，賣壓可能接近尾聲。";
+      } else {
+        out.quadrant = "盤整";
+        out.bias = 0;
+        out.note = "價格與未平倉量都沒有明確方向。";
+      }
+    }
+
+    /* 擁擠度：某一方是否過度集中（0–100） */
+    let crowd = 0;
+    if (out.fundingApr != null) crowd += clamp(Math.abs(out.fundingApr) / 50, 0, 1) * 45;
+    if (out.fundingRank != null) crowd += clamp(Math.abs(out.fundingRank - 50) / 50, 0, 1) * 25;
+    if (out.lsRatio != null) crowd += clamp(Math.abs(out.lsRatio - 1) / 1.2, 0, 1) * 30;
+    out.crowd = r1(clamp(crowd, 0, 100));
+
+    /* 軋空／軋多燃料：正值＝空方擁擠（軋空燃料），負值＝多方擁擠 */
+    if (fund != null && Number.isFinite(fund)) {
+      const side = fund > 0 ? -1 : 1; // 費率為正＝多方付錢＝多方擁擠
+      let mag = clamp(Math.abs(out.fundingApr || 0) / 60, 0, 1);
+      if (oc != null) mag *= clamp(0.5 + oc / 20, 0.3, 1.5);
+      out.fuel = r1(clamp(side * mag * 100, -100, 100));
+    }
+    return out;
+  }
+
+  /* 把衍生品結論回饋到雷達分數。刻意做成小幅調整而非主導：
+     衍生品是輔助證據，主結構仍由量價與均線決定。 */
+  function derivScoreAdjust(base, dv, side) {
+    if (!dv || dv.quadrant == null) return [base, null];
+    const bias = dv.bias || 0,
+      crowd = dv.crowd || 0;
+    let adj = 0;
+    const why = [];
+    const want = side === "bull" ? 1 : -1;
+    if (bias * want > 0) {
+      adj += 6 * Math.abs(bias);
+      why.push(`${dv.quadrant}，與方向一致`);
+    } else if (bias * want < 0) {
+      adj -= 8 * Math.abs(bias);
+      why.push(`${dv.quadrant}，與方向相反`);
+    }
+    if (crowd > 55) {
+      const fuel = dv.fuel || 0;
+      if (fuel * want < 0) {
+        adj -= clamp((crowd - 55) / 45, 0, 1) * 16;
+        why.push("同方向部位過度擁擠，反轉風險升高");
+      } else {
+        adj += clamp((crowd - 55) / 45, 0, 1) * 8;
+        why.push("對手方擁擠，具備軋倉燃料");
+      }
+    }
+    return [r1(clamp(base + adj, 0, 100)), why.length ? why.join("；") : null];
+  }
 
   /* ── 雷達掃描 ── */
   const scan = useCallback(async list => {
@@ -7134,7 +7350,158 @@ function CryptoScreener() {
       fontSize: 11,
       color: C.muted
     }
-  }, "雷達分數"))), !detail.scanned ? /*#__PURE__*/React.createElement("div", {
+  }, "雷達分數"))), (() => {
+    const dv = deriv[detail.id];
+    if (derivBusy && !dv) return /*#__PURE__*/React.createElement("div", {
+      className: "mt-3 px-3 py-2 rounded",
+      style: {
+        background: C.panel2,
+        border: `1px solid ${C.line}`,
+        fontSize: 12,
+        color: C.muted
+      }
+    }, "讀取合約數據…");
+    if (!dv) return null;
+    if (dv.none) return /*#__PURE__*/React.createElement("div", {
+      className: "mt-3 px-3 py-2 rounded",
+      style: {
+        background: C.panel2,
+        border: `1px solid ${C.line}`,
+        fontSize: 12,
+        color: C.muted
+      }
+    }, "Binance 沒有這檔的 USDT 永續合約，或資料暫時取不到。衍生品指標僅適用於有合約的幣種。");
+    const posTone = (v, inv) => v == null ? C.muted : (inv ? -v : v) > 0 ? UP : (inv ? -v : v) < 0 ? DOWN : C.bone;
+    const qColor = dv.bias > 0.5 ? UP : dv.bias < -0.5 ? DOWN : C.gold;
+    const [adjB, whyB] = derivScoreAdjust(detail.score ?? 50, dv, side === "bear" ? "bear" : "bull");
+    return /*#__PURE__*/React.createElement("div", {
+      className: "mt-3 rounded",
+      style: {
+        background: C.panel2,
+        border: `1px solid ${C.line}`,
+        padding: 12
+      }
+    }, /*#__PURE__*/React.createElement("div", {
+      className: "flex items-center gap-2 flex-wrap"
+    }, /*#__PURE__*/React.createElement("span", {
+      style: {
+        fontFamily: FONT.display,
+        fontSize: 13
+      }
+    }, "合約市場結構"), /*#__PURE__*/React.createElement("span", {
+      style: {
+        fontFamily: FONT.data,
+        fontSize: 10.5,
+        color: C.muted
+      }
+    }, dv.symbol, " · Binance 永續"), dv.quadrant && /*#__PURE__*/React.createElement("span", {
+      className: "px-2 py-0.5 rounded",
+      style: {
+        background: qColor,
+        color: C.ink,
+        fontSize: 11.5
+      }
+    }, dv.quadrant)), dv.note && /*#__PURE__*/React.createElement("div", {
+      className: "mt-2",
+      style: {
+        fontSize: 12,
+        color: C.bone,
+        lineHeight: 1.7
+      }
+    }, dv.note), /*#__PURE__*/React.createElement("div", {
+      className: "mt-2.5 grid grid-cols-2 gap-x-4 gap-y-1.5",
+      style: {
+        fontFamily: FONT.data,
+        fontSize: 11.5
+      }
+    }, /*#__PURE__*/React.createElement("div", {
+      className: "flex justify-between"
+    }, /*#__PURE__*/React.createElement("span", {
+      style: {
+        color: C.muted
+      }
+    }, "未平倉量 24h"), /*#__PURE__*/React.createElement("span", {
+      style: {
+        color: posTone(dv.oiChg24h)
+      }
+    }, dv.oiChg24h == null ? "—" : fmtPct(dv.oiChg24h))), /*#__PURE__*/React.createElement("div", {
+      className: "flex justify-between"
+    }, /*#__PURE__*/React.createElement("span", {
+      style: {
+        color: C.muted
+      }
+    }, "未平倉量 4h"), /*#__PURE__*/React.createElement("span", {
+      style: {
+        color: posTone(dv.oiChg4h)
+      }
+    }, dv.oiChg4h == null ? "—" : fmtPct(dv.oiChg4h))), /*#__PURE__*/React.createElement("div", {
+      className: "flex justify-between"
+    }, /*#__PURE__*/React.createElement("span", {
+      style: {
+        color: C.muted
+      }
+    }, "資金費率年化"), /*#__PURE__*/React.createElement("span", {
+      style: {
+        color: posTone(dv.fundingApr)
+      }
+    }, dv.fundingApr == null ? "—" : fmtPct(dv.fundingApr))), /*#__PURE__*/React.createElement("div", {
+      className: "flex justify-between"
+    }, /*#__PURE__*/React.createElement("span", {
+      style: {
+        color: C.muted
+      }
+    }, "多空帳戶比"), /*#__PURE__*/React.createElement("span", {
+      style: {
+        color: dv.lsRatio == null ? C.muted : dv.lsRatio > 1 ? UP : DOWN
+      }
+    }, dv.lsRatio == null ? "—" : dv.lsRatio.toFixed(2))), /*#__PURE__*/React.createElement("div", {
+      className: "flex justify-between"
+    }, /*#__PURE__*/React.createElement("span", {
+      style: {
+        color: C.muted
+      }
+    }, "主動買賣比"), /*#__PURE__*/React.createElement("span", {
+      style: {
+        color: dv.taker == null ? C.muted : dv.taker > 1 ? UP : DOWN
+      }
+    }, dv.taker == null ? "—" : dv.taker.toFixed(2))), /*#__PURE__*/React.createElement("div", {
+      className: "flex justify-between"
+    }, /*#__PURE__*/React.createElement("span", {
+      style: {
+        color: C.muted
+      }
+    }, "擁擠度"), /*#__PURE__*/React.createElement("span", {
+      style: {
+        color: (dv.crowd ?? 0) > 65 ? C.red : C.bone
+      }
+    }, dv.crowd == null ? "—" : dv.crowd))), dv.fuel != null && Math.abs(dv.fuel) > 20 && /*#__PURE__*/React.createElement("div", {
+      className: "mt-2.5 px-2.5 py-1.5 rounded",
+      style: {
+        background: C.panel,
+        border: `1px solid ${dv.fuel > 0 ? C.line : C.red}`,
+        fontSize: 11.5,
+        lineHeight: 1.7
+      }
+    }, dv.fuel > 0 ? `空方部位偏擁擠（燃料 ${dv.fuel}）。若價格向上突破，空單回補可能加速漲勢；反過來說，這也是空單的風險位置。` : `多方部位偏擁擠（燃料 ${dv.fuel}）。多單付出高額資金費率支撐行情，一旦轉弱容易連鎖平倉。`), whyB && /*#__PURE__*/React.createElement("div", {
+      className: "mt-2",
+      style: {
+        fontSize: 11.5,
+        color: C.muted,
+        lineHeight: 1.7
+      }
+    }, "對", side === "bear" ? "空頭" : "多頭", "評分的影響：", detail.score ?? "—", " → ", /*#__PURE__*/React.createElement("span", {
+      style: {
+        color: adjB > (detail.score ?? 50) ? UP : adjB < (detail.score ?? 50) ? DOWN : C.bone
+      }
+    }, adjB), "\u3000", whyB), /*#__PURE__*/React.createElement("div", {
+      className: "mt-2",
+      style: {
+        fontSize: 10.5,
+        color: C.muted,
+        lineHeight: 1.6
+      }
+    }, "資料為 Binance 公開端點，與現貨雷達的量價結論獨立。兩者一致時訊號較可靠，衝突時以量價結構為主。"));
+  })(), !detail.scanned ? /*#__PURE__*/React.createElement("div", {
     className: "mt-3 px-3 py-3 rounded",
     style: {
       background: C.panel2,
@@ -7606,15 +7973,11 @@ function CryptoScreener() {
     }
   }, "在 CoinGecko 查看完整資料 →"))));
 }
-ReactDOM.createRoot(document.getElementById('root')).render(React.createElement(CryptoScreener));
+ReactDOM.createRoot(document.getElementById("root")).render(React.createElement(CryptoScreener));
 </script>
 <script>
-  // 註冊 Service Worker：讓 App 可安裝、離線也能開啟外殼
-  if ("serviceWorker" in navigator && location.protocol.startsWith("http")) {
-    window.addEventListener("load", function () {
-      navigator.serviceWorker.register("./sw.js").catch(function () {});
-    });
+  if ("serviceWorker" in navigator) {
+    window.addEventListener("load", () => navigator.serviceWorker.register("sw.js").catch(() => {}));
   }
 </script>
-</body>
-</html>
+</body></html>
