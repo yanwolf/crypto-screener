@@ -72,7 +72,10 @@ START_TS = time.time()
 QUOTA = {"exhausted": False, "ts": 0}
 _cache = {}
 _cache_lock = threading.Lock()
-CACHE_DIR = os.path.join(HERE, ".screener_cache")
+# 快取預設放在專案資料夾外，避免執行時在原始碼目錄長出上百 MB 檔案，
+# 也避免被建置流程掃描。部署時建議掛 Volume 並設 CACHE_DIR。
+CACHE_DIR = os.environ.get("CACHE_DIR") or os.path.join(
+    os.environ.get("TMPDIR", "/tmp"), "screener-cache")
 DISK_TTL = 12 * 3600.0          # 深度資料寫入磁碟，重啟後仍可用
 
 

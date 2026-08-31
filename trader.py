@@ -267,6 +267,57 @@ def plan_exits(entry, stop, side):
     }
 
 
+
+
+# ── 條件單（停損／停利／移動停利）──────────────────────────
+#
+# 幣安自 2025-12-09 起把條件單搬到 Algo 服務，舊的 /fapi/v1/order
+# 會用 -4120 拒絕 STOP_MARKET 這類型別。
+# 新端點的參數名稱也不同：stopPrice → triggerPrice，
+# activationPrice → activatePrice，且必須帶 algoType=CONDITIONAL。
+#
+# 這裡優先打新端點，遇到「端點不存在」才退回舊寫法，
+# 讓不同版本的正式網與模擬網都能運作。
+
+_algo_supported = [None]        # None = 還不確定，True/False = 已測知
+
+
+def place_conditional(params: dict):
+    """送出條件單。回傳 (status, data, 用了哪個端點)。"""
+    algo = dict(params)
+    algo["algoType"] = "CONDITIONAL"
+    if "stopPrice" in algo:
+        algo["triggerPrice"] = algo.pop("stopPrice")
+    if "activationPrice" in algo:
+        algo["activatePrice"] = algo.pop("activationPrice")
+
+    if _algo_supported[0] is not False:
+        st, d = _request("POST", "/fapi/v1/algoOrder", algo, signed=True)
+        if st == 200:
+            _algo_supported[0] = True
+            return st, d, "algo"
+        code = d.get("code") if isinstance(d, dict) else None
+        # -1121 之類的參數錯不代表端點不存在，只有 404 或未知端點才退回
+        if st == 404 or code in (-1000, -1013) or "Unknown" in str(d):
+            _algo_supported[0] = False
+        else:
+            return st, d, "algo"
+
+    legacy = dict(params)
+    st, d = _request("POST", "/fapi/v1/order", legacy, signed=True)
+    return st, d, "legacy"
+
+
+def cancel_conditional(symbol):
+    """兩種端點都清一次，避免殘留掛單擋住下一筆。"""
+    out = []
+    st, d = _request("DELETE", "/fapi/v1/algoOpenOrders", {"symbol": symbol}, signed=True)
+    out.append(("algo", st))
+    st2, d2 = _request("DELETE", "/fapi/v1/allOpenOrders", {"symbol": symbol}, signed=True)
+    out.append(("legacy", st2))
+    return out
+
+
 # ── 下單 ────────────────────────────────────────────────────
 
 def set_leverage(symbol, lev):
@@ -316,10 +367,10 @@ def open_position(symbol_base, side, entry_hint, stop, info=None, note=""):
     sub, errs = [], []
 
     # 停損：closePosition 確保無論部位多大都全平
-    st2, r2 = _request("POST", "/fapi/v1/order", {
+    st2, r2, ep2 = place_conditional({
         "symbol": sym, "side": close_side, "type": "STOP_MARKET",
         "stopPrice": stop_px, "closePosition": "true", "workingType": "MARK_PRICE",
-    }, signed=True)
+    })
     if st2 != 200:
         errs.append(f"停損掛單失敗：{r2.get('msg') or r2}")
         # 沒有停損就不留倉
@@ -328,35 +379,36 @@ def open_position(symbol_base, side, entry_hint, stop, info=None, note=""):
             "quantity": qty, "reduceOnly": "true",
         }, signed=True)
         return {"ok": False, "error": "；".join(errs) + "　已立即平倉，避免無停損部位"}
-    sub.append({"type": "STOP_MARKET", "id": r2.get("orderId"), "px": stop_px})
+    sub.append({"type": "STOP_MARKET", "id": r2.get("algoId") or r2.get("orderId"),
+                "px": stop_px, "via": ep2})
 
     # 第一目標：出一半，讓剩下的部位零成本奔跑
     step = (info or {}).get("step") or 0.001
     tp_qty = round_step(qty * CFG["tp1Portion"], step)
     if tp_qty > 0:
-        st3, r3 = _request("POST", "/fapi/v1/order", {
+        st3, r3, ep3 = place_conditional({
             "symbol": sym, "side": close_side, "type": "TAKE_PROFIT_MARKET",
             "stopPrice": round_step(exits["tp1"], tick), "quantity": tp_qty,
             "reduceOnly": "true", "workingType": "MARK_PRICE",
-        }, signed=True)
+        })
         if st3 == 200:
-            sub.append({"type": "TAKE_PROFIT_MARKET", "id": r3.get("orderId"),
-                        "px": round_step(exits["tp1"], tick), "qty": tp_qty})
+            sub.append({"type": "TAKE_PROFIT_MARKET", "id": r3.get("algoId") or r3.get("orderId"),
+                        "px": round_step(exits["tp1"], tick), "qty": tp_qty, "via": ep3})
         else:
             errs.append(f"停利掛單失敗：{r3.get('msg') or r3}")
 
     # 移動停利：到 2R 才啟動，讓趨勢單有機會走遠
     trail_qty = round_step(qty - tp_qty, step)
     if trail_qty > 0:
-        st4, r4 = _request("POST", "/fapi/v1/order", {
+        st4, r4, ep4 = place_conditional({
             "symbol": sym, "side": close_side, "type": "TRAILING_STOP_MARKET",
             "quantity": trail_qty, "callbackRate": CFG["trailCallback"],
             "activationPrice": round_step(exits["trailActivate"], tick),
             "reduceOnly": "true", "workingType": "MARK_PRICE",
-        }, signed=True)
+        })
         if st4 == 200:
-            sub.append({"type": "TRAILING_STOP_MARKET", "id": r4.get("orderId"),
-                        "activate": round_step(exits["trailActivate"], tick)})
+            sub.append({"type": "TRAILING_STOP_MARKET", "id": r4.get("algoId") or r4.get("orderId"),
+                        "activate": round_step(exits["trailActivate"], tick), "via": ep4})
         else:
             errs.append(f"移動停利掛單失敗：{r4.get('msg') or r4}")
 
@@ -381,7 +433,7 @@ def close_position(symbol, reason="手動平倉"):
             "symbol": symbol, "side": close_side, "type": "MARKET",
             "quantity": pos["qty"], "reduceOnly": "true",
         }, signed=True)
-        _request("DELETE", "/fapi/v1/allOpenOrders", {"symbol": symbol}, signed=True)
+        cancel_conditional(symbol)
     px = mark_price(symbol) or pos["entry"]
     record_close(pos, px, reason)
     return {"ok": True, "symbol": symbol, "exit": px}
