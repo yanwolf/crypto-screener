@@ -938,6 +938,8 @@ def main():
         print("        Bot 已設定但尚未配對，請到網頁的提醒設定按「開始配對」")
 
     # ── 模擬單設定 ──
+    # 只做不碰網路的設定；對時、抓合約清單、查權益都丟到背景，
+    # 否則上游一慢就會拖住連接埠，讓平台誤判容器沒起來。
     if trader is not None:
         want_live = args.live and os.environ.get("ALLOW_LIVE", "") == "1"
         if args.live and not want_live:
@@ -950,19 +952,23 @@ def main():
         trader.load_state(os.path.join(CACHE_DIR, "trader.json"))
         net = "正式網（真實資金）" if want_live else "模擬網 Testnet"
         if trader.CFG["key"]:
-            off = trader.sync_time()
-            n = len(trader.load_filters())
-            eq, err = trader.account_equity()
-            sys.stderr.write(
-                f"  交易　{net}　風險 {args.risk_pct}%/筆　槓桿 {args.leverage}x　"
-                f"合約 {n} 檔　時鐘差 {off if off is not None else '?'}ms\n")
-            sys.stderr.write(f"  權益　{('%.2f USDT' % eq) if eq is not None else '取不到（' + str(err) + '）'}\n")
+            sys.stderr.write(f"  交易　{net}　風險 {args.risk_pct}%/筆　槓桿 {args.leverage}x　（連線資訊背景載入中）\n")
             if want_live:
                 sys.stderr.write("  ⚠ 正在對正式網下單，會動用真實資金\n")
+
+            def _trader_warmup():
+                off = trader.sync_time()
+                n = len(trader.load_filters())
+                eq, err = trader.account_equity()
+                sys.stderr.write(
+                    f"  交易　合約 {n} 檔　時鐘差 {off if off is not None else '?'}ms　"
+                    f"權益 {('%.2f USDT' % eq) if eq is not None else '取不到（' + str(err) + '）'}\n")
+
+            threading.Thread(target=_trader_warmup, daemon=True).start()
         else:
             sys.stderr.write(f"  交易　未設定 BN_KEY／BN_SECRET，模擬單功能停用（{net}）\n")
 
-    ok = selftest()
+    threading.Thread(target=selftest, daemon=True).start()
 
     if engine is None:
         print("  監控　找不到 engine.py，背景訊號監控停用")
@@ -996,8 +1002,7 @@ def main():
             else:
                 print("  已開放區網連入，但查不到本機 IP，請自行用 ipconfig / ifconfig 查詢")
             print("  提醒：這會讓同網段的裝置都能存取，公用 Wi-Fi 請勿使用 --lan")
-        if ok:
-            print("  頁面上的「透過本機代理」會自動勾選，按重新整理就會載入即時行情。")
+        print("  頁面上的「透過本機代理」會自動勾選，按重新整理就會載入即時行情。")
         print("  Ctrl+C 結束\n")
         try:
             httpd.serve_forever()
