@@ -423,6 +423,84 @@ def open_position(symbol_base, side, entry_hint, stop, info=None, note=""):
     return {"ok": True, **pos}
 
 
+
+
+# ── 自動下單的風險閘門 ──────────────────────────────────────
+#
+# 自動下單會在沒人看著的時候開倉，所以閘門比手動嚴格。
+# 這些限制是硬性的，任何一條不過就不下單。
+
+AUTO = {
+    "on": False,
+    "maxPerDay": 6,            # 每日最多開幾筆
+    "dailyLossR": -3.0,        # 當日累計虧損達 3R 就停止當天所有下單
+    "cooldownMin": 120,        # 同一檔幣平倉後多久才能再進
+    "minScore": 62,            # 自動下單的分數門檻，比手動的 58 嚴格
+    "day": None,               # 當前計算中的日期
+    "opened": 0,               # 今日已開倉數
+    "closedR": 0.0,            # 今日已實現 R
+    "lastClose": {},           # symbol → 最後平倉時間
+    "blocked": None,           # 當日被停用的原因
+}
+
+
+def _today():
+    return time.strftime("%Y-%m-%d", time.gmtime())
+
+
+def auto_roll_day():
+    """跨日重置計數。自動下單的限制以 UTC 日為單位。"""
+    d = _today()
+    if AUTO["day"] != d:
+        AUTO["day"] = d
+        AUTO["opened"] = 0
+        AUTO["closedR"] = 0.0
+        AUTO["blocked"] = None
+        save_state()
+
+
+def auto_can_trade(symbol):
+    """回傳 (可否下單, 原因)。這裡只管風險額度，不管訊號好壞。"""
+    auto_roll_day()
+    if not AUTO["on"]:
+        return False, "自動下單未啟用"
+    if not (CFG["key"] and CFG["secret"]):
+        return False, "未設定幣安金鑰"
+    if AUTO["blocked"]:
+        return False, AUTO["blocked"]
+    if AUTO["closedR"] <= AUTO["dailyLossR"]:
+        AUTO["blocked"] = f"當日已虧損 {AUTO['closedR']:.2f}R，達停損上限，今日停止下單"
+        save_state()
+        return False, AUTO["blocked"]
+    if AUTO["opened"] >= AUTO["maxPerDay"]:
+        return False, f"今日已開 {AUTO['opened']} 筆，達上限"
+    if len(STATE["positions"]) >= CFG["maxPositions"]:
+        return False, f"同時持倉已達 {CFG['maxPositions']} 筆上限"
+    if symbol in STATE["positions"]:
+        return False, "這檔已有部位"
+    last = AUTO["lastClose"].get(symbol)
+    if last and (time.time() - last) < AUTO["cooldownMin"] * 60:
+        left = int((AUTO["cooldownMin"] * 60 - (time.time() - last)) / 60)
+        return False, f"剛平倉，冷卻中還剩 {left} 分鐘"
+    return True, None
+
+
+def auto_open(symbol_base, side, entry, stop, note="", on_event=None):
+    """自動開倉。通過風險閘門才會真的送單。"""
+    sym = symbol_base.upper() + "USDT"
+    ok, why = auto_can_trade(sym)
+    if not ok:
+        return {"ok": False, "skipped": True, "error": why}
+
+    r = open_position(symbol_base, side, entry, stop, note=note)
+    if r.get("ok"):
+        AUTO["opened"] += 1
+        save_state()
+        if on_event:
+            on_event("open", r)
+    return r
+
+
 def close_position(symbol, reason="手動平倉"):
     pos = STATE["positions"].get(symbol)
     if not pos:
@@ -451,6 +529,11 @@ def record_close(pos, exit_px, reason):
         "reason": reason, "note": pos.get("note", ""),
     })
     STATE["positions"].pop(pos["symbol"], None)
+    AUTO["lastClose"][pos["symbol"]] = time.time()
+    rm = STATE["trades"][-1].get("rMultiple")
+    if rm is not None:
+        auto_roll_day()
+        AUTO["closedR"] += rm
     save_state()
 
 
@@ -527,7 +610,8 @@ def save_state():
         return
     try:
         with open(STATE_FILE, "w") as f:
-            json.dump({k: STATE[k] for k in ("enabled", "positions", "trades")}, f)
+            json.dump({"state": {k: STATE[k] for k in ("enabled", "positions", "trades")},
+                       "auto": AUTO}, f)
     except Exception:
         pass
 
@@ -538,9 +622,13 @@ def load_state(path):
     try:
         with open(path) as f:
             d = json.load(f)
-        STATE["enabled"] = d.get("enabled", False)
-        STATE["positions"] = d.get("positions", {})
-        STATE["trades"] = d.get("trades", [])
+        st = d.get("state", d)          # 相容舊格式
+        STATE["enabled"] = st.get("enabled", False)
+        STATE["positions"] = st.get("positions", {})
+        STATE["trades"] = st.get("trades", [])
+        for k, v in (d.get("auto") or {}).items():
+            if k in AUTO:
+                AUTO[k] = v
     except Exception:
         pass
 
@@ -563,4 +651,7 @@ def status():
         "cfg": {k: v for k, v in CFG.items() if k not in ("key", "secret")},
         "lastRun": STATE["lastRun"],
         "symbols": len(_filters),
+        "auto": {k: AUTO[k] for k in
+                 ("on", "maxPerDay", "dailyLossR", "cooldownMin", "minScore",
+                  "opened", "closedR", "blocked", "day")},
     }

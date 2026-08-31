@@ -743,3 +743,53 @@ def deriv_score_adjust(base, dv, side="bull"):
             why.append("對手方擁擠，具備軋倉燃料")
 
     return round(clamp(base + adj, 0, 100), 1), "；".join(why) if why else None
+
+
+def _fmt1(v):
+    """與 JavaScript 的 Math.round(v*10)/10 對齊。
+    Python 的 round() 用銀行家捨入（0.5 進到偶數），JS 是一律進位，
+    兩邊若不統一，同一個分數會顯示成 34.5 和 34.6。
+    另外整數不補小數點，配合 JS 的數字轉字串行為。"""
+    if v is None:
+        return "—"
+    n = math.floor(v * 10 + 0.5) / 10
+    return str(int(n)) if n == int(n) else str(n)
+
+
+def trade_gate(detail, dv, bear):
+    """進場前的證據檢查。與 core.jsx 的 tradeGate 逐條對齊，
+    自動下單與手動下單必須用同一套判斷，否則畫面顯示的和實際成交的會對不起來。
+    回傳 (blocks, warns)。blocks 非空代表不該進場。"""
+    blocks, warns = [], []
+    score = detail.get("score")
+    stage = detail.get("stage")
+    rvol = detail.get("rvol7")
+
+    if dv and dv.get("quadrant") and dv.get("bias") is not None:
+        want = -1.0 if bear else 1.0
+        b = dv["bias"] * want
+        if b < -0.5:
+            blocks.append(f"合約結構顯示「{dv['quadrant']}」，與{'做空' if bear else '做多'}方向相反")
+        elif b < 0:
+            warns.append(f"合約結構偏「{dv['quadrant']}」，與下單方向不一致")
+
+    if score is not None:
+        if score < 45:
+            blocks.append(f"雷達分數只有 {_fmt1(score)}，目前沒有明顯的資金動作")
+        elif score < 58:
+            warns.append(f"雷達分數 {_fmt1(score)} 偏低，訊號不算強")
+
+    if not bear and stage in ("沉寂整理", "退潮低迷"):
+        blocks.append(f"目前階段是「{stage}」，量能與價格都沒有啟動")
+    if bear and stage in ("加速上漲", "剛啟動"):
+        blocks.append(f"目前階段是「{stage}」，逆勢做空風險高")
+
+    if not bear and rvol is not None and rvol < 1.3:
+        warns.append(f"量能只有平常的 {rvol:.2f} 倍，沒有放量")
+
+    if dv and (dv.get("crowd") or 0) > 70:
+        fuel = dv.get("fuel") or 0
+        want = -1.0 if bear else 1.0
+        if fuel * want < 0:
+            warns.append(f"同方向部位擁擠度 {_fmt1(dv['crowd'])}，反轉風險偏高")
+    return blocks, warns

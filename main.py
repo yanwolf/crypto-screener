@@ -332,6 +332,77 @@ def mon_fetch_json(path):
     return json.loads(body)
 
 
+
+def fmt_money(v):
+    if v is None:
+        return "—"
+    a = abs(v)
+    if a >= 1:
+        return f"{v:,.2f}"
+    return f"{v:.6g}"
+
+
+def notify_trade_open(r):
+    """開倉通知。把這筆的風險講清楚，讓你在手機上就能判斷要不要手動介入。"""
+    sz = r.get("sizing") or {}
+    ex = r.get("exits") or {}
+    side_txt = "▲ 做多" if r["side"] == "LONG" else "▼ 做空"
+    lines = [
+        f"{side_txt}　{r['symbol']}",
+        f"進場　{fmt_money(r['entry'])}",
+        f"數量　{r['qty']}　名目 {fmt_money(sz.get('notional'))} U",
+        f"停損　{fmt_money(r['stop'])}　風險 {fmt_money(sz.get('riskAmt'))} U（1R）",
+        f"目標　{fmt_money(ex.get('tp1'))}（2R 出一半）",
+        f"移動停利　{fmt_money(ex.get('trailActivate'))} 啟動，回撤 {ex.get('trailCallback')}%",
+    ]
+    if r.get("note"):
+        lines.append(f"依據　{r['note']}")
+    if r.get("warnings"):
+        lines.append("注意　" + "；".join(r["warnings"]))
+    net = "正式網" if (trader and trader.CFG["live"]) else "模擬網"
+    lines.append(f"（{net}）")
+    return "自動開倉", "\n".join(lines)
+
+
+def notify_trade_close(t):
+    """平倉通知。R 倍數是重點，金額只是附帶。"""
+    win = (t.get("pnl") or 0) > 0
+    rm = t.get("rMultiple")
+    head = "獲利平倉" if win else "虧損平倉"
+    mark = "＋" if win else "－"
+    lines = [
+        f"{'▲' if t['side'] == 'LONG' else '▼'} {t['symbol']}　{t['side'] == 'LONG' and '做多' or '做空'}",
+        f"進場　{fmt_money(t['entry'])}",
+        f"出場　{fmt_money(t['exit'])}",
+        f"損益　{mark}{fmt_money(abs(t.get('pnl') or 0))} U"
+        + (f"　{rm:+.2f}R" if rm is not None else ""),
+        f"原因　{t.get('reason', '—')}",
+    ]
+    held = (t.get("closed", 0) - t.get("opened", 0)) / 60000.0
+    if held > 0:
+        lines.append(f"持有　{int(held // 60)} 小時 {int(held % 60)} 分")
+
+    if trader:
+        p = trader.performance()
+        if p.get("count"):
+            lines.append("")
+            lines.append(f"累計 {p['count']} 筆　勝率 {p['winRate']}%　"
+                         f"賺賠比 {p.get('payoff') or '—'}　期望值 {p['expectancyR']}R")
+            a = trader.AUTO
+            lines.append(f"今日 {a['opened']} 筆　已實現 {a['closedR']:+.2f}R")
+            if a.get("blocked"):
+                lines.append(f"⚠ {a['blocked']}")
+    return head, "\n".join(lines)
+
+
+def push_all(title, text):
+    for fn in (notify_telegram, notify_discord, notify_email):
+        try:
+            fn(title, text)
+        except Exception:
+            pass
+
+
 def mon_run_once():
     """跑一輪：抓行情 → 取歷史 → 評分 → 判斷訊號 → 發通知"""
     if not (engine and MON["cfg"]):
@@ -399,15 +470,98 @@ def mon_run_once():
 
     for e in events:
         title, text = engine.alert_text(e)
-        for fn in (notify_telegram, notify_discord, notify_email):
+        push_all(title, text)
+
+    # ── 自動下單 ──
+    # 只處理本輪觸發的訊號，且必須通過與畫面相同的證據檢查。
+    if trader and trader.AUTO["on"] and events:
+        by_id = {r["id"]: r for r in rows}
+        for e in events:
             try:
-                fn(title, text)
-            except Exception:
-                pass
+                auto_try_trade(e, by_id.get(e.get("id")))
+            except Exception as ex:
+                sys.stderr.write(f"  ! 自動下單失敗 {e.get('sym')}: {ex}\n")
     if events:
         sys.stderr.write(f"  ! 背景監控觸發 {len(events)} 則："
                          f"{'、'.join(x['sym'] + '/' + x['side'] for x in events)}\n")
     return len(events)
+
+
+
+def auto_try_trade(ev, row):
+    """把一則訊號轉成實際下單。任何一關不過就跳過，並記錄原因。"""
+    if not (trader and row):
+        return
+    bear = ev.get("side") == "bear"
+    sym = (row.get("sym") or "").upper()
+    if not sym:
+        return
+
+    # 分數門檻：自動下單比手動嚴格
+    score = row.get("bearScore") if bear else row.get("score")
+    if score is None or score < trader.AUTO["minScore"]:
+        return
+
+    # 衍生品資料：與畫面上看到的同一組
+    dv = None
+    try:
+        dv = fetch_deriv_server(sym, row.get("m24"))
+    except Exception:
+        dv = None
+
+    detail = {"score": score, "stage": row.get("stage"), "rvol7": row.get("rvol7")}
+    blocks, warns = engine.trade_gate(detail, dv, bear)
+    if blocks:
+        sys.stderr.write(f"  ~ 自動下單跳過 {sym}：{'；'.join(blocks)}\n")
+        return
+
+    # 停損：空頭用結構停損，多頭用三刀流綠線
+    if bear:
+        stop = (row.get("bear") or {}).get("stop")
+    else:
+        ma60 = (row.get("blades") or {}).get("ma60")
+        stop = ma60 * 0.995 if ma60 else (row["price"] * 0.94 if row.get("price") else None)
+    price = row.get("price")
+    if stop is None or price is None or (stop > price) != bear:
+        sys.stderr.write(f"  ~ 自動下單跳過 {sym}：算不出合理停損\n")
+        return
+
+    note = f"{'空頭' if bear else '多頭'}雷達 {round(score, 1)} 分"
+    if warns:
+        note += "（" + "；".join(warns) + "）"
+
+    r = trader.auto_open(sym, "SHORT" if bear else "LONG", price, float(stop), note=note)
+    if r.get("ok"):
+        t, x = notify_trade_open(r)
+        push_all(t, x)
+        sys.stderr.write(f"  $ 自動開倉 {r['symbol']} {r['side']} 數量 {r['qty']}\n")
+    elif r.get("skipped"):
+        sys.stderr.write(f"  ~ 自動下單跳過 {sym}：{r.get('error')}\n")
+    else:
+        sys.stderr.write(f"  ! 自動下單失敗 {sym}：{r.get('error')}\n")
+
+
+def fetch_deriv_server(base, chg24):
+    """伺服器端取衍生品資料，欄位與前端 fetchDeriv 一致。"""
+    sym = base.upper() + "USDT"
+    q = f"symbol={sym}&period=1h&limit=30"
+    def g(p):
+        st, b = fetch_upstream(p, "/api/bn")
+        return json.loads(b) if st == 200 else None
+    oi = g(f"/futures/data/openInterestHist?{q}")
+    ls = g(f"/futures/data/globalLongShortAccountRatio?{q}")
+    tk = g(f"/futures/data/takerlongshortRatio?{q}")
+    pm = g(f"/fapi/v1/premiumIndex?symbol={sym}")
+    if not oi and not pm:
+        return None
+    return engine.deriv_analyze({
+        "oi": [float(x["sumOpenInterestValue"]) for x in (oi or [])],
+        "ls": [float(x["longShortRatio"]) for x in (ls or [])],
+        "taker": [float(x["buySellRatio"]) for x in (tk or [])],
+        "funding": float(pm["lastFundingRate"]) if pm else None,
+        "fundingHist": [],
+        "chg24": chg24,
+    })
 
 
 def monitor_worker(interval_min):
@@ -416,6 +570,13 @@ def monitor_worker(interval_min):
         try:
             if MON["on"]:
                 mon_run_once()          # 額度用盡會自動降級為無金鑰，仍可續跑
+            # 與交易所對帳：停損或停利成交後推播結果
+            if trader and trader.STATE["positions"]:
+                before = len(trader.STATE["trades"])
+                trader.sync_positions()
+                for t in trader.STATE["trades"][before:]:
+                    ti, tx = notify_trade_close(t)
+                    push_all(ti, tx)
                 MON["lastError"] = None
         except Exception as e:
             MON["lastError"] = str(e)
@@ -455,6 +616,19 @@ def trade_handle(path, payload):
                    "tp1R", "tp1Portion", "trailCallback", "trailActivateR")
         kw = {k: payload[k] for k in allowed if k in payload}
         return 200, {"cfg": trader.configure(**kw)}
+
+    if path == "/api/trade/auto":
+        if "on" in payload:
+            trader.AUTO["on"] = bool(payload["on"])
+            if trader.AUTO["on"]:
+                trader.AUTO["blocked"] = None      # 手動重啟時解除當日封鎖
+        for k in ("maxPerDay", "cooldownMin", "minScore"):
+            if k in payload:
+                trader.AUTO[k] = int(payload[k])
+        if "dailyLossR" in payload:
+            trader.AUTO["dailyLossR"] = -abs(float(payload["dailyLossR"]))
+        trader.save_state()
+        return 200, {"auto": trader.status()["auto"]}
 
     if path == "/api/trade/enable":
         trader.STATE["enabled"] = bool(payload.get("on"))

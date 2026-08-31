@@ -6218,7 +6218,96 @@ function CryptoScreener() {
     style: {
       color: C.muted
     }
-  }, "關閉")), trade.perf && trade.perf.count > 0 ? /*#__PURE__*/React.createElement("div", {
+  }, "關閉")), trade.auto && /*#__PURE__*/React.createElement("div", {
+    className: "mt-3 rounded p-3",
+    style: {
+      background: C.panel2,
+      border: `1px solid ${trade.auto.on ? C.teal : C.line}`
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "flex items-center gap-2 flex-wrap"
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontFamily: FONT.display,
+      fontSize: 13
+    }
+  }, "自動下單"), /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 11.5,
+      color: trade.auto.on ? C.teal : C.muted
+    }
+  }, trade.auto.on ? "運作中" : "已關閉"), /*#__PURE__*/React.createElement("button", {
+    onClick: async () => {
+      const j = await tradeCall("auto", {
+        on: !trade.auto.on
+      });
+      if (j && !j.error) {
+        setTradeMsg(["ok", j.auto.on ? "自動下單已啟用" : "自動下單已關閉"]);
+        refreshTrade();
+      }
+    },
+    disabled: tradeBusy,
+    className: "ml-auto px-3 py-1 rounded",
+    style: {
+      background: trade.auto.on ? C.panel : C.teal,
+      color: trade.auto.on ? C.red : C.ink,
+      border: trade.auto.on ? `1px solid ${C.red}` : "none",
+      fontSize: 12
+    }
+  }, trade.auto.on ? "停止" : "啟用")), /*#__PURE__*/React.createElement("div", {
+    className: "mt-2.5 grid grid-cols-2 gap-x-4 gap-y-1.5",
+    style: {
+      fontFamily: FONT.data,
+      fontSize: 11.5
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "flex justify-between"
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: C.muted
+    }
+  }, "今日開倉"), /*#__PURE__*/React.createElement("span", null, trade.auto.opened, " / ", trade.auto.maxPerDay)), /*#__PURE__*/React.createElement("div", {
+    className: "flex justify-between"
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: C.muted
+    }
+  }, "今日已實現"), /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: (trade.auto.closedR ?? 0) > 0 ? UP : (trade.auto.closedR ?? 0) < 0 ? DOWN : C.bone
+    }
+  }, (trade.auto.closedR ?? 0).toFixed(2), "R")), /*#__PURE__*/React.createElement("div", {
+    className: "flex justify-between"
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: C.muted
+    }
+  }, "當日停損上限"), /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: DOWN
+    }
+  }, trade.auto.dailyLossR, "R")), /*#__PURE__*/React.createElement("div", {
+    className: "flex justify-between"
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: C.muted
+    }
+  }, "分數門檻"), /*#__PURE__*/React.createElement("span", null, trade.auto.minScore))), trade.auto.blocked && /*#__PURE__*/React.createElement("div", {
+    className: "mt-2 px-2.5 py-1.5 rounded",
+    style: {
+      background: "#241A1A",
+      border: `1px solid ${C.red}`,
+      fontSize: 11.5,
+      color: C.red
+    }
+  }, trade.auto.blocked), /*#__PURE__*/React.createElement("div", {
+    className: "mt-2",
+    style: {
+      fontSize: 10.5,
+      color: C.muted,
+      lineHeight: 1.7
+    }
+  }, "由背景監控觸發，套用與畫面相同的證據檢查，但分數門檻更嚴（", trade.auto.minScore, " 分）。 開倉與平倉都會推播 Telegram。同一檔平倉後 ", trade.auto.cooldownMin, " 分鐘內不再進場。 當日虧損達 ", trade.auto.dailyLossR, "R 會自動停止，隔日（UTC）重置。")), trade.perf && trade.perf.count > 0 ? /*#__PURE__*/React.createElement("div", {
     className: "mt-3 rounded p-3",
     style: {
       background: C.panel2,
