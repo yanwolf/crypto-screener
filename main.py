@@ -288,6 +288,11 @@ try:
 except Exception:                       # 缺少 engine.py 時只停用監控，其他功能照常
     engine = None
 
+try:
+    import trader                       # 模擬單模組；缺少時只停用交易頁
+except Exception:
+    trader = None
+
 MON = {"on": False, "watch": [], "cfg": None, "states": {}, "scope": "watch", "topN": 100,
        "history": [], "lastRun": None, "lastCount": 0, "lastError": None,
        "histTTL": 12, "maxRefresh": 8, "lastRefreshed": 0, "callsToday": 0}
@@ -413,6 +418,62 @@ def monitor_worker(interval_min):
             MON["lastError"] = str(e)
             sys.stderr.write(f"  ! 背景監控失敗：{e}\n")
         time.sleep(max(60, interval_min * 60))
+
+
+
+def trade_handle(path, payload):
+    """模擬單相關端點。金鑰只留在伺服器，前端永遠拿不到。"""
+    if trader is None:
+        return 500, {"error": "trader_module_missing"}
+
+    if path == "/api/trade/status":
+        return 200, trader.status()
+
+    if path == "/api/trade/check":
+        base = str(payload.get("symbol", "")).strip()
+        if not base:
+            return 400, {"error": "missing_symbol"}
+        ok, sym, msg, info = trader.check_tradable(base)
+        out = {"ok": ok, "symbol": sym, "message": msg}
+        if info:
+            out["filters"] = info
+            px = trader.mark_price(sym) if ok else None
+            out["markPrice"] = px
+        return 200, out
+
+    need = os.environ.get("ADMIN_KEY", "").strip()
+    if need and str(payload.get("adminKey", "")) != need:
+        return 403, {"error": "admin_key_required"}
+
+    if path == "/api/trade/config":
+        allowed = ("riskPct", "maxPositions", "leverage", "stopAtrMult",
+                   "tp1R", "tp1Portion", "trailCallback", "trailActivateR")
+        kw = {k: payload[k] for k in allowed if k in payload}
+        return 200, {"cfg": trader.configure(**kw)}
+
+    if path == "/api/trade/enable":
+        trader.STATE["enabled"] = bool(payload.get("on"))
+        trader.save_state()
+        return 200, {"enabled": trader.STATE["enabled"]}
+
+    if path == "/api/trade/open":
+        base = str(payload.get("symbol", "")).strip()
+        side = "SHORT" if str(payload.get("side", "LONG")).upper() == "SHORT" else "LONG"
+        stop = payload.get("stop")
+        entry = payload.get("entry")
+        if not base or stop is None:
+            return 400, {"error": "need_symbol_and_stop"}
+        r = trader.open_position(base, side, entry, float(stop), note=str(payload.get("note", "")))
+        return (200 if r.get("ok") else 400), r
+
+    if path == "/api/trade/close":
+        sym = str(payload.get("symbol", "")).strip().upper()
+        return 200, trader.close_position(sym, str(payload.get("reason", "手動平倉")))
+
+    if path == "/api/trade/sync":
+        return 200, trader.sync_positions()
+
+    return 404, {"error": "not_found"}
 
 
 def mon_handle(path, payload):
@@ -654,6 +715,12 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         if p.startswith("/api/tg/"):
             code, body = tg_handle(p, {})
             return self.send_json(code, json.dumps(body, ensure_ascii=False).encode())
+        if p.startswith("/api/trade/"):
+            qs = urllib.parse.parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "")
+            payload = {k: v[0] for k, v in qs.items()}
+            code, body = trade_handle(p, payload)
+            return self.send_json(code, json.dumps(body, ensure_ascii=False).encode())
+
         if p.startswith("/api/monitor/"):
             code, body = mon_handle(p, {})
             return self.send_json(code, json.dumps(body, ensure_ascii=False).encode())
@@ -673,6 +740,10 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
         if self.path.startswith("/api/tg/"):
             code, body = tg_handle(self.path, payload)
+            return self.send_json(code, json.dumps(body, ensure_ascii=False).encode())
+
+        if self.path.startswith("/api/trade/"):
+            code, body = trade_handle(self.path.split("?")[0], payload)
             return self.send_json(code, json.dumps(body, ensure_ascii=False).encode())
 
         if self.path.startswith("/api/monitor/"):
@@ -806,6 +877,14 @@ def main():
                     help="開放同一個 Wi-Fi 的手機連入（監聽 0.0.0.0，預設只允許本機）")
     ap.add_argument("--key", default=os.environ.get("CG_API_KEY", ""), help="CoinGecko API Key")
     ap.add_argument("--pro", action="store_true", help="使用 Pro 端點")
+    ap.add_argument("--bn-key", default=os.environ.get("BN_KEY", ""),
+                    help="幣安合約 API Key（模擬網請用 testnet.binancefuture.com 申請的）")
+    ap.add_argument("--bn-secret", default=os.environ.get("BN_SECRET", ""), help="幣安 API Secret")
+    ap.add_argument("--risk-pct", type=float, default=float(os.environ.get("RISK_PCT", 0.5)),
+                    help="單筆風險佔帳戶權益的百分比，預設 0.5")
+    ap.add_argument("--leverage", type=int, default=int(os.environ.get("LEVERAGE", 3)))
+    ap.add_argument("--live", action="store_true",
+                    help="打正式網。必須同時設環境變數 ALLOW_LIVE=1，否則忽略")
     ap.add_argument("--tg-token", default=os.environ.get("TG_TOKEN", ""), help="Telegram Bot Token")
     ap.add_argument("--tg-chat", default=os.environ.get("TG_CHAT", ""), help="Telegram Chat ID")
     ap.add_argument("--discord", default=os.environ.get("DISCORD_WEBHOOK", ""), help="Discord Webhook 網址")
@@ -855,6 +934,31 @@ def main():
           + (f"　已配對 {len(_tg['chats'])} 個聊天室" if _tg["chats"] else ""))
     if _tg["token"] and not _tg["chats"]:
         print("        Bot 已設定但尚未配對，請到網頁的提醒設定按「開始配對」")
+
+    # ── 模擬單設定 ──
+    if trader is not None:
+        want_live = args.live and os.environ.get("ALLOW_LIVE", "") == "1"
+        if args.live and not want_live:
+            sys.stderr.write("  ! 已指定 --live 但未設 ALLOW_LIVE=1，仍使用模擬網\n")
+        trader.CFG["key"] = args.bn_key.strip()
+        trader.CFG["secret"] = args.bn_secret.strip()
+        trader.CFG["live"] = want_live
+        trader.CFG["riskPct"] = args.risk_pct
+        trader.CFG["leverage"] = args.leverage
+        trader.load_state(os.path.join(CACHE_DIR, "trader.json"))
+        net = "正式網（真實資金）" if want_live else "模擬網 Testnet"
+        if trader.CFG["key"]:
+            off = trader.sync_time()
+            n = len(trader.load_filters())
+            eq, err = trader.account_equity()
+            sys.stderr.write(
+                f"  交易　{net}　風險 {args.risk_pct}%/筆　槓桿 {args.leverage}x　"
+                f"合約 {n} 檔　時鐘差 {off if off is not None else '?'}ms\n")
+            sys.stderr.write(f"  權益　{('%.2f USDT' % eq) if eq is not None else '取不到（' + str(err) + '）'}\n")
+            if want_live:
+                sys.stderr.write("  ⚠ 正在對正式網下單，會動用真實資金\n")
+        else:
+            sys.stderr.write(f"  交易　未設定 BN_KEY／BN_SECRET，模擬單功能停用（{net}）\n")
 
     ok = selftest()
 

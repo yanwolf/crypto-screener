@@ -1,0 +1,514 @@
+"""
+幣安合約模擬網（Testnet）下單模組
+
+設計原則：
+1. 金鑰只存在伺服器環境變數，永遠不送到瀏覽器。
+2. 預設鎖死在 Testnet。要打正式網必須同時設 ALLOW_LIVE=1 與 --live，
+   避免一個環境變數手滑就打到真錢。
+3. 下單前一定做可交易性檢查：有沒有永續合約、能不能下、精度與最小名目金額。
+4. 部位大小由「單筆願意虧多少」反推，不是由金額反推。
+   停損距離越遠、部位越小，讓每一筆的虧損上限一致，這是大賺小賠的前提。
+5. 出場採 R 倍數：固定停損 1R，到 2R 先出一半，剩下用移動停利讓利潤跑。
+
+與 engine.py 一樣，這裡不做任何預測，只執行訊號給出的計畫。
+"""
+
+import hashlib
+import hmac
+import json
+import math
+import os
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+TESTNET_BASE = "https://testnet.binancefuture.com"
+LIVE_BASE = "https://fapi.binance.com"
+
+CFG = {
+    "key": "", "secret": "",
+    "live": False,                 # 預設 Testnet
+    "riskPct": 0.5,                # 單筆風險：帳戶權益的 %
+    "maxPositions": 5,             # 同時最多幾個部位
+    "leverage": 3,
+    "stopAtrMult": 1.5,            # 停損 = 進場價 ∓ 1.5×ATR
+    "tp1R": 2.0,                   # 第一目標：2R 出一半
+    "tp1Portion": 0.5,
+    "trailCallback": 1.2,          # 移動停利回撤 %
+    "trailActivateR": 2.0,         # 到 2R 才啟動移動停利
+    "minNotional": 5.0,
+    "dryRun": False,               # True 時只計算不送單，供離線驗證
+}
+
+_filters = {}                      # symbol → 精度與限制
+_filters_ts = 0
+_lock = threading.Lock()
+_time_offset = [0]                 # 伺服器與幣安的時鐘差
+
+STATE = {
+    "enabled": False,
+    "positions": {},               # symbol → 部位紀錄
+    "trades": [],                  # 已平倉紀錄
+    "errors": [],
+    "lastRun": None,
+}
+
+STATE_FILE = None
+
+
+# ── 基礎工具 ────────────────────────────────────────────────
+
+def base_url():
+    return LIVE_BASE if CFG["live"] else TESTNET_BASE
+
+
+def _sign(params: dict) -> str:
+    q = urllib.parse.urlencode(params)
+    sig = hmac.new(CFG["secret"].encode(), q.encode(), hashlib.sha256).hexdigest()
+    return q + "&signature=" + sig
+
+
+def _request(method, path, params=None, signed=False, timeout=15):
+    """回傳 (status, data)。data 解析失敗時是原始文字。"""
+    params = dict(params or {})
+    if signed:
+        if not CFG["key"] or not CFG["secret"]:
+            return 401, {"error": "missing_credentials"}
+        params["timestamp"] = int(time.time() * 1000) + _time_offset[0]
+        params.setdefault("recvWindow", 10000)
+        body = _sign(params)
+    else:
+        body = urllib.parse.urlencode(params)
+
+    url = base_url() + path
+    headers = {"User-Agent": "crypto-screener-trader/1.0"}
+    if CFG["key"]:
+        headers["X-MBX-APIKEY"] = CFG["key"]
+
+    if method == "GET":
+        req = urllib.request.Request(url + ("?" + body if body else ""), headers=headers)
+    else:
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
+        req = urllib.request.Request(url, data=body.encode(), headers=headers, method=method)
+
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return 200, json.loads(r.read() or b"{}")
+    except urllib.error.HTTPError as e:
+        raw = e.read()
+        try:
+            return e.code, json.loads(raw or b"{}")
+        except Exception:
+            return e.code, {"error": raw.decode(errors="replace")[:300]}
+    except Exception as e:
+        return 0, {"error": str(e)[:300]}
+
+
+def sync_time():
+    """幣安要求時間戳落在 recvWindow 內。容器時鐘漂移會造成 -1021 錯誤，
+    所以啟動時先對時。"""
+    st, d = _request("GET", "/fapi/v1/time")
+    if st == 200 and isinstance(d, dict) and "serverTime" in d:
+        _time_offset[0] = int(d["serverTime"]) - int(time.time() * 1000)
+        return _time_offset[0]
+    return None
+
+
+# ── 精度與可交易性 ──────────────────────────────────────────
+
+_filters_err = [None]
+
+
+def load_filters(force=False):
+    """抓 exchangeInfo，建立每個交易對的精度與下限。
+    失敗時記錄原因，讓呼叫端能分辨「查不到」與「不存在」。"""
+    global _filters_ts
+    with _lock:
+        if _filters and not force and time.time() - _filters_ts < 3600:
+            return _filters
+    st, d = _request("GET", "/fapi/v1/exchangeInfo", timeout=25)
+    if st != 200 or not isinstance(d, dict):
+        _filters_err[0] = (d.get("error") or d.get("msg") or f"HTTP {st}") if isinstance(d, dict) else f"HTTP {st}"
+        return _filters
+    _filters_err[0] = None
+    out = {}
+    for s in d.get("symbols", []):
+        if s.get("contractType") != "PERPETUAL" or s.get("quoteAsset") != "USDT":
+            continue
+        f = {"status": s.get("status"), "base": s.get("baseAsset"),
+             "tick": None, "step": None, "minQty": None, "minNotional": None}
+        for flt in s.get("filters", []):
+            t = flt.get("filterType")
+            if t == "PRICE_FILTER":
+                f["tick"] = float(flt["tickSize"])
+            elif t == "LOT_SIZE":
+                f["step"] = float(flt["stepSize"])
+                f["minQty"] = float(flt["minQty"])
+            elif t in ("MIN_NOTIONAL", "NOTIONAL"):
+                f["minNotional"] = float(flt.get("notional") or flt.get("minNotional") or 0)
+        out[s["symbol"]] = f
+    with _lock:
+        _filters.clear()
+        _filters.update(out)
+        _filters_ts = time.time()
+    return _filters
+
+
+def round_step(v, step):
+    """往下取到步進的整數倍。用字串處理避免浮點誤差把數量推過界，
+    幣安對精度非常嚴格，多一位小數就會被拒單。"""
+    if not step or step <= 0:
+        return v
+    n = math.floor(round(v / step, 9)) * step
+    dec = max(0, -int(math.floor(math.log10(step)))) if step < 1 else 0
+    return float(f"{n:.{dec}f}")
+
+
+def check_tradable(symbol_base: str):
+    """下單前的可交易性檢查。回傳 (ok, symbol, 說明, filters)。
+
+    刻意區分三種結果，因為「連不到交易所」和「這個幣沒有合約」
+    是完全不同的問題，混為一談會讓人誤判。
+    """
+    f = load_filters()
+    sym = symbol_base.upper() + "USDT"
+    if not f:
+        return False, sym, (
+            "取不到幣安合約清單，無法確認是否有這檔合約"
+            + (f"（{_filters_err[0]}）" if _filters_err[0] else "")
+            + "。這是連線問題，不代表沒有合約。"), None
+    if sym not in f:
+        return False, sym, f"幣安沒有 {sym} 永續合約（清單共 {len(f)} 檔）", None
+    info = f[sym]
+    if info.get("status") != "TRADING":
+        return False, sym, f"{sym} 目前狀態為 {info.get('status')}，無法下單", info
+    return True, sym, "可交易", info
+
+
+def mark_price(symbol):
+    st, d = _request("GET", "/fapi/v1/premiumIndex", {"symbol": symbol})
+    if st == 200 and isinstance(d, dict):
+        try:
+            return float(d["markPrice"])
+        except Exception:
+            return None
+    return None
+
+
+def account_equity():
+    st, d = _request("GET", "/fapi/v2/account", signed=True)
+    if st != 200 or not isinstance(d, dict):
+        return None, (d.get("msg") or d.get("error") or f"HTTP {st}") if isinstance(d, dict) else str(st)
+    try:
+        return float(d["totalWalletBalance"]), None
+    except Exception:
+        return None, "回應缺少 totalWalletBalance"
+
+
+# ── 部位大小 ────────────────────────────────────────────────
+
+def size_position(equity, entry, stop, info, risk_pct=None, lev=None):
+    """由「單筆願意虧多少」反推數量，而不是由金額反推。
+
+    停損距離越遠 → 數量越小 → 每筆最大虧損維持一致。
+    這是大賺小賠能成立的前提：虧損端必須被壓在固定值。
+    回傳 (qty, 說明dict)。qty 為 0 代表這筆不該下。
+    """
+    risk_pct = CFG["riskPct"] if risk_pct is None else risk_pct
+    lev = CFG["leverage"] if lev is None else lev
+    dist = abs(entry - stop)
+    out = {"equity": equity, "entry": entry, "stop": stop, "dist": dist,
+           "riskAmt": None, "qty": 0.0, "notional": 0.0, "reason": None}
+    if not (equity and entry and dist > 0):
+        out["reason"] = "缺少權益、進場價或停損距離"
+        return 0.0, out
+
+    risk_amt = equity * risk_pct / 100.0
+    out["riskAmt"] = risk_amt
+    qty = risk_amt / dist
+
+    step = (info or {}).get("step") or 0.001
+    qty = round_step(qty, step)
+    notional = qty * entry
+
+    # 名目金額上限：不得超過權益 × 槓桿
+    cap = equity * lev
+    if notional > cap:
+        qty = round_step(cap / entry, step)
+        notional = qty * entry
+        out["reason"] = "受槓桿上限縮減"
+
+    min_qty = (info or {}).get("minQty") or 0
+    min_not = max((info or {}).get("minNotional") or 0, CFG["minNotional"])
+    if qty < min_qty or notional < min_not:
+        out["qty"] = qty
+        out["notional"] = notional
+        out["reason"] = (f"數量 {qty} 低於最小下單量 {min_qty}" if qty < min_qty
+                         else f"名目金額 {notional:.2f} 低於最小值 {min_not}")
+        return 0.0, out
+
+    out["qty"] = qty
+    out["notional"] = notional
+    return qty, out
+
+
+def plan_exits(entry, stop, side):
+    """由停損距離推出各級目標。R = 1 倍停損距離。"""
+    r = abs(entry - stop)
+    sgn = 1 if side == "LONG" else -1
+    return {
+        "R": r,
+        "stop": stop,
+        "tp1": entry + sgn * r * CFG["tp1R"],
+        "trailActivate": entry + sgn * r * CFG["trailActivateR"],
+        "trailCallback": CFG["trailCallback"],
+    }
+
+
+# ── 下單 ────────────────────────────────────────────────────
+
+def set_leverage(symbol, lev):
+    return _request("POST", "/fapi/v1/leverage", {"symbol": symbol, "leverage": int(lev)}, signed=True)
+
+
+def open_position(symbol_base, side, entry_hint, stop, info=None, note=""):
+    """進場：市價單 + 停損單 + 部分停利 + 移動停利。
+
+    停損一定在進場後立刻掛出。如果掛停損失敗，會立刻market平掉剛進的倉，
+    因為沒有停損的部位違反這套系統的前提。
+    """
+    ok, sym, msg, finfo = check_tradable(symbol_base)
+    if not ok:
+        return {"ok": False, "error": msg}
+    info = info or finfo
+
+    equity, err = account_equity()
+    if equity is None:
+        return {"ok": False, "error": f"取不到帳戶權益：{err}"}
+
+    px = mark_price(sym) or entry_hint
+    if not px:
+        return {"ok": False, "error": "取不到市價"}
+
+    qty, detail = size_position(equity, px, stop, info)
+    if qty <= 0:
+        return {"ok": False, "error": f"部位大小不合格：{detail.get('reason')}", "detail": detail}
+
+    exits = plan_exits(px, stop, side)
+    if CFG["dryRun"]:
+        return {"ok": True, "dryRun": True, "symbol": sym, "side": side,
+                "qty": qty, "entry": px, "exits": exits, "sizing": detail}
+
+    set_leverage(sym, CFG["leverage"])
+    order_side = "BUY" if side == "LONG" else "SELL"
+    close_side = "SELL" if side == "LONG" else "BUY"
+
+    st, entry_res = _request("POST", "/fapi/v1/order", {
+        "symbol": sym, "side": order_side, "type": "MARKET", "quantity": qty,
+    }, signed=True)
+    if st != 200:
+        return {"ok": False, "error": f"進場失敗：{entry_res.get('msg') or entry_res}"}
+
+    tick = (info or {}).get("tick") or 0.01
+    stop_px = round_step(stop, tick)
+    sub, errs = [], []
+
+    # 停損：closePosition 確保無論部位多大都全平
+    st2, r2 = _request("POST", "/fapi/v1/order", {
+        "symbol": sym, "side": close_side, "type": "STOP_MARKET",
+        "stopPrice": stop_px, "closePosition": "true", "workingType": "MARK_PRICE",
+    }, signed=True)
+    if st2 != 200:
+        errs.append(f"停損掛單失敗：{r2.get('msg') or r2}")
+        # 沒有停損就不留倉
+        _request("POST", "/fapi/v1/order", {
+            "symbol": sym, "side": close_side, "type": "MARKET",
+            "quantity": qty, "reduceOnly": "true",
+        }, signed=True)
+        return {"ok": False, "error": "；".join(errs) + "　已立即平倉，避免無停損部位"}
+    sub.append({"type": "STOP_MARKET", "id": r2.get("orderId"), "px": stop_px})
+
+    # 第一目標：出一半，讓剩下的部位零成本奔跑
+    step = (info or {}).get("step") or 0.001
+    tp_qty = round_step(qty * CFG["tp1Portion"], step)
+    if tp_qty > 0:
+        st3, r3 = _request("POST", "/fapi/v1/order", {
+            "symbol": sym, "side": close_side, "type": "TAKE_PROFIT_MARKET",
+            "stopPrice": round_step(exits["tp1"], tick), "quantity": tp_qty,
+            "reduceOnly": "true", "workingType": "MARK_PRICE",
+        }, signed=True)
+        if st3 == 200:
+            sub.append({"type": "TAKE_PROFIT_MARKET", "id": r3.get("orderId"),
+                        "px": round_step(exits["tp1"], tick), "qty": tp_qty})
+        else:
+            errs.append(f"停利掛單失敗：{r3.get('msg') or r3}")
+
+    # 移動停利：到 2R 才啟動，讓趨勢單有機會走遠
+    trail_qty = round_step(qty - tp_qty, step)
+    if trail_qty > 0:
+        st4, r4 = _request("POST", "/fapi/v1/order", {
+            "symbol": sym, "side": close_side, "type": "TRAILING_STOP_MARKET",
+            "quantity": trail_qty, "callbackRate": CFG["trailCallback"],
+            "activationPrice": round_step(exits["trailActivate"], tick),
+            "reduceOnly": "true", "workingType": "MARK_PRICE",
+        }, signed=True)
+        if st4 == 200:
+            sub.append({"type": "TRAILING_STOP_MARKET", "id": r4.get("orderId"),
+                        "activate": round_step(exits["trailActivate"], tick)})
+        else:
+            errs.append(f"移動停利掛單失敗：{r4.get('msg') or r4}")
+
+    pos = {
+        "symbol": sym, "side": side, "qty": qty, "entry": px,
+        "stop": stop_px, "exits": exits, "sizing": detail,
+        "orders": sub, "opened": int(time.time() * 1000),
+        "note": note, "warnings": errs,
+    }
+    STATE["positions"][sym] = pos
+    save_state()
+    return {"ok": True, **pos}
+
+
+def close_position(symbol, reason="手動平倉"):
+    pos = STATE["positions"].get(symbol)
+    if not pos:
+        return {"ok": False, "error": "沒有這個部位"}
+    close_side = "SELL" if pos["side"] == "LONG" else "BUY"
+    if not CFG["dryRun"]:
+        _request("POST", "/fapi/v1/order", {
+            "symbol": symbol, "side": close_side, "type": "MARKET",
+            "quantity": pos["qty"], "reduceOnly": "true",
+        }, signed=True)
+        _request("DELETE", "/fapi/v1/allOpenOrders", {"symbol": symbol}, signed=True)
+    px = mark_price(symbol) or pos["entry"]
+    record_close(pos, px, reason)
+    return {"ok": True, "symbol": symbol, "exit": px}
+
+
+def record_close(pos, exit_px, reason):
+    sgn = 1 if pos["side"] == "LONG" else -1
+    pnl = (exit_px - pos["entry"]) * sgn * pos["qty"]
+    r = pos["exits"]["R"] * pos["qty"]
+    STATE["trades"].append({
+        "symbol": pos["symbol"], "side": pos["side"], "qty": pos["qty"],
+        "entry": pos["entry"], "exit": exit_px, "pnl": pnl,
+        "rMultiple": (pnl / r) if r else None,
+        "opened": pos["opened"], "closed": int(time.time() * 1000),
+        "reason": reason, "note": pos.get("note", ""),
+    })
+    STATE["positions"].pop(pos["symbol"], None)
+    save_state()
+
+
+def sync_positions():
+    """跟幣安對帳：本地記著但交易所已無部位的，代表被停損或停利成交了。"""
+    if CFG["dryRun"]:
+        return {"closed": []}
+    st, d = _request("GET", "/fapi/v2/positionRisk", signed=True)
+    if st != 200 or not isinstance(d, list):
+        return {"error": "對帳失敗"}
+    live = {}
+    for p in d:
+        try:
+            amt = float(p.get("positionAmt") or 0)
+        except Exception:
+            amt = 0.0
+        if abs(amt) > 0:
+            live[p["symbol"]] = p
+    closed = []
+    for sym in list(STATE["positions"].keys()):
+        if sym not in live:
+            pos = STATE["positions"][sym]
+            px = mark_price(sym) or pos["entry"]
+            record_close(pos, px, "交易所出場（停損或停利觸發）")
+            closed.append(sym)
+    STATE["lastRun"] = int(time.time() * 1000)
+    return {"closed": closed, "open": list(live.keys())}
+
+
+# ── 績效統計 ────────────────────────────────────────────────
+
+def performance():
+    """以 R 倍數為核心。大賺小賠的關鍵不是勝率，是平均獲利 R 要明顯大於
+    平均虧損 R，所以這裡把兩者分開列出。"""
+    t = STATE["trades"]
+    if not t:
+        return {"count": 0}
+    wins = [x for x in t if (x["pnl"] or 0) > 0]
+    losses = [x for x in t if (x["pnl"] or 0) <= 0]
+    rs = [x["rMultiple"] for x in t if x.get("rMultiple") is not None]
+    win_r = [x["rMultiple"] for x in wins if x.get("rMultiple") is not None]
+    loss_r = [x["rMultiple"] for x in losses if x.get("rMultiple") is not None]
+
+    equity_curve, peak, dd = 0.0, 0.0, 0.0
+    for x in t:
+        equity_curve += x["pnl"] or 0
+        peak = max(peak, equity_curve)
+        dd = min(dd, equity_curve - peak)
+
+    avg_w = sum(win_r) / len(win_r) if win_r else 0.0
+    avg_l = sum(loss_r) / len(loss_r) if loss_r else 0.0
+    wr = len(wins) / len(t)
+    return {
+        "count": len(t),
+        "wins": len(wins), "losses": len(losses),
+        "winRate": round(wr * 100, 1),
+        "pnl": round(sum(x["pnl"] or 0 for x in t), 2),
+        "avgWinR": round(avg_w, 2), "avgLossR": round(avg_l, 2),
+        # 賺賠比：平均獲利 R ÷ 平均虧損 R。大賺小賠要讓這個數字大於 2
+        "payoff": round(abs(avg_w / avg_l), 2) if avg_l else None,
+        # 期望值：每冒 1R 風險平均賺回多少 R
+        "expectancyR": round(wr * avg_w + (1 - wr) * avg_l, 3),
+        "totalR": round(sum(rs), 2) if rs else None,
+        "maxDrawdown": round(dd, 2),
+        "best": round(max(rs), 2) if rs else None,
+        "worst": round(min(rs), 2) if rs else None,
+    }
+
+
+# ── 狀態持久化 ──────────────────────────────────────────────
+
+def save_state():
+    if not STATE_FILE:
+        return
+    try:
+        with open(STATE_FILE, "w") as f:
+            json.dump({k: STATE[k] for k in ("enabled", "positions", "trades")}, f)
+    except Exception:
+        pass
+
+
+def load_state(path):
+    global STATE_FILE
+    STATE_FILE = path
+    try:
+        with open(path) as f:
+            d = json.load(f)
+        STATE["enabled"] = d.get("enabled", False)
+        STATE["positions"] = d.get("positions", {})
+        STATE["trades"] = d.get("trades", [])
+    except Exception:
+        pass
+
+
+def configure(**kw):
+    for k, v in kw.items():
+        if k in CFG and v is not None:
+            CFG[k] = v
+    return {k: (bool(v) if k in ("live", "dryRun") else v)
+            for k, v in CFG.items() if k not in ("key", "secret")}
+
+
+def status():
+    return {
+        "enabled": STATE["enabled"],
+        "net": "LIVE 正式網" if CFG["live"] else "TESTNET 模擬網",
+        "hasCreds": bool(CFG["key"] and CFG["secret"]),
+        "positions": list(STATE["positions"].values()),
+        "perf": performance(),
+        "cfg": {k: v for k, v in CFG.items() if k not in ("key", "secret")},
+        "lastRun": STATE["lastRun"],
+        "symbols": len(_filters),
+    }
