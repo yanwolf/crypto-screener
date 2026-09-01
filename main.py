@@ -393,6 +393,7 @@ def fmt_money(v):
 STAGE_LABEL = {
     "disabled": "未下單",
     "score": "未下單　分數不足",
+    "nodata": "未下單　缺少資料",
     "gate": "未下單　條件不符",
     "stop": "未下單　停損無法計算",
     "risk": "未下單　風險額度限制",
@@ -597,9 +598,14 @@ def auto_try_trade(ev, row):
     if not sym:
         return {"stage": "disabled", "why": "取不到幣別代號"}
 
-    score = row.get("bearScore") if bear else row.get("score")
+    # 分數優先用訊號事件裡的值：那正是通知上顯示的「評分」，
+    # 與 rows 的欄位名不同（rows 用 radar / bearRadar），先前讀錯導致永遠是 None。
+    score = ev.get("score")
     if score is None:
-        return {"stage": "score", "why": "沒有評分資料"}
+        score = row.get("bear") if bear else row.get("radar")   # 空頭分數存在 row["bear"]
+    if score is None:
+        return {"stage": "nodata",
+                "why": "取不到這檔的評分（掃描資料可能尚未涵蓋），本輪不下單"}
     if score < trader.AUTO["minScore"]:
         return {"stage": "score",
                 "why": f"分數 {engine._fmt1(score)} 未達自動下單門檻 {trader.AUTO['minScore']}"}
@@ -607,7 +613,7 @@ def auto_try_trade(ev, row):
     dv = None
     dv_err = None
     try:
-        dv = fetch_deriv_server(sym, row.get("m24"))
+        dv = fetch_deriv_server(sym, row.get("m24"))     # m24 由行情端點合併進 row
         if dv is None:
             dv_err = "幣安沒有這檔永續合約，或合約資料取不到"
     except Exception as e:
@@ -618,12 +624,15 @@ def auto_try_trade(ev, row):
     if blocks:
         return {"stage": "gate", "why": "；".join(blocks), "note": "；".join(warns) or None}
 
+    # 停損來源與畫面一致：空頭用結構停損（row["stop"]），
+    # 多頭用三刀流的小綠（row["ma60"]，在 row 頂層，不在 blades 底下）。
     if bear:
-        stop = (row.get("bear") or {}).get("stop")
+        stop = row.get("stop") or ev.get("stop")
     else:
-        ma60 = (row.get("blades") or {}).get("ma60")
-        stop = ma60 * 0.995 if ma60 else (row["price"] * 0.94 if row.get("price") else None)
-    price = row.get("price")
+        ma60 = row.get("ma60")
+        price0 = row.get("price") or ev.get("price")
+        stop = ma60 * 0.995 if ma60 else (price0 * 0.94 if price0 else None)
+    price = row.get("price") or ev.get("price")
     if stop is None or price is None or (stop > price) != bear:
         return {"stage": "stop", "why": "算不出合理的停損價，不送無停損的單"}
 
