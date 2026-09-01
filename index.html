@@ -6426,6 +6426,58 @@ function CryptoScreener() {
       color: C.red
     }
   }, trade.auto.blocked), /*#__PURE__*/React.createElement("div", {
+    className: "mt-2.5 pt-2.5 flex items-center gap-2 flex-wrap",
+    style: {
+      borderTop: `1px solid ${C.line}`,
+      fontSize: 11.5
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: C.muted
+    }
+  }, "快取用量"), /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontFamily: FONT.data
+    }
+  }, trade.diskMB ?? "—", " MB"), /*#__PURE__*/React.createElement("button", {
+    onClick: async () => {
+      const j = await tradeCall("cleanup", {
+        dry: true
+      });
+      if (j && !j.error) {
+        setTradeMsg(["ok", j.removed ? `可清除 ${j.removed} 個過期檔（${j.freedMB} MB）。再按「立即清理」執行。` : `沒有超過 ${j.maxAgeH} 小時的過期快取，目前 ${j.diskMB} MB。`]);
+      }
+    },
+    disabled: tradeBusy,
+    className: "px-2.5 py-1 rounded",
+    style: {
+      background: C.panel,
+      border: `1px solid ${C.line}`,
+      color: C.muted,
+      fontSize: 11
+    }
+  }, "試算"), /*#__PURE__*/React.createElement("button", {
+    onClick: async () => {
+      const j = await tradeCall("cleanup", {});
+      if (j && !j.error) {
+        setTradeMsg(["ok", `已清除 ${j.removed} 個過期檔，釋出 ${j.freedMB} MB，剩餘 ${j.diskMB} MB。`]);
+        refreshTrade();
+      }
+    },
+    disabled: tradeBusy,
+    className: "px-2.5 py-1 rounded",
+    style: {
+      background: C.panel,
+      border: `1px solid ${C.line}`,
+      color: C.muted,
+      fontSize: 11
+    }
+  }, "立即清理"), /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: C.muted,
+      fontSize: 10.5
+    }
+  }, "每 6 小時自動清一次")), /*#__PURE__*/React.createElement("div", {
     className: "mt-2",
     style: {
       fontSize: 10.5,

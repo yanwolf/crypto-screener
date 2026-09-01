@@ -706,6 +706,7 @@ def trade_handle(path, payload):
     if path == "/api/trade/status":
         st = trader.status()
         st["adminRequired"] = bool(os.environ.get("ADMIN_KEY", "").strip())
+        st["diskMB"] = cache_disk_mb()
         return 200, st
 
     if path == "/api/trade/check":
@@ -738,6 +739,13 @@ def trade_handle(path, payload):
                 v = max(lo, min(hi, v))
                 kw[k] = int(v) if k in ("maxPositions", "leverage") else v
         return 200, {"cfg": trader.configure(**kw)}
+
+    if path == "/api/trade/cleanup":
+        dry = str(payload.get("dry", "")) in ("1", "true", "True")
+        st = cache_cleanup(dry_run=dry)
+        st["diskMB"] = cache_disk_mb()
+        st["maxAgeH"] = CACHE_MAX_AGE_H
+        return 200, st
 
     if path == "/api/trade/auto":
         if "on" in payload:
@@ -850,6 +858,131 @@ def upstream_probe():
             out.append({"name": name, "ok": False, "code": 0,
                         "ms": int((time.time() - t0) * 1000), "detail": str(e)[:180]})
     return out
+
+
+
+# ── 快取清理 ────────────────────────────────────────────────
+#
+# 深度資料的快取檔過期後不會自動消失，只是不再被採用，
+# 所以磁碟用量會持續累積。這裡定期清掉真的用不到的。
+#
+# 狀態檔（Telegram 配對、監控設定、交易紀錄）絕對不能刪，
+# 它們跟快取放在同一個目錄，靠固定檔名保護。
+
+PROTECTED = {"telegram.json", "monitor.json", "trader.json"}
+
+
+def cache_disk_mb():
+    if not os.path.isdir(CACHE_DIR):
+        return 0.0
+    tot = 0
+    try:
+        for n in os.listdir(CACHE_DIR):
+            try:
+                tot += os.path.getsize(os.path.join(CACHE_DIR, n))
+            except OSError:
+                pass
+    except OSError:
+        return 0.0
+    return round(tot / 1048576.0, 1)
+
+CACHE_MAX_AGE_H = float(os.environ.get("CACHE_MAX_AGE_H", 72))   # 超過幾小時就刪
+CACHE_MAX_MB = float(os.environ.get("CACHE_MAX_MB", 0))          # 0 = 不限總量
+
+
+def cache_cleanup(max_age_h=None, max_mb=None, dry_run=False):
+    """刪除過期或超量的快取檔。回傳統計。
+
+    保留期刻意比 TTL 長很多：TTL 到期只代表「要重抓」，
+    但背景監控的 histTTL 最長可設 72 小時，太早刪會讓它白白重抓。
+    """
+    max_age = (CACHE_MAX_AGE_H if max_age_h is None else max_age_h) * 3600
+    limit_mb = CACHE_MAX_MB if max_mb is None else max_mb
+    stat = {"scanned": 0, "removed": 0, "freedMB": 0.0, "keptMB": 0.0,
+            "protected": 0, "errors": 0}
+    if not os.path.isdir(CACHE_DIR):
+        return stat
+
+    now = time.time()
+    entries = []
+    for name in os.listdir(CACHE_DIR):
+        if name in PROTECTED:
+            stat["protected"] += 1
+            continue
+        if not name.endswith(".json"):
+            continue                      # 不認識的檔案一律不碰
+        p = os.path.join(CACHE_DIR, name)
+        try:
+            st = os.stat(p)
+        except OSError:
+            continue
+        stat["scanned"] += 1
+
+        # 以檔案內記錄的時間為準，檔案 mtime 可能因為搬移而失真
+        ts = st.st_mtime
+        try:
+            with open(p) as f:
+                ts = float(json.load(f).get("ts") or st.st_mtime)
+        except Exception:
+            pass
+        entries.append((ts, p, st.st_size))
+
+    keep = []
+    for ts, p, size in entries:
+        if now - ts > max_age:
+            if dry_run:
+                stat["removed"] += 1
+                stat["freedMB"] += size / 1048576.0
+            else:
+                try:
+                    os.remove(p)
+                    stat["removed"] += 1
+                    stat["freedMB"] += size / 1048576.0
+                except OSError:
+                    stat["errors"] += 1
+        else:
+            keep.append((ts, p, size))
+
+    # 總量上限：從最舊的開始刪，直到低於上限
+    if limit_mb > 0:
+        keep.sort()                         # 舊的在前
+        total = sum(x[2] for x in keep) / 1048576.0
+        while keep and total > limit_mb:
+            ts, p, size = keep.pop(0)
+            if not dry_run:
+                try:
+                    os.remove(p)
+                except OSError:
+                    stat["errors"] += 1
+                    continue
+            stat["removed"] += 1
+            stat["freedMB"] += size / 1048576.0
+            total -= size / 1048576.0
+
+    stat["keptMB"] = round(sum(x[2] for x in keep) / 1048576.0, 2)
+    stat["freedMB"] = round(stat["freedMB"], 2)
+
+    # 記憶體快取也要同步清，否則刪了檔案卻還在記憶體裡佔空間
+    if not dry_run and stat["removed"]:
+        with _cache_lock:
+            for k in [k for k, v in _cache.items() if now - v[0] > max_age]:
+                _cache.pop(k, None)
+    return stat
+
+
+def cleanup_worker(every_h=6):
+    """定期清理。啟動後先等一分鐘，避開開機時的尖峰。"""
+    time.sleep(60)
+    while True:
+        try:
+            st = cache_cleanup()
+            if st["removed"]:
+                sys.stderr.write(
+                    f"  ~ 快取清理：刪除 {st['removed']} 檔，釋出 {st['freedMB']} MB，"
+                    f"保留 {st['keptMB']} MB\n")
+        except Exception as e:
+            sys.stderr.write(f"  ! 快取清理失敗：{e}\n")
+        time.sleep(every_h * 3600)
 
 
 def notify_telegram(title, text):
@@ -995,6 +1128,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 "monitor": MON["on"], "cached": len(_cache),
                 "quotaExhausted": QUOTA["exhausted"], "keyless": keyless_now(),
                 "disk": (len(os.listdir(CACHE_DIR)) if os.path.isdir(CACHE_DIR) else 0),
+                "diskMB": cache_disk_mb(),
                 "gap": CFG["gap"], "uptime": int(time.time() - START_TS),
             }
             if "probe=1" in (self.path.split("?", 1)[1] if "?" in self.path else ""):
@@ -1284,6 +1418,7 @@ def main():
             sys.stderr.write(f"  交易　未設定 BN_KEY／BN_SECRET，模擬單功能停用（{net}）\n")
 
     threading.Thread(target=selftest, daemon=True).start()
+    threading.Thread(target=cleanup_worker, daemon=True).start()
 
     if engine is None:
         print("  監控　找不到 engine.py，背景訊號監控停用")
