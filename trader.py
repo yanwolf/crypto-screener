@@ -407,6 +407,22 @@ def open_position(symbol_base, side, entry_hint, stop, info=None, note=""):
     stop_px = round_step(stop, tick)
     sub, errs = [], []
 
+    # 掛停損前用「當下」的標記價再檢查一次。
+    # 訊號產生到實際下單之間可能隔了幾分鐘，波動大的幣可能已經跌破預定停損；
+    # 這時掛單會被拒（Order would immediately trigger），
+    # 而且更重要的是——這筆的前提已經不成立，不該留倉。
+    live = mark_price(sym) or px
+    buf = 0.002                      # 0.2% 緩衝，避免掛在剛好觸發的邊緣
+    breached = (stop_px >= live * (1 - buf)) if side == "LONG" else (stop_px <= live * (1 + buf))
+    if breached:
+        _request("POST", "/fapi/v1/order", {
+            "symbol": sym, "side": close_side, "type": "MARKET",
+            "quantity": qty, "reduceOnly": "true",
+        }, signed=True)
+        return {"ok": False, "error": (
+            f"下單瞬間價格已越過預定停損（現價 {live:g}，停損 {stop_px:g}），"
+            f"進場前提不成立，已立即平倉不留倉位")}
+
     # 停損：closePosition 確保無論部位多大都全平
     st2, r2, ep2 = place_conditional({
         "symbol": sym, "side": close_side, "type": "STOP_MARKET",

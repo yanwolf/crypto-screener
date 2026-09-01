@@ -6445,7 +6445,7 @@ function CryptoScreener() {
         dry: true
       });
       if (j && !j.error) {
-        setTradeMsg(["ok", j.removed ? `可清除 ${j.removed} 個過期檔（${j.freedMB} MB）。再按「立即清理」執行。` : `沒有超過 ${j.maxAgeH} 小時的過期快取，目前 ${j.diskMB} MB。`]);
+        setTradeMsg(["ok", j.removed ? `可清除 ${j.removed} 個過期檔（${j.freedMB} MB），清完剩 ${(j.diskMB - j.freedMB).toFixed(1)} MB。` : `沒有可清的檔案。目前 ${j.diskMB} MB、${j.scanned} 個快取檔，` + `最舊的才 ${j.oldestH ?? "—"} 小時（保留期 ${j.maxAgeH} 小時）` + (j.lastAuto != null ? `。上次${j.lastBy === "auto" ? "自動" : "手動"}清理在 ${j.lastAuto} 分鐘前` : "") + "。"]);
       }
     },
     disabled: tradeBusy,
@@ -6460,7 +6460,7 @@ function CryptoScreener() {
     onClick: async () => {
       const j = await tradeCall("cleanup", {});
       if (j && !j.error) {
-        setTradeMsg(["ok", `已清除 ${j.removed} 個過期檔，釋出 ${j.freedMB} MB，剩餘 ${j.diskMB} MB。`]);
+        setTradeMsg(["ok", j.removed ? `已清除 ${j.removed} 個過期檔，釋出 ${j.freedMB} MB，剩餘 ${j.diskMB} MB。` : `沒有東西需要清。${j.scanned} 個快取檔都在保留期內` + `（最舊 ${j.oldestH ?? "—"} 小時，保留期 ${j.maxAgeH} 小時），共 ${j.diskMB} MB。` + (j.lastAuto != null && j.lastAuto < 720 ? `上次${j.lastBy === "auto" ? "自動" : "手動"}清理在 ${j.lastAuto} 分鐘前，可能已經清過了。` : "")]);
         refreshTrade();
       }
     },

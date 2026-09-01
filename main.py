@@ -743,8 +743,13 @@ def trade_handle(path, payload):
     if path == "/api/trade/cleanup":
         dry = str(payload.get("dry", "")) in ("1", "true", "True")
         st = cache_cleanup(dry_run=dry)
+        if not dry:
+            LAST_CLEAN["by"] = "manual"
         st["diskMB"] = cache_disk_mb()
         st["maxAgeH"] = CACHE_MAX_AGE_H
+        st["lastAuto"] = (int((time.time() - LAST_CLEAN["ts"]) / 60)
+                          if LAST_CLEAN["ts"] else None)
+        st["lastBy"] = LAST_CLEAN["by"]
         return 200, st
 
     if path == "/api/trade/auto":
@@ -871,6 +876,8 @@ def upstream_probe():
 
 PROTECTED = {"telegram.json", "monitor.json", "trader.json"}
 
+LAST_CLEAN = {"ts": None, "removed": 0, "freedMB": 0.0, "by": None}
+
 
 def cache_disk_mb():
     if not os.path.isdir(CACHE_DIR):
@@ -899,7 +906,8 @@ def cache_cleanup(max_age_h=None, max_mb=None, dry_run=False):
     max_age = (CACHE_MAX_AGE_H if max_age_h is None else max_age_h) * 3600
     limit_mb = CACHE_MAX_MB if max_mb is None else max_mb
     stat = {"scanned": 0, "removed": 0, "freedMB": 0.0, "keptMB": 0.0,
-            "protected": 0, "errors": 0}
+            "protected": 0, "errors": 0, "beforeMB": cache_disk_mb(),
+            "oldestH": None, "newestH": None}
     if not os.path.isdir(CACHE_DIR):
         return stat
 
@@ -961,6 +969,15 @@ def cache_cleanup(max_age_h=None, max_mb=None, dry_run=False):
 
     stat["keptMB"] = round(sum(x[2] for x in keep) / 1048576.0, 2)
     stat["freedMB"] = round(stat["freedMB"], 2)
+    if keep:
+        ages = [(now - x[0]) / 3600.0 for x in keep]
+        stat["oldestH"] = round(max(ages), 1)
+        stat["newestH"] = round(min(ages), 1)
+
+    if not dry_run:
+        LAST_CLEAN["ts"] = now
+        LAST_CLEAN["removed"] = stat["removed"]
+        LAST_CLEAN["freedMB"] = stat["freedMB"]
 
     # 記憶體快取也要同步清，否則刪了檔案卻還在記憶體裡佔空間
     if not dry_run and stat["removed"]:
@@ -976,10 +993,10 @@ def cleanup_worker(every_h=6):
     while True:
         try:
             st = cache_cleanup()
-            if st["removed"]:
-                sys.stderr.write(
-                    f"  ~ 快取清理：刪除 {st['removed']} 檔，釋出 {st['freedMB']} MB，"
-                    f"保留 {st['keptMB']} MB\n")
+            LAST_CLEAN["by"] = "auto"
+            sys.stderr.write(
+                f"  ~ 快取清理（自動）：刪除 {st['removed']} 檔，釋出 {st['freedMB']} MB，"
+                f"保留 {st['keptMB']} MB\n")
         except Exception as e:
             sys.stderr.write(f"  ! 快取清理失敗：{e}\n")
         time.sleep(every_h * 3600)
