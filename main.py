@@ -725,9 +725,18 @@ def trade_handle(path, payload):
         return 403, {"error": "admin_key_required"}
 
     if path == "/api/trade/config":
-        allowed = ("riskPct", "maxPositions", "leverage", "stopAtrMult",
-                   "tp1R", "tp1Portion", "trailCallback", "trailActivateR")
-        kw = {k: payload[k] for k in allowed if k in payload}
+        limits = {"riskPct": (0.1, 5.0), "maxPositions": (1, 20), "leverage": (1, 20),
+                  "stopAtrMult": (0.5, 5.0), "tp1R": (1.0, 10.0), "tp1Portion": (0.0, 1.0),
+                  "trailCallback": (0.1, 10.0), "trailActivateR": (0.5, 10.0)}
+        kw = {}
+        for k, (lo, hi) in limits.items():
+            if k in payload:
+                try:
+                    v = float(payload[k])
+                except (TypeError, ValueError):
+                    continue
+                v = max(lo, min(hi, v))
+                kw[k] = int(v) if k in ("maxPositions", "leverage") else v
         return 200, {"cfg": trader.configure(**kw)}
 
     if path == "/api/trade/auto":
@@ -1187,6 +1196,8 @@ def main():
     ap.add_argument("--risk-pct", type=float, default=float(os.environ.get("RISK_PCT", 0.5)),
                     help="單筆風險佔帳戶權益的百分比，預設 0.5")
     ap.add_argument("--leverage", type=int, default=int(os.environ.get("LEVERAGE", 3)))
+    ap.add_argument("--max-positions", type=int, default=int(os.environ.get("MAX_POSITIONS", 5)),
+                    help="同時最多持有幾個部位，預設 5（等同環境變數 MAX_POSITIONS）")
     ap.add_argument("--live", action="store_true",
                     help="打正式網。必須同時設環境變數 ALLOW_LIVE=1，否則忽略")
     ap.add_argument("--tg-token", default=os.environ.get("TG_TOKEN", ""), help="Telegram Bot Token")
@@ -1251,10 +1262,12 @@ def main():
         trader.CFG["live"] = want_live
         trader.CFG["riskPct"] = args.risk_pct
         trader.CFG["leverage"] = args.leverage
+        trader.CFG["maxPositions"] = max(1, min(20, args.max_positions))
         trader.load_state(os.path.join(CACHE_DIR, "trader.json"))
         net = "正式網（真實資金）" if want_live else "模擬網 Testnet"
         if trader.CFG["key"]:
-            sys.stderr.write(f"  交易　{net}　風險 {args.risk_pct}%/筆　槓桿 {args.leverage}x　（連線資訊背景載入中）\n")
+            sys.stderr.write(f"  交易　{net}　風險 {args.risk_pct}%/筆　槓桿 {args.leverage}x　"
+                             f"同時持倉上限 {trader.CFG['maxPositions']}　（連線資訊背景載入中）\n")
             if want_live:
                 sys.stderr.write("  ⚠ 正在對正式網下單，會動用真實資金\n")
 

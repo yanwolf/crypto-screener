@@ -42,6 +42,10 @@ CFG = {
     "dryRun": False,               # True 時只計算不送單，供離線驗證
 }
 
+# 會存檔的設定項。live / key / secret 一律不存。
+PERSIST_CFG = ("riskPct", "maxPositions", "leverage", "stopAtrMult",
+               "tp1R", "tp1Portion", "trailCallback", "trailActivateR")
+
 _filters = {}                      # symbol → 精度與限制
 _filters_ts = 0
 _lock = threading.Lock()
@@ -648,7 +652,10 @@ def save_state():
     try:
         with open(STATE_FILE, "w") as f:
             json.dump({"state": {k: STATE[k] for k in ("enabled", "positions", "trades")},
-                       "auto": AUTO}, f)
+                       "auto": AUTO,
+                       # 金鑰與網路別刻意不存：金鑰只該在環境變數，
+                       # 網路別只該由啟動參數決定，避免存檔把正式網狀態帶回來
+                       "cfg": {k: CFG[k] for k in PERSIST_CFG}}, f)
     except Exception:
         pass
 
@@ -666,6 +673,9 @@ def load_state(path):
         for k, v in (d.get("auto") or {}).items():
             if k in AUTO:
                 AUTO[k] = v
+        for k, v in (d.get("cfg") or {}).items():
+            if k in PERSIST_CFG and v is not None:
+                CFG[k] = v
     except Exception:
         pass
 
@@ -674,6 +684,7 @@ def configure(**kw):
     for k, v in kw.items():
         if k in CFG and v is not None:
             CFG[k] = v
+    save_state()            # 介面上的調整要留得住，不能只改記憶體
     return {k: (bool(v) if k in ("live", "dryRun") else v)
             for k, v in CFG.items() if k not in ("key", "secret")}
 
