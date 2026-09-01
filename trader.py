@@ -620,6 +620,68 @@ def sync_positions():
     return {"closed": closed, "open": list(live.keys())}
 
 
+
+
+_live_cache = {"ts": 0, "data": {}}
+
+
+def live_positions(max_age=10):
+    """向幣安取各部位的即時損益。
+
+    positionRisk 一次回傳所有部位的標記價與未實現損益，
+    不必逐檔查價。畫面會頻繁重整，所以短暫快取避免打太密。
+    """
+    now = time.time()
+    if now - _live_cache["ts"] < max_age:
+        return _live_cache["data"]
+    if not (CFG["key"] and CFG["secret"]) or CFG["dryRun"]:
+        return {}
+    st, d = _request("GET", "/fapi/v2/positionRisk", signed=True)
+    if st != 200 or not isinstance(d, list):
+        return _live_cache["data"]
+    out = {}
+    for p in d:
+        try:
+            amt = float(p.get("positionAmt") or 0)
+            if abs(amt) <= 0:
+                continue
+            out[p["symbol"]] = {
+                "mark": float(p.get("markPrice") or 0),
+                "pnl": float(p.get("unRealizedProfit") or 0),
+                "entry": float(p.get("entryPrice") or 0),
+                "qty": abs(amt),
+                "liq": float(p.get("liquidationPrice") or 0) or None,
+            }
+        except (TypeError, ValueError):
+            continue
+    _live_cache["ts"] = now
+    _live_cache["data"] = out
+    return out
+
+
+def enrich_positions():
+    """把即時損益併進本地部位紀錄，並換算成 R 倍數。"""
+    live = live_positions()
+    rows = []
+    for p in STATE["positions"].values():
+        r = dict(p)
+        L = live.get(p["symbol"])
+        if L:
+            r["mark"] = L["mark"]
+            r["pnl"] = round(L["pnl"], 4)
+            r["liq"] = L["liq"]
+            # R = 進場到停損的價格距離；乘上數量就是這筆的 1R 金額
+            unit = (p.get("exits") or {}).get("R")
+            risk_amt = (unit or 0) * (p.get("qty") or 0)
+            r["rMultiple"] = round(L["pnl"] / risk_amt, 2) if risk_amt else None
+            # 距停損還有多遠，用來判斷這筆還剩多少緩衝
+            if p.get("stop"):
+                span = abs(L["mark"] - p["stop"])
+                r["toStopPct"] = round(100 * span / L["mark"], 2) if L["mark"] else None
+        rows.append(r)
+    return rows
+
+
 # ── 績效統計 ────────────────────────────────────────────────
 
 def performance():
@@ -706,11 +768,14 @@ def configure(**kw):
 
 
 def status():
+    pos = enrich_positions()
     return {
         "enabled": STATE["enabled"],
         "net": "LIVE 正式網" if CFG["live"] else "TESTNET 模擬網",
         "hasCreds": bool(CFG["key"] and CFG["secret"]),
-        "positions": list(STATE["positions"].values()),
+        "positions": pos,
+        "openPnl": round(sum((r.get("pnl") or 0) for r in pos), 2),
+        "openR": round(sum((r.get("rMultiple") or 0) for r in pos), 2),
         "perf": performance(),
         "cfg": {k: v for k, v in CFG.items() if k not in ("key", "secret")},
         "lastRun": STATE["lastRun"],

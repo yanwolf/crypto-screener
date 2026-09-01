@@ -4046,7 +4046,11 @@ function CryptoScreener() {
     if (j && !j.error) setTrade(j);else if (j && j.error) setTradeMsg(["err", "模擬單模組未載入，確認 trader.py 有一起部署"]);
   }, [tradeCall]);
   useEffect(() => {
-    if (page === "trade") refreshTrade();
+    if (page !== "trade") return;
+    refreshTrade();
+    // 持倉損益要跟得上行情，這頁開著時每 15 秒更新一次
+    const t = setInterval(refreshTrade, 15000);
+    return () => clearInterval(t);
   }, [page, refreshTrade]);
   const [deepN, setDeepN] = useState(8);
   useEffect(() => {
@@ -6537,12 +6541,19 @@ function CryptoScreener() {
       color: C.muted
     }
   }, "還沒有已平倉的交易。從雷達點進個股詳情，用「送模擬單」建立第一筆。"), /*#__PURE__*/React.createElement("div", {
-    className: "mt-3",
+    className: "mt-3 flex items-baseline gap-2 flex-wrap"
+  }, /*#__PURE__*/React.createElement("span", {
     style: {
       fontFamily: FONT.display,
       fontSize: 13
     }
-  }, "目前持倉 ", trade.positions?.length || 0, " 筆"), (trade.positions || []).map(p => /*#__PURE__*/React.createElement("div", {
+  }, "目前持倉 ", trade.positions?.length || 0, " 筆"), trade.positions?.length > 0 && trade.openPnl != null && /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontFamily: FONT.data,
+      fontSize: 12,
+      color: trade.openPnl > 0 ? UP : trade.openPnl < 0 ? DOWN : C.muted
+    }
+  }, "未實現 ", trade.openPnl > 0 ? "+" : "", trade.openPnl, " U", trade.openR != null && `　${trade.openR > 0 ? "+" : ""}${trade.openR}R`)), (trade.positions || []).map(p => /*#__PURE__*/React.createElement("div", {
     key: p.symbol,
     className: "mt-2 rounded p-3",
     style: {
@@ -6587,13 +6598,46 @@ function CryptoScreener() {
       color: C.red,
       fontSize: 11.5
     }
-  }, "平倉")), /*#__PURE__*/React.createElement("div", {
+  }, "平倉")), p.mark != null && /*#__PURE__*/React.createElement("div", {
+    className: "mt-2 px-2.5 py-1.5 rounded flex items-center gap-3 flex-wrap",
+    style: {
+      background: C.panel,
+      border: `1px solid ${(p.pnl ?? 0) >= 0 ? C.line : C.red}`,
+      fontFamily: FONT.data,
+      fontSize: 12
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: C.muted
+    }
+  }, "現價"), /*#__PURE__*/React.createElement("span", null, fmtPrice(p.mark)), /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: (p.pnl ?? 0) > 0 ? UP : (p.pnl ?? 0) < 0 ? DOWN : C.bone,
+      fontSize: 13
+    }
+  }, (p.pnl ?? 0) > 0 ? "+" : "", (p.pnl ?? 0).toFixed(2), " U"), p.rMultiple != null && /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: p.rMultiple > 0 ? UP : p.rMultiple < 0 ? DOWN : C.bone
+    }
+  }, p.rMultiple > 0 ? "+" : "", p.rMultiple, "R"), p.toStopPct != null && /*#__PURE__*/React.createElement("span", {
+    style: {
+      marginLeft: "auto",
+      color: p.toStopPct < 2 ? C.red : p.toStopPct < 5 ? C.gold : C.muted,
+      fontSize: 11
+    }
+  }, "距停損 ", p.toStopPct, "%")), /*#__PURE__*/React.createElement("div", {
     className: "mt-2 grid grid-cols-3 gap-x-3",
     style: {
       fontFamily: FONT.data,
       fontSize: 11.5
     }
   }, /*#__PURE__*/React.createElement("div", {
+    className: "flex justify-between"
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: C.muted
+    }
+  }, "進場"), /*#__PURE__*/React.createElement("span", null, fmtPrice(p.entry))), /*#__PURE__*/React.createElement("div", {
     className: "flex justify-between"
   }, /*#__PURE__*/React.createElement("span", {
     style: {
@@ -6613,13 +6657,7 @@ function CryptoScreener() {
     style: {
       color: UP
     }
-  }, fmtPrice(p.exits?.tp1))), /*#__PURE__*/React.createElement("div", {
-    className: "flex justify-between"
-  }, /*#__PURE__*/React.createElement("span", {
-    style: {
-      color: C.muted
-    }
-  }, "風險"), /*#__PURE__*/React.createElement("span", null, p.sizing?.riskAmt?.toFixed(2), " U"))), p.warnings?.length > 0 && /*#__PURE__*/React.createElement("div", {
+  }, fmtPrice(p.exits?.tp1)))), p.warnings?.length > 0 && /*#__PURE__*/React.createElement("div", {
     className: "mt-1.5",
     style: {
       fontSize: 11,
