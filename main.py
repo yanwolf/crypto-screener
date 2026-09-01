@@ -1206,6 +1206,20 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             return self.send_json(404, b'{"error":"not_found"}')
         title = str(payload.get("title", "訊號提醒"))
         text = str(payload.get("text", ""))
+
+        # 網頁送來的訊號也要跑一次下單判斷，並把結果附在訊息後面。
+        # 否則同一批訊號會因為來源不同，有的有「是否下單」有的沒有。
+        ev = payload.get("event")
+        if isinstance(ev, dict) and trader:
+            try:
+                outcome = auto_try_trade(ev, payload.get("row") or {})
+            except Exception as e:
+                outcome = {"stage": "failed", "why": f"執行時發生錯誤：{str(e)[:80]}"}
+            text += "\n" + trade_outcome_text(outcome)
+            if outcome.get("stage") == "opened":
+                t2, x2 = notify_trade_open(outcome["result"])
+                push_all(t2, x2)
+
         sent, failed = [], []
         for fn in (notify_telegram, notify_discord, notify_email):
             try:

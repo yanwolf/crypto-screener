@@ -1700,9 +1700,13 @@ async function sendNotify(ch, msg) {
         headers: {
           "Content-Type": "application/json"
         },
+        // 帶上訊號與掃描資料，伺服器才能跑同一套自動下單判斷，
+        // 否則網頁送出的通知會少掉「有沒有下單、為什麼」那一段。
         body: JSON.stringify({
           title: msg.title,
-          text: msg.text
+          text: msg.text,
+          event: msg.event || null,
+          row: msg.row || null
         })
       });
       const j = await r.json().catch(() => ({}));
@@ -3908,7 +3912,11 @@ function CryptoScreener() {
       const res = await sendNotify({
         ...alertCfg.ch,
         useServer: engineRef.current.local
-      }, alertText(e));
+      }, {
+        ...alertText(e),
+        event: e,
+        row: pool.find(r => r.id === e.id) || null
+      });
       setNotifyLog(l => [{
         ts: Date.now(),
         sym: e.sym,
