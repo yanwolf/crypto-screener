@@ -389,6 +389,38 @@ def fmt_money(v):
     return f"{v:.6g}"
 
 
+
+STAGE_LABEL = {
+    "disabled": "未下單",
+    "score": "未下單　分數不足",
+    "gate": "未下單　條件不符",
+    "stop": "未下單　停損無法計算",
+    "risk": "未下單　風險額度限制",
+    "failed": "下單失敗",
+    "opened": "已下單",
+}
+
+
+def trade_outcome_text(o):
+    """把下單判斷結果寫成一段文字，附在訊號通知後面。"""
+    if not o:
+        return "──────\n未下單　原因不明"
+    stage = o.get("stage")
+    head = STAGE_LABEL.get(stage, "未下單")
+    lines = ["──────", head]
+    if o.get("why"):
+        for w in str(o["why"]).split("；"):
+            lines.append(f"· {w}")
+    if stage == "opened":
+        r = o.get("result") or {}
+        lines.append(f"· {r.get('symbol')} {r.get('qty')} 單位，詳情見下一則")
+    if o.get("note") and stage != "opened":
+        lines.append(f"（另有提醒：{o['note']}）")
+    elif o.get("note"):
+        lines.append(f"注意　{o['note']}")
+    return "\n".join(lines)
+
+
 def notify_trade_open(r):
     """開倉通知。把這筆的風險講清楚，讓你在手機上就能判斷要不要手動介入。"""
     sz = r.get("sizing") or {}
@@ -515,19 +547,26 @@ def mon_run_once():
             MON["history"] = (events + MON["history"])[:400]
         mon_save()
 
+    # 先跑下單判斷，再把結果併進訊號通知，
+    # 這樣一則訊息就能回答「有沒有下單、為什麼」。
+    by_id = {r["id"]: r for r in rows}
     for e in events:
         title, text = engine.alert_text(e)
+        try:
+            outcome = auto_try_trade(e, by_id.get(e.get("id")))
+        except Exception as ex:
+            outcome = {"stage": "failed", "why": f"執行時發生錯誤：{str(ex)[:80]}"}
+
+        text += "\n" + trade_outcome_text(outcome)
         push_all(title, text)
 
-    # ── 自動下單 ──
-    # 只處理本輪觸發的訊號，且必須通過與畫面相同的證據檢查。
-    if trader and trader.AUTO["on"] and events:
-        by_id = {r["id"]: r for r in rows}
-        for e in events:
-            try:
-                auto_try_trade(e, by_id.get(e.get("id")))
-            except Exception as ex:
-                sys.stderr.write(f"  ! 自動下單失敗 {e.get('sym')}: {ex}\n")
+        if outcome.get("stage") == "opened":
+            t2, x2 = notify_trade_open(outcome["result"])
+            push_all(t2, x2)
+            sys.stderr.write(f"  $ 自動開倉 {outcome['result']['symbol']}\n")
+        else:
+            sys.stderr.write(f"  ~ {e.get('sym')} 未下單（{outcome.get('stage')}）："
+                             f"{outcome.get('why')}\n")
     if events:
         sys.stderr.write(f"  ! 背景監控觸發 {len(events)} 則："
                          f"{'、'.join(x['sym'] + '/' + x['side'] for x in events)}\n")
@@ -536,33 +575,49 @@ def mon_run_once():
 
 
 def auto_try_trade(ev, row):
-    """把一則訊號轉成實際下單。任何一關不過就跳過，並記錄原因。"""
-    if not (trader and row):
-        return
+    """把一則訊號轉成實際下單。
+
+    回傳 dict：
+      stage  哪一關結束的（disabled/score/gate/stop/risk/failed/opened）
+      why    人看得懂的原因，會一起推播
+      note   補充（警告事項等）
+      result 成功時的下單結果
+    刻意每一關都回傳原因，否則你在手機上只會看到訊號、
+    不知道為什麼沒下單。
+    """
+    if not trader:
+        return {"stage": "disabled", "why": "下單模組未載入"}
+    if not trader.AUTO["on"]:
+        return {"stage": "disabled", "why": "自動下單未啟用"}
+    if not row:
+        return {"stage": "disabled", "why": "本輪沒有這檔的完整掃描資料"}
+
     bear = ev.get("side") == "bear"
     sym = (row.get("sym") or "").upper()
     if not sym:
-        return
+        return {"stage": "disabled", "why": "取不到幣別代號"}
 
-    # 分數門檻：自動下單比手動嚴格
     score = row.get("bearScore") if bear else row.get("score")
-    if score is None or score < trader.AUTO["minScore"]:
-        return
+    if score is None:
+        return {"stage": "score", "why": "沒有評分資料"}
+    if score < trader.AUTO["minScore"]:
+        return {"stage": "score",
+                "why": f"分數 {engine._fmt1(score)} 未達自動下單門檻 {trader.AUTO['minScore']}"}
 
-    # 衍生品資料：與畫面上看到的同一組
     dv = None
+    dv_err = None
     try:
         dv = fetch_deriv_server(sym, row.get("m24"))
-    except Exception:
-        dv = None
+        if dv is None:
+            dv_err = "幣安沒有這檔永續合約，或合約資料取不到"
+    except Exception as e:
+        dv_err = f"合約資料讀取失敗（{str(e)[:60]}）"
 
     detail = {"score": score, "stage": row.get("stage"), "rvol7": row.get("rvol7")}
     blocks, warns = engine.trade_gate(detail, dv, bear)
     if blocks:
-        sys.stderr.write(f"  ~ 自動下單跳過 {sym}：{'；'.join(blocks)}\n")
-        return
+        return {"stage": "gate", "why": "；".join(blocks), "note": "；".join(warns) or None}
 
-    # 停損：空頭用結構停損，多頭用三刀流綠線
     if bear:
         stop = (row.get("bear") or {}).get("stop")
     else:
@@ -570,22 +625,24 @@ def auto_try_trade(ev, row):
         stop = ma60 * 0.995 if ma60 else (row["price"] * 0.94 if row.get("price") else None)
     price = row.get("price")
     if stop is None or price is None or (stop > price) != bear:
-        sys.stderr.write(f"  ~ 自動下單跳過 {sym}：算不出合理停損\n")
-        return
+        return {"stage": "stop", "why": "算不出合理的停損價，不送無停損的單"}
 
-    note = f"{'空頭' if bear else '多頭'}雷達 {round(score, 1)} 分"
+    # 幣安沒有合約就不可能下單，這裡才擋，讓前面的原因先被看到
+    if dv is None and dv_err:
+        ok_sym, _, msg, _ = trader.check_tradable(sym)
+        if not ok_sym:
+            return {"stage": "gate", "why": msg}
+
+    note = f"{'空頭' if bear else '多頭'}雷達 {engine._fmt1(score)} 分"
     if warns:
         note += "（" + "；".join(warns) + "）"
 
     r = trader.auto_open(sym, "SHORT" if bear else "LONG", price, float(stop), note=note)
     if r.get("ok"):
-        t, x = notify_trade_open(r)
-        push_all(t, x)
-        sys.stderr.write(f"  $ 自動開倉 {r['symbol']} {r['side']} 數量 {r['qty']}\n")
-    elif r.get("skipped"):
-        sys.stderr.write(f"  ~ 自動下單跳過 {sym}：{r.get('error')}\n")
-    else:
-        sys.stderr.write(f"  ! 自動下單失敗 {sym}：{r.get('error')}\n")
+        return {"stage": "opened", "why": None, "result": r, "note": "；".join(warns) or None}
+    if r.get("skipped"):
+        return {"stage": "risk", "why": r.get("error")}
+    return {"stage": "failed", "why": r.get("error")}
 
 
 def fetch_deriv_server(base, chg24):
