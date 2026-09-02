@@ -538,6 +538,22 @@ def mon_run_once():
 
     now_ms = time.time() * 1000
     events, states = engine.evaluate(rows, MON["cfg"], MON["states"], now_ms)
+
+    # 每項條件的通過率：看不到空頭訊號時，能知道是哪一條卡住
+    tally = {"bull": {}, "bear": {}, "n": 0}
+    for r in rows:
+        if not r.get("scanned"):
+            continue
+        tally["n"] += 1
+        for side, fn in (("bull", engine.bull_gate), ("bear", engine.bear_gate)):
+            try:
+                _, checks, _ = fn(r, MON["cfg"][side])
+            except Exception:
+                continue
+            for name, ok, _ in checks:
+                d = tally[side].setdefault(name, {"pass": 0, "fail": 0})
+                d["pass" if ok else "fail"] += 1
+    MON["gateStats"] = tally
     with _mon_lock:
         MON["states"] = states
         MON["lastRun"] = now_ms
@@ -854,6 +870,7 @@ def mon_handle(path, payload):
                      "lastError": MON["lastError"], "engine": bool(engine),
                      "historyCount": len(MON["history"]),
                      "lastRefreshed": MON.get("lastRefreshed", 0),
+                     "gateStats": MON.get("gateStats"),
                      "callsToday": MON.get("callsToday", 0),
                      "histTTL": MON.get("histTTL", 12), "maxRefresh": MON.get("maxRefresh", 8),
                      "scope": MON["scope"], "topN": MON["topN"],

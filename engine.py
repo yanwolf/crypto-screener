@@ -779,10 +779,12 @@ def trade_gate(detail, dv, bear):
         elif score < 58:
             warns.append(f"雷達分數 {_fmt1(score)} 偏低，訊號不算強")
 
-    if not bear and stage in ("沉寂整理", "退潮低迷"):
-        blocks.append(f"目前階段是「{stage}」，量能與價格都沒有啟動")
-    if bear and stage in ("加速上漲", "剛啟動"):
-        blocks.append(f"目前階段是「{stage}」，逆勢做空風險高")
+    # stage 是代碼（quiet/accel…）。先前誤用中文比對，這一關從來沒生效過。
+    label = STAGE_LABEL.get(stage, stage)
+    if not bear and stage in ("quiet", "fade"):
+        blocks.append(f"目前階段是「{label}」，量能與價格都沒有啟動")
+    if bear and stage in ("accel", "ignite"):
+        blocks.append(f"目前階段是「{label}」，逆勢做空風險高")
 
     if not bear and rvol is not None and rvol < 1.3:
         warns.append(f"量能只有平常的 {rvol:.2f} 倍，沒有放量")

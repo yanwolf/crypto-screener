@@ -3434,11 +3434,13 @@ function CryptoScreener() {
     }
 
     // 沉寂整理或退潮低迷時進場，等於在沒有動能的地方押注
-    if (!bear && ["沉寂整理", "退潮低迷"].includes(detail.stage)) {
-      blocks.push(`目前階段是「${detail.stage}」，量能與價格都沒有啟動`);
+    // stage 是代碼（quiet/accel…），顯示時再轉中文；比對必須用代碼
+    const stageLabel = (STAGES[detail.stage] || {}).label || detail.stage;
+    if (!bear && ["quiet", "fade"].includes(detail.stage)) {
+      blocks.push(`目前階段是「${stageLabel}」，量能與價格都沒有啟動`);
     }
-    if (bear && ["加速上漲", "剛啟動"].includes(detail.stage)) {
-      blocks.push(`目前階段是「${detail.stage}」，逆勢做空風險高`);
+    if (bear && ["accel", "ignite"].includes(detail.stage)) {
+      blocks.push(`目前階段是「${stageLabel}」，逆勢做空風險高`);
     }
 
     // 量能沒有放大，多方進場缺少基本條件
@@ -7212,7 +7214,50 @@ function CryptoScreener() {
         color: C.muted
       }
     }, "歷史資料在 ", mon.histTTL ?? 12, " 小時內不重抓，每輪最多補抓 ", mon.maxRefresh ?? 8, " 檔； 上一輪實際補抓 ", mon.lastRefreshed ?? 0, " 檔。"));
-  })(), mon.lastError && /*#__PURE__*/React.createElement("div", {
+  })(), mon.gateStats && mon.gateStats.n > 0 && /*#__PURE__*/React.createElement("div", {
+    className: "mt-2 px-2.5 py-2 rounded",
+    style: {
+      background: C.panel2,
+      border: `1px solid ${C.line}`,
+      fontSize: 11.5
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      color: C.bone,
+      marginBottom: 4
+    }
+  }, "上輪 ", mon.gateStats.n, " 檔的各條件通過率", /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: C.muted,
+      fontSize: 10.5
+    }
+  }, "\u3000通過率最低的那條，就是訊號少的主因")), [["bull", "多頭", UP], ["bear", "空頭", DOWN]].map(([k, lab, col]) => {
+    const st = mon.gateStats[k] || {};
+    const rows = Object.entries(st).map(([name, v]) => [name, v.pass, v.pass + v.fail]).sort((a, b) => a[1] / a[2] - b[1] / b[2]);
+    return /*#__PURE__*/React.createElement("div", {
+      key: k,
+      className: "mt-1.5"
+    }, /*#__PURE__*/React.createElement("span", {
+      style: {
+        color: col
+      }
+    }, lab), rows.map(([name, p, t]) => /*#__PURE__*/React.createElement("div", {
+      key: name,
+      className: "flex justify-between",
+      style: {
+        fontFamily: FONT.data,
+        fontSize: 11
+      }
+    }, /*#__PURE__*/React.createElement("span", {
+      style: {
+        color: C.muted
+      }
+    }, name), /*#__PURE__*/React.createElement("span", {
+      style: {
+        color: p / t < 0.1 ? C.red : p / t < 0.3 ? C.gold : C.bone
+      }
+    }, p, "/", t, "\u3000", Math.round(100 * p / t), "%"))));
+  })), mon.lastError && /*#__PURE__*/React.createElement("div", {
     style: {
       fontSize: 11.5,
       color: C.red,
