@@ -8399,7 +8399,7 @@ function CryptoScreener() {
           side: bear ? "SHORT" : "LONG",
           entry: detail.price,
           stop,
-          note: `${bear ? "空頭" : "多頭"}雷達 ${detail.score ?? "—"} 分`
+          note: `${bear ? "空頭" : "多頭"}雷達 ${detail.score == null ? "—" : r1(detail.score)} 分（手動）`
         });
         if (j?.ok) {
           setTradeMsg(["ok", `${j.symbol} 已送出：${j.qty} 單位，風險 ${j.sizing?.riskAmt?.toFixed(2)} U`]);
