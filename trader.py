@@ -597,8 +597,8 @@ def record_close(pos, exit_px, reason):
         "id": f"{pos['symbol']}-{int(time.time() * 1000)}",
         "excluded": False,
         "symbol": pos["symbol"], "side": pos["side"], "qty": pos["qty"],
-        "entry": pos["entry"], "exit": exit_px, "pnl": pnl,
-        "rMultiple": (pnl / r) if r else None,
+        "entry": pos["entry"], "exit": exit_px, "pnl": round(pnl, 4),
+        "rMultiple": round(pnl / r, 2) if r else None,
         "opened": pos["opened"], "closed": int(time.time() * 1000),
         "reason": reason, "note": pos.get("note", ""),
     })
@@ -949,6 +949,10 @@ def load_state(path):
             if not t.get("id"):
                 t["id"] = f"{t.get('symbol', 'X')}-{t.get('closed') or i}"
             t.setdefault("excluded", False)
+            if t.get("rMultiple") is not None:
+                t["rMultiple"] = round(float(t["rMultiple"]), 2)
+            if t.get("pnl") is not None:
+                t["pnl"] = round(float(t["pnl"]), 4)
         for k, v in (d.get("auto") or {}).items():
             if k in AUTO:
                 AUTO[k] = v

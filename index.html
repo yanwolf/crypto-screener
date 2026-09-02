@@ -6612,7 +6612,7 @@ function CryptoScreener() {
       style: {
         color: win ? UP : DOWN
       }
-    }, t.rMultiple > 0 ? "+" : "", t.rMultiple, "R"), held != null && /*#__PURE__*/React.createElement("span", {
+    }, t.rMultiple > 0 ? "+" : "", Number(t.rMultiple).toFixed(2), "R"), held != null && /*#__PURE__*/React.createElement("span", {
       style: {
         color: C.muted,
         fontSize: 10.5
@@ -6735,7 +6735,7 @@ function CryptoScreener() {
     style: {
       color: p.rMultiple > 0 ? UP : p.rMultiple < 0 ? DOWN : C.bone
     }
-  }, p.rMultiple > 0 ? "+" : "", p.rMultiple, "R"), p.toStopPct != null && /*#__PURE__*/React.createElement("span", {
+  }, p.rMultiple > 0 ? "+" : "", Number(p.rMultiple).toFixed(2), "R"), p.toStopPct != null && /*#__PURE__*/React.createElement("span", {
     style: {
       marginLeft: "auto",
       color: p.toStopPct < 2 ? C.red : p.toStopPct < 5 ? C.gold : C.muted,
