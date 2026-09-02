@@ -39,6 +39,7 @@ CFG = {
     "trailCallback": 1.2,          # （舊）固定回撤 %，僅在 trailR 為 0 時使用
     "trailR": 0.5,                 # 移動停利回撤，以 R 為單位；不同波動的幣才會一致
     "breakevenR": 1.0,             # 到幾 R 把停損移到成本；0 = 關閉
+    "guardClose": False,           # 停損補不回來時是否強制平倉。預設只警告
     "trailActivateR": 2.0,         # 到 2R 才啟動移動停利
     "minNotional": 5.0,
     "dryRun": False,               # True 時只計算不送單，供離線驗證
@@ -47,7 +48,7 @@ CFG = {
 # 會存檔的設定項。live / key / secret 一律不存。
 PERSIST_CFG = ("riskPct", "maxPositions", "leverage", "stopAtrMult",
                "tp1R", "tp1Portion", "trailCallback", "trailActivateR",
-               "trailR", "breakevenR")
+               "trailR", "breakevenR", "guardClose")
 
 _filters = {}                      # symbol → 精度與限制
 _filters_ts = 0
@@ -593,6 +594,8 @@ def record_close(pos, exit_px, reason):
     pnl = (exit_px - pos["entry"]) * sgn * pos["qty"]
     r = pos["exits"]["R"] * pos["qty"]
     STATE["trades"].append({
+        "id": f"{pos['symbol']}-{int(time.time() * 1000)}",
+        "excluded": False,
         "symbol": pos["symbol"], "side": pos["side"], "qty": pos["qty"],
         "entry": pos["entry"], "exit": exit_px, "pnl": pnl,
         "rMultiple": (pnl / r) if r else None,
@@ -701,41 +704,58 @@ def enrich_positions():
 
 
 def open_algo_orders(symbol):
-    """查這個交易對還掛著哪些條件單。用來確認停損是否還在。"""
-    for path in ("/fapi/v1/openAlgoOrders", "/fapi/v1/algoOpenOrders"):
-        st, d = _request("GET", path, {"symbol": symbol}, signed=True)
-        if st == 200 and isinstance(d, list):
-            return d
-        if st == 200 and isinstance(d, dict) and isinstance(d.get("orders"), list):
-            return d["orders"]
-    # 新端點都不通時退回舊的一般掛單
-    st, d = _request("GET", "/fapi/v1/openOrders", {"symbol": symbol}, signed=True)
-    return d if st == 200 and isinstance(d, list) else []
+    """查這個交易對還掛著哪些條件單。
+
+    回傳 (orders, ok)。ok=False 代表查詢本身失敗，
+    呼叫端絕對不能把「查不到」當成「不存在」——這正是先前誤平倉的根源。
+    """
+    st, d = _request("GET", "/fapi/v1/openAlgoOrders", {"symbol": symbol}, signed=True)
+    if st == 200 and isinstance(d, list):
+        return d, True
+    if st == 200 and isinstance(d, dict) and isinstance(d.get("orders"), list):
+        return d["orders"], True
+    return [], False
+
+
+def _order_type(o):
+    """Algo 端點的型別欄位叫 orderType，舊端點叫 type。兩個都看。"""
+    return str(o.get("orderType") or o.get("type") or o.get("origType") or "").upper()
+
+
+def has_stop_order(orders):
+    return any(_order_type(o) in ("STOP_MARKET", "STOP", "TRAILING_STOP_MARKET")
+               for o in orders)
+
+
+_missing_streak = {}          # symbol → 連續幾次確認停損不在
 
 
 def guard_positions():
     """確認每個部位的停損還掛著。
 
-    這是自動下單最重要的安全網：如果停損單因為任何原因消失
-    （被手動取消、交易所異常、部分成交後失效），部位就變成裸倉，
-    整套風險控制會失效。發現就補掛，補不回來就平倉。
+    設計原則（來自一次誤平倉的教訓）：
+    1. 查詢失敗 ≠ 停損不在。查不到就跳過，下一輪再查。
+    2. 必須連續 3 輪都確認不在，才動作。一次的讀取錯誤不該觸發任何事。
+    3. 補掛被拒且原因是「已存在」→ 代表停損其實在，判斷錯了，不動作。
+    4. 預設只補掛、不平倉。強制平倉需要明確開啟 CFG["guardClose"]。
     """
     if CFG["dryRun"] or not (CFG["key"] and CFG["secret"]):
         return []
     events = []
     for sym, pos in list(STATE["positions"].items()):
-        try:
-            orders = open_algo_orders(sym)
-        except Exception:
+        orders, ok = open_algo_orders(sym)
+        if not ok:
+            continue                              # 原則 1
+        if has_stop_order(orders):
+            _missing_streak[sym] = 0
             continue
-        has_stop = any(str(o.get("type", "")).upper() in
-                       ("STOP_MARKET", "STOP", "TRAILING_STOP_MARKET")
-                       for o in orders)
-        if has_stop:
+
+        n = _missing_streak.get(sym, 0) + 1
+        _missing_streak[sym] = n
+        if n < 3:                                 # 原則 2
             continue
 
         close_side = "SELL" if pos["side"] == "LONG" else "BUY"
-        tick = 0.0
         f = _filters.get(sym) or {}
         tick = f.get("tick") or 0.0
         stop_px = round_step(pos["stop"], tick) if tick else pos["stop"]
@@ -744,28 +764,36 @@ def guard_positions():
             "symbol": sym, "side": close_side, "type": "STOP_MARKET",
             "stopPrice": stop_px, "closePosition": "true", "workingType": "MARK_PRICE",
         })
+        msg = str((r or {}).get("msg") or r)
         if st == 200:
+            _missing_streak[sym] = 0
             events.append({"symbol": sym, "action": "restored", "stop": stop_px})
-        else:
-            # 補不回來就不留倉：沒有停損的部位違反這套系統的前提
+            continue
+        if "existing" in msg.lower() or "already" in msg.lower():
+            _missing_streak[sym] = 0              # 原則 3
+            events.append({"symbol": sym, "action": "false_alarm", "why": msg[:120]})
+            continue
+
+        # 到這裡：連續三輪確認不在、補掛失敗、且失敗原因不是「已存在」
+        if CFG.get("guardClose"):                 # 原則 4
             _request("POST", "/fapi/v1/order", {
                 "symbol": sym, "side": close_side, "type": "MARKET",
                 "quantity": pos["qty"], "reduceOnly": "true",
             }, signed=True)
             px = mark_price(sym) or pos["entry"]
             record_close(pos, px, "停損單遺失且無法補掛，強制平倉")
-            events.append({"symbol": sym, "action": "closed",
-                           "why": str(r.get("msg") or r)[:120]})
+            events.append({"symbol": sym, "action": "closed", "why": msg[:120]})
+        else:
+            events.append({"symbol": sym, "action": "alert", "why": msg[:120],
+                           "stop": stop_px})
     return events
-
-
 
 
 def cancel_stop_orders(symbol, pos):
     """只取消停損單，保留停利與移動停利。"""
     ok = False
     for o in pos.get("orders") or []:
-        if o.get("type") != "STOP_MARKET" or not o.get("id"):
+        if _order_type(o) != "STOP_MARKET" or not o.get("id"):
             continue
         if o.get("via") == "algo":
             st, _ = _request("DELETE", "/fapi/v1/algoOrder",
@@ -842,10 +870,14 @@ def manage_positions():
 
 def performance():
     """以 R 倍數為核心。大賺小賠的關鍵不是勝率，是平均獲利 R 要明顯大於
-    平均虧損 R，所以這裡把兩者分開列出。"""
-    t = STATE["trades"]
+    平均虧損 R，所以這裡把兩者分開列出。
+
+    被標記排除的交易不列入統計——例如系統故障造成的非策略出場，
+    算進去會汙染對策略本身的評估。"""
+    t = [x for x in STATE["trades"] if not x.get("excluded")]
+    excluded_n = len(STATE["trades"]) - len(t)
     if not t:
-        return {"count": 0}
+        return {"count": 0, "excluded": excluded_n}
     wins = [x for x in t if (x["pnl"] or 0) > 0]
     losses = [x for x in t if (x["pnl"] or 0) <= 0]
     rs = [x["rMultiple"] for x in t if x.get("rMultiple") is not None]
@@ -862,7 +894,7 @@ def performance():
     avg_l = sum(loss_r) / len(loss_r) if loss_r else 0.0
     wr = len(wins) / len(t)
     return {
-        "count": len(t),
+        "count": len(t), "excluded": excluded_n,
         "wins": len(wins), "losses": len(losses),
         "winRate": round(wr * 100, 1),
         "pnl": round(sum(x["pnl"] or 0 for x in t), 2),
@@ -879,6 +911,15 @@ def performance():
 
 
 # ── 狀態持久化 ──────────────────────────────────────────────
+
+def set_excluded(trade_id, excluded):
+    for t in STATE["trades"]:
+        if t.get("id") == trade_id:
+            t["excluded"] = bool(excluded)
+            save_state()
+            return True
+    return False
+
 
 def save_state():
     if not STATE_FILE:
@@ -904,6 +945,10 @@ def load_state(path):
         STATE["enabled"] = st.get("enabled", False)
         STATE["positions"] = st.get("positions", {})
         STATE["trades"] = st.get("trades", [])
+        for i, t in enumerate(STATE["trades"]):
+            if not t.get("id"):
+                t["id"] = f"{t.get('symbol', 'X')}-{t.get('closed') or i}"
+            t.setdefault("excluded", False)
         for k, v in (d.get("auto") or {}).items():
             if k in AUTO:
                 AUTO[k] = v
@@ -933,6 +978,7 @@ def status():
         "openPnl": round(sum((r.get("pnl") or 0) for r in pos), 2),
         "openR": round(sum((r.get("rMultiple") or 0) for r in pos), 2),
         "perf": performance(),
+        "trades": list(reversed(STATE["trades"][-100:])),
         "cfg": {k: v for k, v in CFG.items() if k not in ("key", "secret")},
         "lastRun": STATE["lastRun"],
         "symbols": len(_filters),

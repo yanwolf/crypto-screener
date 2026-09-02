@@ -708,17 +708,23 @@ def position_worker(every_s=20):
                     else:
                         sys.stderr.write(f"  ! {ev['symbol']} 移損失敗：{ev.get('why')}\n")
 
-                # 確認停損還在，裸倉是這套系統最不該出現的狀態
+                # 確認停損還在。預設只警告不平倉——
+                # 一次誤判造成的平倉，比暫時裸倉幾十秒的損失更大。
                 for ev in trader.guard_positions():
-                    if ev["action"] == "restored":
+                    a = ev["action"]
+                    if a == "restored":
                         push_all("停損已補掛",
-                                 f"{ev['symbol']} 的停損單消失了，已重新掛回 {ev['stop']:g}。")
-                        sys.stderr.write(f"  ! {ev['symbol']} 停損單遺失，已補掛\n")
-                    else:
+                                 f"{ev['symbol']} 連續三輪確認停損不在，已重新掛回 {ev['stop']:g}。")
+                    elif a == "false_alarm":
+                        sys.stderr.write(f"  ~ {ev['symbol']} 停損檢查誤報（交易所回報已存在），不動作\n")
+                    elif a == "alert":
+                        push_all("⚠ 需要你處理",
+                                 f"{ev['symbol']} 連續三輪查不到停損單，補掛也失敗。\n"
+                                 f"原因：{ev.get('why')}\n"
+                                 f"請到幣安確認。若要讓系統自動平倉，在設定開啟 guardClose。")
+                    elif a == "closed":
                         push_all("強制平倉",
-                                 f"{ev['symbol']} 的停損單消失且無法補掛，已平倉。\n"
-                                 f"原因：{ev.get('why')}")
-                        sys.stderr.write(f"  ! {ev['symbol']} 停損補掛失敗，已平倉\n")
+                                 f"{ev['symbol']} 停損單遺失且無法補掛，依設定已平倉。\n原因：{ev.get('why')}")
             else:
                 idle += 1
         except Exception as e:
@@ -774,7 +780,7 @@ def trade_handle(path, payload):
         limits = {"riskPct": (0.1, 5.0), "maxPositions": (1, 20), "leverage": (1, 20),
                   "stopAtrMult": (0.5, 5.0), "tp1R": (1.0, 10.0), "tp1Portion": (0.0, 1.0),
                   "trailCallback": (0.1, 10.0), "trailActivateR": (0.5, 10.0),
-                  "trailR": (0.0, 3.0), "breakevenR": (0.0, 5.0)}
+                  "trailR": (0.0, 3.0), "breakevenR": (0.0, 5.0), "guardClose": (0, 1)}
         kw = {}
         for k, (lo, hi) in limits.items():
             if k in payload:
@@ -783,8 +789,13 @@ def trade_handle(path, payload):
                 except (TypeError, ValueError):
                     continue
                 v = max(lo, min(hi, v))
-                kw[k] = int(v) if k in ("maxPositions", "leverage") else v
+                kw[k] = bool(v) if k == "guardClose" else int(v) if k in ("maxPositions", "leverage") else v
         return 200, {"cfg": trader.configure(**kw)}
+
+    if path == "/api/trade/exclude":
+        tid = str(payload.get("id", ""))
+        ok = trader.set_excluded(tid, payload.get("excluded", True))
+        return (200 if ok else 404), {"ok": ok, "perf": trader.performance()}
 
     if path == "/api/trade/cleanup":
         dry = str(payload.get("dry", "")) in ("1", "true", "True")
