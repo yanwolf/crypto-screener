@@ -3039,6 +3039,8 @@ function CryptoScreener() {
   const [loading, setLoading] = useState(false);
   const [loadSec, setLoadSec] = useState(0);
   const [staleAge, setStaleAge] = useState(null);
+  const [srvRefresh, setSrvRefresh] = useState(null); // 伺服器滾動補抓狀態
+
   const [error, setError] = useState(null);
   const [updated, setUpdated] = useState(null);
   const [source, setSource] = useState(null);
@@ -3210,7 +3212,26 @@ function CryptoScreener() {
     setWatch(w => w.includes(id) ? w.filter(x => x !== id) : [...w, id]);
   }, []);
   const local = proxyMode === "server";
-  const loadRef = useRef(null); // 供 loadMarkets 內部自我重試使用
+  const loadRef = useRef(null);
+  useEffect(() => {
+    if (!local) return; // 伺服器滾動補抓狀態，每分鐘讀一次
+    let dead = false;
+    const poll = async () => {
+      try {
+        const r = await fetch("/api/health", {
+          cache: "no-store"
+        });
+        const j = await r.json();
+        if (!dead && j.refresh) setSrvRefresh(j.refresh);
+      } catch (e) {/* 伺服器不在就不顯示 */}
+    };
+    poll();
+    const t = setInterval(poll, 60000);
+    return () => {
+      dead = true;
+      clearInterval(t);
+    };
+  }, [local]); // 供 loadMarkets 內部自我重試使用
   const detectRef = useRef(null); // 同上：detectProxy 定義在後面，透過 ref 取用
   const cfg = useMemo(() => ({
     key: apiKey.trim(),
@@ -4249,12 +4270,18 @@ function CryptoScreener() {
   }, [universe]);
   const coverage = useMemo(() => {
     const n = universe.length || 1;
-    const done = universe.filter(r => r.scanned && !r.stale).length;
+    // 拆成三種狀態：新鮮（保鮮期內）、過期（掃過但超過保鮮期）、從未掃描
+    const fresh = universe.filter(r => r.scanned && !r.stale).length;
+    const stale = universe.filter(r => r.scanned && r.stale).length;
+    const never = universe.filter(r => !r.scanned).length;
     const gap = cfg.local ? 0.25 : cfg.key ? 0.9 : 2.4; // 秒
     return {
-      done,
+      done: fresh,
+      fresh,
+      stale,
+      never,
       n,
-      pct: done / n * 100,
+      pct: fresh / n * 100,
       todo: queue.length,
       etaMin: queue.length * gap / 60
     };
@@ -5156,11 +5183,36 @@ function CryptoScreener() {
       color: C.muted,
       fontFamily: FONT.data
     }
-  }, "待掃 ", coverage.todo, " 檔，約需 ", coverage.etaMin < 1 ? "不到 1" : coverage.etaMin.toFixed(0), " 分鐘"), batch.running && /*#__PURE__*/React.createElement("span", {
+  }, "待掃 ", coverage.todo, " 檔（", coverage.stale > 0 && /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: C.gold
+    }
+  }, "過期 ", coverage.stale), coverage.stale > 0 && coverage.never > 0 && "、", coverage.never > 0 && /*#__PURE__*/React.createElement("span", {
     style: {
       color: C.teal
     }
-  }, "掃描中 ", batch.done, "/", batch.total), bgScan && !batch.running && /*#__PURE__*/React.createElement("span", {
+  }, "新增 ", coverage.never), "），約需 ", coverage.etaMin < 1 ? "不到 1" : coverage.etaMin.toFixed(0), " 分鐘"), batch.running && /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: C.teal
+    }
+  }, "掃描中 ", batch.done, "/", batch.total), srvRefresh && srvRefresh.n > 0 && /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: C.muted,
+      fontFamily: FONT.data
+    }
+  }, "伺服器滾動補抓\u3000新鮮 ", /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: C.teal
+    }
+  }, srvRefresh.fresh), srvRefresh.stale > 0 && /*#__PURE__*/React.createElement(React.Fragment, null, "\u3000過期 ", /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: C.gold
+    }
+  }, srvRefresh.stale)), srvRefresh.never > 0 && /*#__PURE__*/React.createElement(React.Fragment, null, "\u3000新增 ", /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: C.teal
+    }
+  }, srvRefresh.never)), "\u3000每 ", srvRefresh.interval, "s 補一檔\u3000今日 ", srvRefresh.callsToday, "/", srvRefresh.budget, srvRefresh.last && /*#__PURE__*/React.createElement(React.Fragment, null, "\u3000上次 ", srvRefresh.last)), bgScan && !batch.running && /*#__PURE__*/React.createElement("span", {
     style: {
       color: C.teal
     }

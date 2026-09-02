@@ -1220,6 +1220,9 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 "quotaExhausted": QUOTA["exhausted"], "keyless": keyless_now(),
                 "disk": (len(os.listdir(CACHE_DIR)) if os.path.isdir(CACHE_DIR) else 0),
                 "diskMB": cache_disk_mb(),
+                "refresh": {k: REFRESH[k] for k in
+                            ("last", "lastTs", "callsToday", "budget", "interval",
+                             "fresh", "stale", "never", "n")},
                 "gap": CFG["gap"], "uptime": int(time.time() - START_TS),
             }
             if "probe=1" in (self.path.split("?", 1)[1] if "?" in self.path else ""):
@@ -1360,38 +1363,111 @@ class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
     allow_reuse_address = True
 
 
+REFRESH = {"universe": [], "universeTs": 0, "last": None, "lastTs": None,
+           "callsToday": 0, "day": None, "interval": None,
+           "fresh": 0, "stale": 0, "never": 0, "n": 0, "budget": 0}
+
+
+def _deep_key(cid):
+    return "/api/v3" + f"/coins/{cid}/market_chart?vs_currency=usd&days=90"
+
+
+def refresh_status(count: int, ttl_h: float):
+    """統計目前宇宙裡各檔深度資料的狀態，供前端顯示與排程決策。"""
+    now = time.time()
+    fresh = stale = never = 0
+    oldest = None
+    for cid in REFRESH["universe"][:count]:
+        body, age = cache_peek(_deep_key(cid))
+        if body is None:
+            never += 1
+        elif age > ttl_h * 3600:
+            stale += 1
+            if oldest is None or age > oldest[0]:
+                oldest = (age, cid)
+        else:
+            fresh += 1
+            # 就算都新鮮，也記下最接近到期的，讓節奏保持平滑
+            if oldest is None or age > oldest[0]:
+                oldest = (age, cid)
+    REFRESH.update({"fresh": fresh, "stale": stale, "never": never,
+                    "n": len(REFRESH["universe"][:count])})
+    return fresh, stale, never, oldest
+
+
+def pick_next(count: int, ttl_h: float):
+    """挑下一檔該補的：從未抓過的優先，再來是最舊的。"""
+    fresh, stale, never, oldest = refresh_status(count, ttl_h)
+    for cid in REFRESH["universe"][:count]:
+        body, _ = cache_peek(_deep_key(cid))
+        if body is None:
+            return cid, "never"
+    if oldest:
+        age, cid = oldest
+        if age > ttl_h * 3600:
+            return cid, "stale"
+        # 全部新鮮：提前補最接近到期的，讓過期時間錯開而不是一起到期
+        if age > ttl_h * 3600 * 0.8:
+            return cid, "ahead"
+    return None, None
+
+
 def prefetch_worker(count: int, ttl_h: float):
-    """在背景把額度用滿，持續把深度資料抓進快取。
-    瀏覽器要用的時候直接命中快取，不必當場等 30 次/分的節流。"""
-    time.sleep(3)
+    """滾動式深度資料補抓。
+
+    以前是每小時整批跑：所有幣同一輪抓，就會同一時間過期，
+    到期時又一次爆掃。現在改成每次只補一檔，節奏由每日預算決定，
+    從未抓過的優先、其次最舊的、全部新鮮時提前補最接近到期的。
+    幾輪之後各檔的到期時間自然錯開，負載變成穩定的細流。
+    """
+    time.sleep(5)
+    budget = int(os.environ.get("REFRESH_BUDGET", 0)) or max(24, int(count * 24 / ttl_h * 1.3))
+    interval = 86400.0 / budget
+    REFRESH["budget"] = budget
+    REFRESH["interval"] = round(interval, 1)
+    sys.stderr.write(f"  ~ 滾動補抓：{count} 檔、保鮮 {ttl_h:g} 小時、"
+                     f"每日預算 {budget} 次 → 每 {interval:.0f} 秒補一檔\n")
+
     while True:
         try:
-            st, body = fetch_upstream(
-                "/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=250&page=1")
-            if st != 200:
-                time.sleep(120)
-                continue
-            ids = [c["id"] for c in json.loads(body)][:count]
-            done = skipped = 0
-            for cid in ids:
-                path = f"/coins/{cid}/market_chart?vs_currency=usd&days=90"
-                key = "/api/v3" + path
-                if cache_get(key, ttl_h * 3600) is not None:
-                    skipped += 1
-                    continue
-                if QUOTA["exhausted"]:
-                    sys.stderr.write("  ~ 額度已用盡，預抓暫停（監控仍以無金鑰模式續跑）\n")
-                    break
-                st, b = fetch_upstream(path)
+            # 跨日重置計數
+            d = time.strftime("%Y-%m-%d", time.gmtime())
+            if REFRESH["day"] != d:
+                REFRESH["day"] = d
+                REFRESH["callsToday"] = 0
+
+            # 宇宙每 15 分鐘更新一次，新幣進榜會自動被納入
+            if time.time() - REFRESH["universeTs"] > 900:
+                st, body = fetch_upstream(
+                    "/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=250&page=1")
                 if st == 200:
-                    cache_put(key, b)
-                    done += 1
-                elif st == 429:
-                    time.sleep(30)
-            sys.stderr.write(f"  ~ 背景預抓完成一輪：新增 {done} 檔、快取命中 {skipped} 檔\n")
+                    REFRESH["universe"] = [c["id"] for c in json.loads(body)]
+                    REFRESH["universeTs"] = time.time()
+
+            if QUOTA["exhausted"] or not REFRESH["universe"]:
+                time.sleep(300)
+                continue
+            if REFRESH["callsToday"] >= budget:
+                time.sleep(600)          # 今日預算用完，等跨日
+                continue
+
+            cid, why = pick_next(count, ttl_h)
+            if cid is None:
+                time.sleep(interval)
+                continue
+
+            st, b = fetch_upstream(f"/coins/{cid}/market_chart?vs_currency=usd&days=90")
+            REFRESH["callsToday"] += 1
+            if st == 200:
+                cache_put(_deep_key(cid), b)
+                REFRESH["last"] = f"{cid}（{ {'never': '新增', 'stale': '過期', 'ahead': '預補'}[why] }）"
+                REFRESH["lastTs"] = int(time.time() * 1000)
+            elif st == 429:
+                time.sleep(30)
+            time.sleep(interval)
         except Exception as e:
-            sys.stderr.write(f"  ~ 背景預抓中斷：{e}\n")
-        time.sleep(3600)      # 預抓每小時跑一輪就夠，快取命中不耗額度
+            sys.stderr.write(f"  ~ 滾動補抓中斷：{e}\n")
+            time.sleep(60)
 
 
 def lan_ip():
@@ -1453,8 +1529,10 @@ def main():
     ap.add_argument("--prefetch", type=int, default=int(os.environ.get("PREFETCH", 0)), metavar="N",
                     help="背景預抓市值前 N 檔的 90 日資料。Demo Key 每月僅 1 萬次，"
                          "建議 0 或 50 以內（等同環境變數 PREFETCH）")
-    ap.add_argument("--prefetch-ttl", type=float, default=float(os.environ.get("PREFETCH_TTL", 24)),
-                    metavar="H", help="預抓資料的保鮮時數，預設 12（等同環境變數 PREFETCH_TTL）")
+    ap.add_argument("--prefetch-ttl", type=float, default=float(os.environ.get("PREFETCH_TTL", 72)),
+                    metavar="H", help="深度資料的保鮮時數，預設 72。這些是 90 天歷史，變化慢；"
+                                      "設太短會把額度燒光（250 檔×12h ≈ 每月 19,500 次）。"
+                                      "等同環境變數 PREFETCH_TTL")
     ap.add_argument("--cache-dir", default=os.environ.get("CACHE_DIR", ""),
                     help="快取目錄，雲端掛載 Volume 時指定（等同環境變數 CACHE_DIR）")
     args = ap.parse_args()
