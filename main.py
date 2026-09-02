@@ -677,19 +677,63 @@ def fetch_deriv_server(base, chg24):
     })
 
 
+
+def position_worker(every_s=20):
+    """獨立的部位監看執行緒。
+
+    停損停利是掛在幣安上的，觸發不需要我們輪詢；
+    這裡只是盡快「發現」它成交了，好記錄績效與推播。
+    綁在 30 分鐘的行情監控上沒有意義——幣安的額度與 CoinGecko 無關，
+    每 20 秒一次也只用掉不到 1% 的權重。
+    """
+    idle = 0
+    while True:
+        try:
+            if trader and trader.STATE["positions"]:
+                idle = 0
+                before = len(trader.STATE["trades"])
+                trader.sync_positions()
+                for t in trader.STATE["trades"][before:]:
+                    ti, tx = notify_trade_close(t)
+                    push_all(ti, tx)
+
+                # 主動管理：到 1R 把停損移到成本
+                for ev in trader.manage_positions():
+                    if ev.get("ok"):
+                        push_all("停損移至成本",
+                                 f"{ev['symbol']} 已到 {trader.CFG['breakevenR']}R，"
+                                 f"停損從 {ev['old']:g} 移到 {ev['new']:g}（現價 {ev['mark']:g}）。\n"
+                                 f"這筆最差就是打平。")
+                        sys.stderr.write(f"  $ {ev['symbol']} 停損移至成本 {ev['new']:g}\n")
+                    else:
+                        sys.stderr.write(f"  ! {ev['symbol']} 移損失敗：{ev.get('why')}\n")
+
+                # 確認停損還在，裸倉是這套系統最不該出現的狀態
+                for ev in trader.guard_positions():
+                    if ev["action"] == "restored":
+                        push_all("停損已補掛",
+                                 f"{ev['symbol']} 的停損單消失了，已重新掛回 {ev['stop']:g}。")
+                        sys.stderr.write(f"  ! {ev['symbol']} 停損單遺失，已補掛\n")
+                    else:
+                        push_all("強制平倉",
+                                 f"{ev['symbol']} 的停損單消失且無法補掛，已平倉。\n"
+                                 f"原因：{ev.get('why')}")
+                        sys.stderr.write(f"  ! {ev['symbol']} 停損補掛失敗，已平倉\n")
+            else:
+                idle += 1
+        except Exception as e:
+            sys.stderr.write(f"  ! 部位監看失敗：{str(e)[:100]}\n")
+        # 沒有部位時放慢，不必空轉
+        time.sleep(every_s if (trader and trader.STATE["positions"]) else 60)
+
+
 def monitor_worker(interval_min):
     time.sleep(8)
     while True:
         try:
             if MON["on"]:
                 mon_run_once()          # 額度用盡會自動降級為無金鑰，仍可續跑
-            # 與交易所對帳：停損或停利成交後推播結果
-            if trader and trader.STATE["positions"]:
-                before = len(trader.STATE["trades"])
-                trader.sync_positions()
-                for t in trader.STATE["trades"][before:]:
-                    ti, tx = notify_trade_close(t)
-                    push_all(ti, tx)
+
                 MON["lastError"] = None
         except Exception as e:
             MON["lastError"] = str(e)
@@ -707,6 +751,7 @@ def trade_handle(path, payload):
         st = trader.status()
         st["adminRequired"] = bool(os.environ.get("ADMIN_KEY", "").strip())
         st["diskMB"] = cache_disk_mb()
+        st["poll"] = float(os.environ.get("POSITION_POLL", 20))
         return 200, st
 
     if path == "/api/trade/check":
@@ -728,7 +773,8 @@ def trade_handle(path, payload):
     if path == "/api/trade/config":
         limits = {"riskPct": (0.1, 5.0), "maxPositions": (1, 20), "leverage": (1, 20),
                   "stopAtrMult": (0.5, 5.0), "tp1R": (1.0, 10.0), "tp1Portion": (0.0, 1.0),
-                  "trailCallback": (0.1, 10.0), "trailActivateR": (0.5, 10.0)}
+                  "trailCallback": (0.1, 10.0), "trailActivateR": (0.5, 10.0),
+                  "trailR": (0.0, 3.0), "breakevenR": (0.0, 5.0)}
         kw = {}
         for k, (lo, hi) in limits.items():
             if k in payload:
@@ -1450,6 +1496,10 @@ def main():
 
     threading.Thread(target=selftest, daemon=True).start()
     threading.Thread(target=cleanup_worker, daemon=True).start()
+    if trader:
+        threading.Thread(target=position_worker,
+                         args=(float(os.environ.get("POSITION_POLL", 20)),),
+                         daemon=True).start()
 
     if engine is None:
         print("  監控　找不到 engine.py，背景訊號監控停用")

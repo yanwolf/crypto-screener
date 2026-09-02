@@ -6388,7 +6388,7 @@ function CryptoScreener() {
       color: C.gold,
       marginBottom: 6
     }
-  }, "以下兩項直接決定每筆的虧損金額"), [["maxPositions", "同時持倉上限", [1, 2, 3, 5, 8], "筆", trade.cfg?.maxPositions], ["riskPct", "單筆風險", [0.25, 0.5, 1, 1.5, 2], "%", trade.cfg?.riskPct]].map(([key, label, opts, unit, cur]) => /*#__PURE__*/React.createElement("div", {
+  }, "以下兩項直接決定每筆的虧損金額"), [["maxPositions", "同時持倉上限", [1, 2, 3, 5, 8], "筆", trade.cfg?.maxPositions], ["riskPct", "單筆風險", [0.25, 0.5, 1, 1.5, 2], "%", trade.cfg?.riskPct], ["breakevenR", "移損到成本（0 = 關閉）", [0, 0.8, 1, 1.5, 2], "R", trade.cfg?.breakevenR], ["trailR", "移動停利回撤", [0.3, 0.5, 0.8, 1], "R", trade.cfg?.trailR]].map(([key, label, opts, unit, cur]) => /*#__PURE__*/React.createElement("div", {
     key: key,
     className: "mt-2"
   }, /*#__PURE__*/React.createElement("div", {
@@ -6429,7 +6429,7 @@ function CryptoScreener() {
       color: C.muted,
       lineHeight: 1.7
     }
-  }, "第一天建議：每日最多 2 筆、分數門檻 70、同時持倉 2 筆， 確認通知與成交都正常後再放寬。 設定存在伺服器的 trader.json，優先於環境變數。 環境變數（MAX_POSITIONS、RISK_PCT、LEVERAGE）只在第一次啟動、 還沒有存檔時當預設值。 存檔位於 CACHE_DIR，沒掛 Volume 的話重新部署會清空並退回環境變數。"))), trade.auto.blocked && /*#__PURE__*/React.createElement("div", {
+  }, "第一天建議：每日最多 2 筆、分數門檻 70、同時持倉 2 筆， 確認通知與成交都正常後再放寬。 移損到成本會讓「衝到 1.5R 又跌回去」的單從虧 1R 變成打平， 代價是被小回檔掃出場的次數會變多；移動停利的回撤以 R 計，不同波動的幣才會一致。 設定存在伺服器的 trader.json，優先於環境變數。 環境變數（MAX_POSITIONS、RISK_PCT、LEVERAGE）只在第一次啟動、 還沒有存檔時當預設值。 存檔位於 CACHE_DIR，沒掛 Volume 的話重新部署會清空並退回環境變數。"))), trade.auto.blocked && /*#__PURE__*/React.createElement("div", {
     className: "mt-2 px-2.5 py-1.5 rounded",
     style: {
       background: "#241A1A",
@@ -6547,7 +6547,12 @@ function CryptoScreener() {
       fontFamily: FONT.display,
       fontSize: 13
     }
-  }, "目前持倉 ", trade.positions?.length || 0, " 筆"), trade.positions?.length > 0 && trade.openPnl != null && /*#__PURE__*/React.createElement("span", {
+  }, "目前持倉 ", trade.positions?.length || 0, " 筆"), trade.positions?.length > 0 && trade.poll && /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 10.5,
+      color: C.muted
+    }
+  }, "伺服器每 ", trade.poll, " 秒與交易所對帳"), trade.positions?.length > 0 && trade.openPnl != null && /*#__PURE__*/React.createElement("span", {
     style: {
       fontFamily: FONT.data,
       fontSize: 12,
@@ -6643,9 +6648,9 @@ function CryptoScreener() {
     style: {
       color: C.muted
     }
-  }, "停損"), /*#__PURE__*/React.createElement("span", {
+  }, "停損", p.beMoved ? "·成本" : ""), /*#__PURE__*/React.createElement("span", {
     style: {
-      color: DOWN
+      color: p.beMoved ? C.teal : DOWN
     }
   }, fmtPrice(p.stop))), /*#__PURE__*/React.createElement("div", {
     className: "flex justify-between"

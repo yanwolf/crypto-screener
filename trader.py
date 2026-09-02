@@ -36,7 +36,9 @@ CFG = {
     "stopAtrMult": 1.5,            # 停損 = 進場價 ∓ 1.5×ATR
     "tp1R": 2.0,                   # 第一目標：2R 出一半
     "tp1Portion": 0.5,
-    "trailCallback": 1.2,          # 移動停利回撤 %
+    "trailCallback": 1.2,          # （舊）固定回撤 %，僅在 trailR 為 0 時使用
+    "trailR": 0.5,                 # 移動停利回撤，以 R 為單位；不同波動的幣才會一致
+    "breakevenR": 1.0,             # 到幾 R 把停損移到成本；0 = 關閉
     "trailActivateR": 2.0,         # 到 2R 才啟動移動停利
     "minNotional": 5.0,
     "dryRun": False,               # True 時只計算不送單，供離線驗證
@@ -44,7 +46,8 @@ CFG = {
 
 # 會存檔的設定項。live / key / secret 一律不存。
 PERSIST_CFG = ("riskPct", "maxPositions", "leverage", "stopAtrMult",
-               "tp1R", "tp1Portion", "trailCallback", "trailActivateR")
+               "tp1R", "tp1Portion", "trailCallback", "trailActivateR",
+               "trailR", "breakevenR")
 
 _filters = {}                      # symbol → 精度與限制
 _filters_ts = 0
@@ -259,15 +262,26 @@ def size_position(equity, entry, stop, info, risk_pct=None, lev=None):
 
 
 def plan_exits(entry, stop, side):
-    """由停損距離推出各級目標。R = 1 倍停損距離。"""
+    """由停損距離推出各級目標。R = 1 倍停損距離。
+
+    移動停利的回撤用 R 定義再換算成百分比：
+    同樣 1.2%，對停損距離 17% 的幣只有 0.07R（雜訊就掃出場），
+    對 3% 的幣卻是 0.4R。固定百分比在不同波動的幣之間根本不一致。
+    """
     r = abs(entry - stop)
     sgn = 1 if side == "LONG" else -1
+    if CFG.get("trailR", 0) > 0 and entry > 0:
+        cb = CFG["trailR"] * r / entry * 100.0
+        cb = max(0.1, min(10.0, round(cb, 2)))     # 幣安限制 0.1–10%
+    else:
+        cb = CFG["trailCallback"]
     return {
         "R": r,
         "stop": stop,
         "tp1": entry + sgn * r * CFG["tp1R"],
         "trailActivate": entry + sgn * r * CFG["trailActivateR"],
-        "trailCallback": CFG["trailCallback"],
+        "trailCallback": cb,
+        "breakeven": (entry + sgn * r * CFG["breakevenR"]) if CFG.get("breakevenR", 0) > 0 else None,
     }
 
 
@@ -459,7 +473,7 @@ def open_position(symbol_base, side, entry_hint, stop, info=None, note=""):
     if trail_qty > 0:
         st4, r4, ep4 = place_conditional({
             "symbol": sym, "side": close_side, "type": "TRAILING_STOP_MARKET",
-            "quantity": trail_qty, "callbackRate": CFG["trailCallback"],
+            "quantity": trail_qty, "callbackRate": exits["trailCallback"],
             "activationPrice": round_step(exits["trailActivate"], tick),
             "reduceOnly": "true", "workingType": "MARK_PRICE",
         })
@@ -683,6 +697,148 @@ def enrich_positions():
 
 
 # ── 績效統計 ────────────────────────────────────────────────
+
+
+
+def open_algo_orders(symbol):
+    """查這個交易對還掛著哪些條件單。用來確認停損是否還在。"""
+    for path in ("/fapi/v1/openAlgoOrders", "/fapi/v1/algoOpenOrders"):
+        st, d = _request("GET", path, {"symbol": symbol}, signed=True)
+        if st == 200 and isinstance(d, list):
+            return d
+        if st == 200 and isinstance(d, dict) and isinstance(d.get("orders"), list):
+            return d["orders"]
+    # 新端點都不通時退回舊的一般掛單
+    st, d = _request("GET", "/fapi/v1/openOrders", {"symbol": symbol}, signed=True)
+    return d if st == 200 and isinstance(d, list) else []
+
+
+def guard_positions():
+    """確認每個部位的停損還掛著。
+
+    這是自動下單最重要的安全網：如果停損單因為任何原因消失
+    （被手動取消、交易所異常、部分成交後失效），部位就變成裸倉，
+    整套風險控制會失效。發現就補掛，補不回來就平倉。
+    """
+    if CFG["dryRun"] or not (CFG["key"] and CFG["secret"]):
+        return []
+    events = []
+    for sym, pos in list(STATE["positions"].items()):
+        try:
+            orders = open_algo_orders(sym)
+        except Exception:
+            continue
+        has_stop = any(str(o.get("type", "")).upper() in
+                       ("STOP_MARKET", "STOP", "TRAILING_STOP_MARKET")
+                       for o in orders)
+        if has_stop:
+            continue
+
+        close_side = "SELL" if pos["side"] == "LONG" else "BUY"
+        tick = 0.0
+        f = _filters.get(sym) or {}
+        tick = f.get("tick") or 0.0
+        stop_px = round_step(pos["stop"], tick) if tick else pos["stop"]
+
+        st, r, ep = place_conditional({
+            "symbol": sym, "side": close_side, "type": "STOP_MARKET",
+            "stopPrice": stop_px, "closePosition": "true", "workingType": "MARK_PRICE",
+        })
+        if st == 200:
+            events.append({"symbol": sym, "action": "restored", "stop": stop_px})
+        else:
+            # 補不回來就不留倉：沒有停損的部位違反這套系統的前提
+            _request("POST", "/fapi/v1/order", {
+                "symbol": sym, "side": close_side, "type": "MARKET",
+                "quantity": pos["qty"], "reduceOnly": "true",
+            }, signed=True)
+            px = mark_price(sym) or pos["entry"]
+            record_close(pos, px, "停損單遺失且無法補掛，強制平倉")
+            events.append({"symbol": sym, "action": "closed",
+                           "why": str(r.get("msg") or r)[:120]})
+    return events
+
+
+
+
+def cancel_stop_orders(symbol, pos):
+    """只取消停損單，保留停利與移動停利。"""
+    ok = False
+    for o in pos.get("orders") or []:
+        if o.get("type") != "STOP_MARKET" or not o.get("id"):
+            continue
+        if o.get("via") == "algo":
+            st, _ = _request("DELETE", "/fapi/v1/algoOrder",
+                             {"symbol": symbol, "algoId": o["id"]}, signed=True)
+        else:
+            st, _ = _request("DELETE", "/fapi/v1/order",
+                             {"symbol": symbol, "orderId": o["id"]}, signed=True)
+        ok = ok or st == 200
+    return ok
+
+
+def move_to_breakeven(pos, mark):
+    """到達設定的 R 倍數後，把停損移到成本價。
+
+    移動停利要到 2R 才啟動，1R 到 2R 之間的回落無法保護；
+    這一步補上那個缺口，讓「衝到 1.5R 又跌回去」的單子不再賠滿 1R。
+    順序：先掛新停損，成功後才取消舊的，避免中間出現裸倉。
+    """
+    if pos.get("beMoved"):
+        return None
+    be = (pos.get("exits") or {}).get("breakeven")
+    if be is None:
+        return None
+    sgn = 1 if pos["side"] == "LONG" else -1
+    if (mark - be) * sgn < 0:
+        return None                       # 還沒到
+
+    sym = pos["symbol"]
+    f = _filters.get(sym) or {}
+    tick = f.get("tick") or 0.0
+    # 成本價加一點點手續費緩衝，避免剛好打平還倒貼手續費
+    new_stop = pos["entry"] * (1 + sgn * 0.0015)
+    new_stop = round_step(new_stop, tick) if tick else new_stop
+    close_side = "SELL" if pos["side"] == "LONG" else "BUY"
+
+    st, r, ep = place_conditional({
+        "symbol": sym, "side": close_side, "type": "STOP_MARKET",
+        "stopPrice": new_stop, "closePosition": "true", "workingType": "MARK_PRICE",
+    })
+    if st != 200:
+        return {"symbol": sym, "ok": False, "why": str(r.get("msg") or r)[:100]}
+
+    cancel_stop_orders(sym, pos)
+    old = pos["stop"]
+    pos["stop"] = new_stop
+    pos["beMoved"] = True
+    pos["orders"] = [o for o in (pos.get("orders") or []) if o.get("type") != "STOP_MARKET"]
+    pos["orders"].append({"type": "STOP_MARKET", "id": r.get("algoId") or r.get("orderId"),
+                          "px": new_stop, "via": ep})
+    save_state()
+    return {"symbol": sym, "ok": True, "old": old, "new": new_stop, "mark": mark}
+
+
+def manage_positions():
+    """主動管理：目前只有移損到成本。由部位監看執行緒每輪呼叫。"""
+    if CFG["dryRun"] or not (CFG["key"] and CFG["secret"]):
+        return []
+    if CFG.get("breakevenR", 0) <= 0:
+        return []
+    live = live_positions(max_age=5)
+    out = []
+    for sym, pos in list(STATE["positions"].items()):
+        L = live.get(sym)
+        if not L:
+            continue
+        try:
+            ev = move_to_breakeven(pos, L["mark"])
+            if ev:
+                out.append(ev)
+        except Exception as e:
+            out.append({"symbol": sym, "ok": False, "why": str(e)[:100]})
+    return out
+
 
 def performance():
     """以 R 倍數為核心。大賺小賠的關鍵不是勝率，是平均獲利 R 要明顯大於
