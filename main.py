@@ -1211,6 +1211,20 @@ class Handler(http.server.SimpleHTTPRequestHandler):
     # ── 路由 ──────────────────────────────────────────────
     def do_GET(self):
         p = self.path.split("?")[0]
+        if p == "/api/deep/ts":
+            body = json.dumps(deep_ts_map()).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            try:
+                self.wfile.write(body)
+            except BrokenPipeError:
+                pass
+            return
+
         if p == "/api/health":
             info = {
                 "server": "crypto-screener", "proxy": True,
@@ -1322,7 +1336,9 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
         cached = cache_get(key, ttl)
         if cached is not None:
-            return self.send_json(200, cached, cached=True)
+            _, age = cache_peek(key)
+            return self.send_json(200, cached, cached=True,
+                                  data_ts=(time.time() - age) if age is not None else None)
 
         # 快取過期但還在寬限期內：先把舊資料送出去，背景再更新。
         # 節流閘與重試會讓同步等待長達十幾秒，這段等待對使用者沒有價值——
@@ -1330,19 +1346,31 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         stale, age = cache_peek(key)
         if stale is not None and age is not None and age < ttl + STALE_GRACE:
             revalidate_async(path_qs, prefix, key)
-            return self.send_json(200, stale, cached=True, stale=int(age))
+            return self.send_json(200, stale, cached=True, stale=int(age), data_ts=time.time() - age)
 
         status, body = fetch_upstream(path_qs, prefix)
         if status == 200:
             cache_put(key, body)
-        self.send_json(status, body)
+            # 網頁抓行情榜時順便更新宇宙清單，這樣即使沒開補抓，
+            # /api/deep/ts 也能回報伺服器已有哪些檔的資料
+            if prefix == "/api/v3" and "/coins/markets" in path_qs and "page=1" in path_qs:
+                try:
+                    ids = [c["id"] for c in json.loads(body)]
+                    if ids and time.time() - REFRESH["universeTs"] > 300:
+                        REFRESH["universe"] = ids
+                        REFRESH["universeTs"] = time.time()
+                except Exception:
+                    pass
+        self.send_json(status, body, data_ts=time.time() if status == 200 else None)
 
-    def send_json(self, code, body, cached=False, stale=None):
+    def send_json(self, code, body, cached=False, stale=None, data_ts=None):
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Access-Control-Allow-Origin", "*")
         if stale is not None:
             self.send_header("X-Stale-Age", str(stale))
+        if data_ts is not None:
+            self.send_header("X-Data-Ts", str(int(data_ts * 1000)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Cache", "HIT" if cached else "MISS")
         self.send_header("Content-Length", str(len(body)))
@@ -1410,6 +1438,28 @@ def pick_next(count: int, ttl_h: float):
         if age > ttl_h * 3600 * 0.8:
             return cid, "ahead"
     return None, None
+
+
+
+_deep_ts_memo = {"ts": 0, "data": {}}
+
+
+def deep_ts_map():
+    """回傳 {coin_id: 資料時間戳(ms)}，用檔案 mtime，不用解析內容。
+    網頁用它判斷「伺服器是否有比我更新的資料」，取代自己的 12 小時計時器。"""
+    now = time.time()
+    if now - _deep_ts_memo["ts"] < 30:
+        return _deep_ts_memo["data"]
+    out = {}
+    for cid in REFRESH["universe"][:400]:
+        p = _disk_path(_deep_key(cid))
+        try:
+            out[cid] = int(os.stat(p).st_mtime * 1000)
+        except OSError:
+            pass
+    _deep_ts_memo["ts"] = now
+    _deep_ts_memo["data"] = out
+    return out
 
 
 def prefetch_worker(count: int, ttl_h: float):

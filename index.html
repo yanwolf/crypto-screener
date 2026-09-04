@@ -3035,7 +3035,11 @@ function CryptoScreener() {
   const [demoScans, setDemoScans] = useState(null);
   const [saveState, setSaveState] = useState(store.ok ? "ok" : "nostore");
   const [scanTTL, setScanTTL] = useState(() => store.get("scanTTL", 12));
-  const [bgScan, setBgScan] = useState(false);
+  const [bgScan, setBgScan] = useState(() => store.get("bgScan", true));
+  useEffect(() => {
+    store.set("bgScan", bgScan);
+  }, [bgScan]);
+  const [serverTs, setServerTs] = useState({}); // 伺服器各檔深度資料的時間戳
   const [loading, setLoading] = useState(false);
   const [loadSec, setLoadSec] = useState(0);
   const [staleAge, setStaleAge] = useState(null);
@@ -3229,6 +3233,28 @@ function CryptoScreener() {
     };
     poll();
     const t = setInterval(poll, 60000);
+    return () => {
+      dead = true;
+      clearInterval(t);
+    };
+  }, [local]);
+  useEffect(() => {
+    if (!local) {
+      setServerTs({});
+      return;
+    }
+    let dead = false;
+    const poll = async () => {
+      try {
+        const r = await fetch("/api/deep/ts", {
+          cache: "no-store"
+        });
+        const j = await r.json();
+        if (!dead && j && typeof j === "object") setServerTs(j);
+      } catch (e) {/* 忽略 */}
+    };
+    poll();
+    const t = setInterval(poll, 120000);
     return () => {
       dead = true;
       clearInterval(t);
@@ -3769,12 +3795,20 @@ function CryptoScreener() {
   const activeScans = source === "demo" ? demoScans || {} : scans;
   const rows = useMemo(() => {
     const cut = Date.now() - scanTTL * 3600000;
+    const followServer = local && Object.keys(serverTs).length > 0;
     return preScored.map(r => {
       const o = analyze(r, activeScans[r.id]);
-      o.stale = o.scanTs != null && o.scanTs < cut;
+      if (followServer) {
+        // 伺服器模式：只有當伺服器的資料比我上次計算更新時，才需要重算。
+        // 網頁自己的 12 小時計時器在這裡沒有意義——資料沒變，重算也是同樣結果。
+        const sts = serverTs[r.id];
+        o.stale = o.scanTs != null && sts != null && sts > o.scanTs + 60000;
+      } else {
+        o.stale = o.scanTs != null && o.scanTs < cut;
+      }
       return o;
     });
-  }, [preScored, activeScans, scanTTL]);
+  }, [preScored, activeScans, scanTTL, local, serverTs]);
 
   /* ── Telegram 配對 ── */
   const tgCall = useCallback(async (path, body) => {
@@ -5147,7 +5181,12 @@ function CryptoScreener() {
     style: {
       fontSize: 12
     }
-  }, "資料保鮮", /*#__PURE__*/React.createElement("select", {
+  }, "資料保鮮", local && Object.keys(serverTs).length > 0 ? /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: C.teal
+    },
+    title: "伺服器補抓新資料時，網頁會自動重算該檔"
+  }, "跟隨伺服器") : /*#__PURE__*/React.createElement("select", {
     value: scanTTL,
     onChange: e => setScanTTL(+e.target.value),
     className: "px-2 py-1 rounded",
