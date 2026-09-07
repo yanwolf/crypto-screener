@@ -3407,6 +3407,13 @@ function CryptoScreener() {
         push(`伺服器在線（${Date.now() - t0}ms）　金鑰${j.hasKey ? `已設定（${j.keyLen} 字元${j.pro ? " · Pro" : ""}）` : "未設定"}　` + `記憶體快取 ${j.cached} 筆　磁碟快取 ${j.disk ?? "?"} 筆　已運行 ${Math.floor((j.uptime || 0) / 60)} 分`, true);
         if (j.egressIp) push(`伺服器出口 IP：${j.egressIp}　← 填入幣安 API 金鑰的 IP 白名單，金鑰外洩也無法從別處使用`, null);
 
+        /* 上線就緒度：模擬網階段就能看，不必真的切換 */
+        if (Array.isArray(j.liveChecklist)) {
+          const done = j.liveChecklist.filter(x => x.ok).length;
+          push(`${j.live ? "正式網運作中" : "模擬網"}　接入正式網的準備 ${done}/${j.liveChecklist.length}（流程見專案內 GO_LIVE.md）`, j.live ? true : null);
+          j.liveChecklist.forEach(x => push(`　${x.ok ? "✓" : "○"} ${x.item}`, x.ok ? true : null));
+        }
+
         /* 伺服器自己連往上游的結果：這一步能直接分辨是誰連不上 */
         (j.probe || []).forEach(p => {
           if (p.ok) push(`伺服器 → ${p.name}：通過（HTTP ${p.code}，${p.ms}ms）`, true);else {

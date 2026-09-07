@@ -778,6 +778,7 @@ def trade_handle(path, payload):
         st["adminRequired"] = bool(os.environ.get("ADMIN_KEY", "").strip())
         st["diskMB"] = cache_disk_mb()
         st["poll"] = float(os.environ.get("POSITION_POLL", 20))
+        st["readiness"] = live_readiness()
         return 200, st
 
     if path == "/api/trade/check":
@@ -937,6 +938,69 @@ def egress_ip():
         except Exception:
             continue
     return None
+
+
+
+def live_readiness():
+    """正式網準備清單：每一項自動檢查目前狀態。
+    放在系統裡而不是文件裡，因為文件會忘，頁面每次打開都看得到。"""
+    items = []
+    ak = os.environ.get("ADMIN_KEY", "").strip()
+    items.append({"key": "admin", "label": "ADMIN_KEY 長度 16 字元以上",
+                  "ok": len(ak) >= 16,
+                  "hint": "目前未設或太短。在 Zeabur 變數設一組隨機字串。" if len(ak) < 16 else None})
+    has_bn = bool(trader and trader.CFG["key"] and trader.CFG["secret"])
+    items.append({"key": "bnkey", "label": "幣安金鑰已設定（正式網要換成主網子帳戶的新金鑰）",
+                  "ok": has_bn, "hint": None if has_bn else "BN_KEY／BN_SECRET 未設"})
+    rp = trader.CFG["riskPct"] if trader else None
+    items.append({"key": "risk", "label": "單筆風險 ≤ 1%（首次上線建議 0.25）",
+                  "ok": rp is not None and rp <= 1.0,
+                  "hint": f"目前 {rp}%" if rp is not None and rp > 1.0 else None})
+    lv = trader.CFG["leverage"] if trader else None
+    items.append({"key": "lev", "label": "槓桿 ≤ 5x", "ok": lv is not None and lv <= 5,
+                  "hint": f"目前 {lv}x" if lv is not None and lv > 5 else None})
+    ip = _egress["ip"]
+    items.append({"key": "ip", "label": "已知伺服器出口 IP（填入幣安 IP 白名單）",
+                  "ok": bool(ip), "hint": f"出口 IP：{ip}" if ip else "按「執行連線診斷」取得"})
+    tg = bool(_tg.get("chats"))
+    items.append({"key": "tg", "label": "Telegram 已配對（平倉通知不能漏）",
+                  "ok": tg, "hint": None if tg else "到提醒設定頁完成配對"})
+    n = len([t for t in (trader.STATE["trades"] if trader else []) if not t.get("excluded")])
+    items.append({"key": "sample", "label": "模擬網累積 30 筆以上策略交易",
+                  "ok": n >= 30, "hint": f"目前 {n} 筆"})
+    p = trader.performance() if trader else {}
+    ev = p.get("expectancyR")
+    items.append({"key": "edge", "label": "模擬網期望值為正、賺賠比 ≥ 1.5",
+                  "ok": (ev or 0) > 0 and (p.get("payoff") or 0) >= 1.5,
+                  "hint": f"目前期望值 {ev}R、賺賠比 {p.get('payoff')}" if p.get("count") else "尚無資料"})
+    done = sum(1 for i in items if i["ok"])
+    return {"items": items, "done": done, "total": len(items),
+            "live": bool(trader and trader.CFG["live"]),
+            "steps": [
+                "幣安建子帳戶，只轉入願意讓機器人管的資金",
+                "建新 API 金鑰：只勾合約交易、不勾提幣、設 IP 白名單",
+                "Zeabur 變數：更新 BN_KEY、BN_SECRET，新設 ALLOW_LIVE=1",
+                "Dockerfile 的 CMD 改為 python main.py --live",
+                "下載並清空 trader.json（模擬網紀錄不要混進真錢績效）",
+                "重新部署，看啟動日誌出現「正式網（真實資金）」",
+                "第一天：每日上限 1 筆、分數門檻 75，確認三張條件單都在幣安 App 看得到",
+            ]}
+
+
+def live_checklist():
+    """距離接入正式網還差什麼。與啟動時的硬性檢查同一套條件，
+    差別是這裡只回報、不擋，讓你在模擬網階段就能看到準備進度。"""
+    ak = os.environ.get("ADMIN_KEY", "").strip()
+    items = [
+        ("ADMIN_KEY 至少 16 字元", len(ak) >= 16),
+        ("BN_KEY／BN_SECRET 已設定", bool(trader and trader.CFG["key"] and trader.CFG["secret"])),
+        ("RISK_PCT ≤ 1", bool(trader) and trader.CFG["riskPct"] <= 1.0),
+        ("LEVERAGE ≤ 5", bool(trader) and trader.CFG["leverage"] <= 5),
+        ("ALLOW_LIVE=1", os.environ.get("ALLOW_LIVE", "") == "1"),
+        ("Dockerfile CMD 帶 --live", "--live" in sys.argv),
+        ("Telegram 已配對", bool(_tg.get("chats"))),
+    ]
+    return [{"item": a, "ok": b} for a, b in items]
 
 
 def upstream_probe():
@@ -1263,6 +1327,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 "pro": CFG["pro"], "engine": bool(engine),
                 "monitor": MON["on"], "cached": len(_cache),
                 "quotaExhausted": QUOTA["exhausted"], "keyless": keyless_now(),
+                "live": bool(trader and trader.CFG["live"]),
+                "liveChecklist": live_checklist(),
                 "disk": (len(os.listdir(CACHE_DIR)) if os.path.isdir(CACHE_DIR) else 0),
                 "diskMB": cache_disk_mb(),
                 "refresh": {k: REFRESH[k] for k in
@@ -1656,6 +1722,26 @@ def main():
         want_live = args.live and os.environ.get("ALLOW_LIVE", "") == "1"
         if args.live and not want_live:
             sys.stderr.write("  ! 已指定 --live 但未設 ALLOW_LIVE=1，仍使用模擬網\n")
+
+        # 正式網的硬性前提：沒有管理金鑰就等於任何人拿到網址都能下真錢的單。
+        # 這裡直接拒絕啟動，而不是警告——警告會被忽略，真錢不能靠警告。
+        if want_live:
+            ak = os.environ.get("ADMIN_KEY", "").strip()
+            problems = []
+            if len(ak) < 16:
+                problems.append("ADMIN_KEY 未設定或短於 16 字元")
+            if args.risk_pct > 1.0:
+                problems.append(f"RISK_PCT={args.risk_pct} 超過 1%，正式網首次啟用請從 0.25 開始")
+            if args.leverage > 5:
+                problems.append(f"LEVERAGE={args.leverage} 超過 5x")
+            if not (args.bn_key and args.bn_secret):
+                problems.append("BN_KEY／BN_SECRET 未設定")
+            if problems:
+                sys.stderr.write("\n  ✕ 正式網啟動條件不足，拒絕啟動：\n")
+                for p in problems:
+                    sys.stderr.write(f"     · {p}\n")
+                sys.stderr.write("     修正後再部署。若要先回模擬網，移除 ALLOW_LIVE 即可。\n\n")
+                sys.exit(2)
         trader.CFG["key"] = args.bn_key.strip()
         trader.CFG["secret"] = args.bn_secret.strip()
         trader.CFG["live"] = want_live
@@ -1667,6 +1753,8 @@ def main():
         if trader.CFG["key"]:
             sys.stderr.write(f"  交易　{net}　風險 {args.risk_pct}%/筆　槓桿 {args.leverage}x　"
                              f"同時持倉上限 {trader.CFG['maxPositions']}　（連線資訊背景載入中）\n")
+            if not want_live:
+                sys.stderr.write("  　　　要接入正式網時，流程在 GO_LIVE.md；連線診斷會顯示還差哪幾項\n")
             if want_live:
                 sys.stderr.write("  ⚠ 正在對正式網下單，會動用真實資金\n")
 
