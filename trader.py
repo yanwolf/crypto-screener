@@ -532,12 +532,37 @@ def auto_roll_day():
 
 
 def auto_can_trade(symbol):
-    """回傳 (可否下單, 原因)。這裡只管風險額度，不管訊號好壞。"""
+    """回傳 (可否下單, 原因)。這裡只管風險額度，不管訊號好壞。
+
+    針對這檔幣的原因（已有部位、冷卻中）排最前面：
+    它們比全域上限更具體、更有用。否則持倉滿的時候，
+    同一檔幣再觸發訊號會被報成「持倉已達上限」，看不出其實是已經持有它。
+    """
     auto_roll_day()
     if not AUTO["on"]:
         return False, "自動下單未啟用"
     if not (CFG["key"] and CFG["secret"]):
         return False, "未設定幣安金鑰"
+
+    # ── 這檔幣本身 ──
+    pos = STATE["positions"].get(symbol)
+    if pos:
+        live = live_positions().get(symbol) or {}
+        mark = live.get("mark")
+        r_amt = ((pos.get("exits") or {}).get("R") or 0) * (pos.get("qty") or 0)
+        rm = (live.get("pnl") / r_amt) if (mark and r_amt) else None
+        held = (time.time() * 1000 - (pos.get("opened") or 0)) / 3600000
+        detail = f"這檔已有部位（{'做多' if pos['side'] == 'LONG' else '做空'}，進場 {pos['entry']:g}"
+        if rm is not None:
+            detail += f"，目前 {rm:+.2f}R"
+        detail += f"，持有 {held:.1f} 小時），不重複進場"
+        return False, detail
+    last = AUTO["lastClose"].get(symbol)
+    if last and (time.time() - last) < AUTO["cooldownMin"] * 60:
+        left = int((AUTO["cooldownMin"] * 60 - (time.time() - last)) / 60)
+        return False, f"剛平倉，冷卻中還剩 {left} 分鐘"
+
+    # ── 全域額度 ──
     if AUTO["blocked"]:
         return False, AUTO["blocked"]
     if AUTO["closedR"] <= AUTO["dailyLossR"]:
@@ -548,12 +573,6 @@ def auto_can_trade(symbol):
         return False, f"今日已開 {AUTO['opened']} 筆，達上限"
     if len(STATE["positions"]) >= CFG["maxPositions"]:
         return False, f"同時持倉已達 {CFG['maxPositions']} 筆上限"
-    if symbol in STATE["positions"]:
-        return False, "這檔已有部位"
-    last = AUTO["lastClose"].get(symbol)
-    if last and (time.time() - last) < AUTO["cooldownMin"] * 60:
-        left = int((AUTO["cooldownMin"] * 60 - (time.time() - last)) / 60)
-        return False, f"剛平倉，冷卻中還剩 {left} 分鐘"
     return True, None
 
 

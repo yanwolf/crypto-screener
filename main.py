@@ -397,6 +397,8 @@ STAGE_LABEL = {
     "gate": "未下單　條件不符",
     "stop": "未下單　停損無法計算",
     "risk": "未下單　風險額度限制",
+    "holding": "未下單　已持有此幣",
+    "cooldown": "未下單　冷卻中",
     "failed": "下單失敗",
     "opened": "已下單",
 }
@@ -666,7 +668,9 @@ def auto_try_trade(ev, row):
     if r.get("ok"):
         return {"stage": "opened", "why": None, "result": r, "note": "；".join(warns) or None}
     if r.get("skipped"):
-        return {"stage": "risk", "why": r.get("error")}
+        why = r.get("error") or ""
+        stage = "holding" if "已有部位" in why else "cooldown" if "冷卻" in why else "risk"
+        return {"stage": stage, "why": why}
     return {"stage": "failed", "why": r.get("error")}
 
 
