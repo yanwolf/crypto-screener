@@ -917,6 +917,28 @@ def mon_handle(path, payload):
 
 
 
+_egress = {"ip": None, "ts": 0}
+
+
+def egress_ip():
+    """伺服器的對外 IP。用來設定幣安 API 的 IP 白名單：
+    金鑰即使外洩，不在白名單的 IP 也用不了。"""
+    if _egress["ip"] and time.time() - _egress["ts"] < 3600:
+        return _egress["ip"]
+    for url in ("https://api.ipify.org", "https://ifconfig.me/ip", "https://icanhazip.com"):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "curl/8"})
+            with urllib.request.urlopen(req, timeout=6) as r:
+                ip = r.read().decode().strip()
+                if ip and len(ip) < 64:
+                    _egress["ip"] = ip
+                    _egress["ts"] = time.time()
+                    return ip
+        except Exception:
+            continue
+    return None
+
+
 def upstream_probe():
     """伺服器自己試連各上游，回報狀態碼與耗時，讓前端能分辨是誰連不上"""
     out = []
@@ -1250,6 +1272,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             }
             if "probe=1" in (self.path.split("?", 1)[1] if "?" in self.path else ""):
                 info["probe"] = upstream_probe()
+                info["egressIp"] = egress_ip()
             body = json.dumps(info, ensure_ascii=False).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
