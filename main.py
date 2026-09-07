@@ -642,17 +642,16 @@ def auto_try_trade(ev, row):
     if blocks:
         return {"stage": "gate", "why": "；".join(blocks), "note": "；".join(warns) or None}
 
-    # 停損來源與畫面一致：空頭用結構停損（row["stop"]），
-    # 多頭用三刀流的小綠（row["ma60"]，在 row 頂層，不在 blades 底下）。
-    if bear:
-        stop = row.get("stop") or ev.get("stop")
-    else:
-        ma60 = row.get("ma60")
-        price0 = row.get("price") or ev.get("price")
-        stop = ma60 * 0.995 if ma60 else (price0 * 0.94 if price0 else None)
+    # 停損用百分比距離，由 stopMode 決定來源（均線／ATR／取近），
+    # 實際價位在下單時套到幣安的標記價上。
     price = row.get("price") or ev.get("price")
-    if stop is None or price is None or (stop > price) != bear:
-        return {"stage": "stop", "why": "算不出合理的停損價，不送無停損的單"}
+    pct, sd = engine.stop_pct(row, bear, mode=trader.CFG.get("stopMode", "tighter"),
+                              atr_mult=trader.CFG.get("stopAtrMult", 1.5),
+                              max_pct=trader.CFG.get("maxStopPct", 12.0),
+                              min_pct=trader.CFG.get("minStopPct", 1.5))
+    if pct is None or price is None:
+        return {"stage": "stop", "why": "算不出合理的停損距離，不送無停損的單"}
+    stop = price * (1 + pct / 100.0) if bear else price * (1 - pct / 100.0)
 
     # 幣安沒有合約就不可能下單，這裡才擋，讓前面的原因先被看到
     if dv is None and dv_err:
@@ -660,11 +659,12 @@ def auto_try_trade(ev, row):
         if not ok_sym:
             return {"stage": "gate", "why": msg}
 
-    note = f"{'空頭' if bear else '多頭'}雷達 {engine._fmt1(score)} 分"
+    src = {"ma": "均線", "atr": "ATR"}.get(sd.get("used"), "?")
+    note = f"{'空頭' if bear else '多頭'}雷達 {engine._fmt1(score)} 分，停損 {pct:.1f}%（{src}）"
     if warns:
         note += "（" + "；".join(warns) + "）"
 
-    r = trader.auto_open(sym, "SHORT" if bear else "LONG", price, float(stop), note=note)
+    r = trader.auto_open(sym, "SHORT" if bear else "LONG", price, float(stop), note=note, stop_pct=pct)
     if r.get("ok"):
         return {"stage": "opened", "why": None, "result": r, "note": "；".join(warns) or None}
     if r.get("skipped"):
@@ -800,7 +800,8 @@ def trade_handle(path, payload):
         limits = {"riskPct": (0.1, 5.0), "maxPositions": (1, 20), "leverage": (1, 20),
                   "stopAtrMult": (0.5, 5.0), "tp1R": (1.0, 10.0), "tp1Portion": (0.0, 1.0),
                   "trailCallback": (0.1, 10.0), "trailActivateR": (0.5, 10.0),
-                  "trailR": (0.0, 3.0), "breakevenR": (0.0, 5.0), "guardClose": (0, 1)}
+                  "trailR": (0.0, 3.0), "breakevenR": (0.0, 5.0), "guardClose": (0, 1),
+                  "maxStopPct": (3.0, 25.0), "minStopPct": (0.5, 5.0)}
         kw = {}
         for k, (lo, hi) in limits.items():
             if k in payload:
@@ -810,6 +811,8 @@ def trade_handle(path, payload):
                     continue
                 v = max(lo, min(hi, v))
                 kw[k] = bool(v) if k == "guardClose" else int(v) if k in ("maxPositions", "leverage") else v
+        if payload.get("stopMode") in ("ma", "atr", "tighter"):
+            kw["stopMode"] = payload["stopMode"]
         return 200, {"cfg": trader.configure(**kw)}
 
     if path == "/api/trade/exclude":
@@ -854,7 +857,9 @@ def trade_handle(path, payload):
         entry = payload.get("entry")
         if not base or stop is None:
             return 400, {"error": "need_symbol_and_stop"}
-        r = trader.open_position(base, side, entry, float(stop), note=str(payload.get("note", "")))
+        sp = payload.get("stopPct")
+        r = trader.open_position(base, side, entry, float(stop), note=str(payload.get("note", "")),
+                                 stop_pct=(float(sp) if sp is not None else None))
         return (200 if r.get("ok") else 400), r
 
     if path == "/api/trade/close":

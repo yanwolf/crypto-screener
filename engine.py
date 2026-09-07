@@ -795,3 +795,49 @@ def trade_gate(detail, dv, bear):
         if fuel * want < 0:
             warns.append(f"同方向部位擁擠度 {_fmt1(dv['crowd'])}，反轉風險偏高")
     return blocks, warns
+
+
+def stop_pct(row, bear, mode="tighter", atr_mult=1.5, max_pct=12.0, min_pct=1.5):
+    """停損距離（佔進場價的百分比）。
+
+    以百分比而非絕對價格回傳，是因為訊號來自 CoinGecko、成交在幣安，
+    兩邊價格可能不同（模擬網尤其明顯）；百分比套到實際成交價才不會錯位。
+
+    mode:
+      ma       用均線（多頭：小綠 ×0.995；空頭：結構停損）
+      atr      用 ATR × 倍數
+      tighter  兩者取近的——現價離均線很遠時，避免停損寬到 15% 以上，
+               那種距離讓部位縮到沒意義、2R 目標遠到等不到。
+    回傳 (pct, detail)。算不出來回 (None, detail)。
+    """
+    price = row.get("price")
+    detail = {"ma": None, "atr": None, "used": None, "mode": mode}
+    if not price or price <= 0:
+        return None, detail
+
+    if bear:
+        s = row.get("stop")
+        ma_pct = (s - price) / price * 100.0 if s and s > price else None
+    else:
+        m = row.get("ma60")
+        ma_pct = (price - m * 0.995) / price * 100.0 if m and m * 0.995 < price else None
+    atr = row.get("atr")
+    atr_pct = atr_mult * atr / price * 100.0 if atr and atr > 0 else None
+    detail["ma"], detail["atr"] = ma_pct, atr_pct
+
+    cands = []
+    if mode == "ma" and ma_pct is not None:
+        cands = [("ma", ma_pct)]
+    elif mode == "atr" and atr_pct is not None:
+        cands = [("atr", atr_pct)]
+    else:
+        cands = [x for x in (("ma", ma_pct), ("atr", atr_pct)) if x[1] is not None]
+        if cands:
+            cands = [min(cands, key=lambda x: x[1])]
+    if not cands:
+        return None, detail
+
+    used, pct = cands[0]
+    pct = max(min_pct, min(max_pct, pct))
+    detail["used"] = used
+    return pct, detail

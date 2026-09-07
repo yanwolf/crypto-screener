@@ -33,7 +33,10 @@ CFG = {
     "riskPct": 0.5,                # 單筆風險：帳戶權益的 %
     "maxPositions": 5,             # 同時最多幾個部位
     "leverage": 3,
-    "stopAtrMult": 1.5,            # 停損 = 進場價 ∓ 1.5×ATR
+    "stopAtrMult": 1.5,            # ATR 停損倍數
+    "stopMode": "tighter",         # ma / atr / tighter（均線與 ATR 取近的）
+    "maxStopPct": 12.0,            # 停損距離上限 %
+    "minStopPct": 1.5,             # 停損距離下限 %
     "tp1R": 2.0,                   # 第一目標：2R 出一半
     "tp1Portion": 0.5,
     "trailCallback": 1.2,          # （舊）固定回撤 %，僅在 trailR 為 0 時使用
@@ -48,7 +51,7 @@ CFG = {
 # 會存檔的設定項。live / key / secret 一律不存。
 PERSIST_CFG = ("riskPct", "maxPositions", "leverage", "stopAtrMult",
                "tp1R", "tp1Portion", "trailCallback", "trailActivateR",
-               "trailR", "breakevenR", "guardClose")
+               "trailR", "breakevenR", "guardClose", "stopMode", "maxStopPct", "minStopPct")
 
 _filters = {}                      # symbol → 精度與限制
 _filters_ts = 0
@@ -366,7 +369,7 @@ def wait_position(symbol, want_qty, tries=12, gap=0.5):
     return 0.0, None
 
 
-def open_position(symbol_base, side, entry_hint, stop, info=None, note=""):
+def open_position(symbol_base, side, entry_hint, stop, info=None, note="", stop_pct=None):
     """進場：市價單 + 停損單 + 部分停利 + 移動停利。
 
     停損一定在進場後立刻掛出。如果掛停損失敗，會立刻market平掉剛進的倉，
@@ -384,6 +387,10 @@ def open_position(symbol_base, side, entry_hint, stop, info=None, note=""):
     px = mark_price(sym) or entry_hint
     if not px:
         return {"ok": False, "error": "取不到市價"}
+    # 停損以百分比套到實際標記價：訊號價與成交價可能不同（模擬網尤其明顯），
+    # 絕對價格直接沿用會錯位；百分比不會。
+    if stop_pct is not None and stop_pct > 0:
+        stop = px * (1 - stop_pct / 100.0) if side == "LONG" else px * (1 + stop_pct / 100.0)
 
     qty, detail = size_position(equity, px, stop, info)
     if qty <= 0:
@@ -576,14 +583,14 @@ def auto_can_trade(symbol):
     return True, None
 
 
-def auto_open(symbol_base, side, entry, stop, note="", on_event=None):
+def auto_open(symbol_base, side, entry, stop, note="", on_event=None, stop_pct=None):
     """自動開倉。通過風險閘門才會真的送單。"""
     sym = symbol_base.upper() + "USDT"
     ok, why = auto_can_trade(sym)
     if not ok:
         return {"ok": False, "skipped": True, "error": why}
 
-    r = open_position(symbol_base, side, entry, stop, note=note)
+    r = open_position(symbol_base, side, entry, stop, note=note, stop_pct=stop_pct)
     if r.get("ok"):
         AUTO["opened"] += 1
         save_state()

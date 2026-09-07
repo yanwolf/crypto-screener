@@ -3509,6 +3509,38 @@ function CryptoScreener() {
     };
   }
 
+  /* 停損距離（%）。與 engine.py 的 stop_pct 對齊；修改時兩邊同步。 */
+  function stopPct(row, bear, mode, atrMult, maxPct, minPct) {
+    const price = row.price;
+    const detail = {
+      ma: null,
+      atr: null,
+      used: null,
+      mode
+    };
+    if (!price || price <= 0) return [null, detail];
+    let maPct = null;
+    if (bear) {
+      const s = row.stop;
+      if (s && s > price) maPct = (s - price) / price * 100;
+    } else {
+      const m = row.ma60;
+      if (m && m * 0.995 < price) maPct = (price - m * 0.995) / price * 100;
+    }
+    const atrPct = row.atr && row.atr > 0 ? atrMult * row.atr / price * 100 : null;
+    detail.ma = maPct;
+    detail.atr = atrPct;
+    let cands = [];
+    if (mode === "ma" && maPct != null) cands = [["ma", maPct]];else if (mode === "atr" && atrPct != null) cands = [["atr", atrPct]];else {
+      cands = [["ma", maPct], ["atr", atrPct]].filter(x => x[1] != null);
+      if (cands.length) cands = [cands.reduce((a, b) => a[1] <= b[1] ? a : b)];
+    }
+    if (!cands.length) return [null, detail];
+    const [used, raw] = cands[0];
+    detail.used = used;
+    return [Math.max(minPct, Math.min(maxPct, raw)), detail];
+  }
+
   /* ── Binance 衍生品資料抓取 ────────────────────────────────
      公開端點免金鑰。瀏覽器直連時 Binance 有 CORS 允許，
      但部分地區的 IP 會被擋，所以走伺服器代理較穩。 */
@@ -6483,7 +6515,51 @@ function CryptoScreener() {
       color: C.gold,
       marginBottom: 6
     }
-  }, "以下兩項直接決定每筆的虧損金額"), [["maxPositions", "同時持倉上限", [1, 2, 3, 5, 8], "筆", trade.cfg?.maxPositions], ["riskPct", "單筆風險", [0.25, 0.5, 1, 1.5, 2], "%", trade.cfg?.riskPct], ["breakevenR", "移損到成本（0 = 關閉）", [0, 0.8, 1, 1.5, 2], "R", trade.cfg?.breakevenR], ["trailR", "移動停利回撤", [0.3, 0.5, 0.8, 1], "R", trade.cfg?.trailR]].map(([key, label, opts, unit, cur]) => /*#__PURE__*/React.createElement("div", {
+  }, "以下直接決定每筆的虧損金額與停損位置"), /*#__PURE__*/React.createElement("div", {
+    className: "mt-2"
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11.5,
+      color: C.muted,
+      marginBottom: 4
+    }
+  }, "停損來源\u3000", /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: C.bone
+    }
+  }, {
+    ma: "均線",
+    atr: "ATR",
+    tighter: "取近的"
+  }[trade.cfg?.stopMode] || "取近的")), /*#__PURE__*/React.createElement("div", {
+    className: "flex flex-wrap gap-1.5"
+  }, [["tighter", "均線／ATR 取近"], ["atr", "只用 ATR"], ["ma", "只用均線"]].map(([v, t]) => /*#__PURE__*/React.createElement("button", {
+    key: v,
+    onClick: async () => {
+      const j = await tradeCall("config", {
+        stopMode: v
+      });
+      if (j && j.cfg) setTrade(x => ({
+        ...x,
+        cfg: j.cfg
+      }));
+    },
+    disabled: tradeBusy,
+    className: "px-2.5 py-1 rounded",
+    style: {
+      background: (trade.cfg?.stopMode || "tighter") === v ? C.gold : C.panel,
+      color: (trade.cfg?.stopMode || "tighter") === v ? C.ink : C.muted,
+      border: `1px solid ${(trade.cfg?.stopMode || "tighter") === v ? C.gold : C.line}`,
+      fontSize: 11.5
+    }
+  }, t))), /*#__PURE__*/React.createElement("div", {
+    className: "mt-1",
+    style: {
+      fontSize: 10.5,
+      color: C.muted,
+      lineHeight: 1.6
+    }
+  }, "現價離小綠 15% 以上時，用均線定停損會寬到讓部位失去意義、2R 遠到等不到； 取近的能把距離壓回該幣的實際波動範圍。")), [["maxPositions", "同時持倉上限", [1, 2, 3, 5, 8], "筆", trade.cfg?.maxPositions], ["riskPct", "單筆風險", [0.25, 0.5, 1, 1.5, 2], "%", trade.cfg?.riskPct], ["stopAtrMult", "ATR 停損倍數", [1, 1.5, 2, 2.5, 3], "×ATR", trade.cfg?.stopAtrMult], ["maxStopPct", "停損距離上限", [6, 8, 10, 12, 15], "%", trade.cfg?.maxStopPct], ["breakevenR", "移損到成本（0 = 關閉）", [0, 0.8, 1, 1.5, 2], "R", trade.cfg?.breakevenR], ["trailR", "移動停利回撤", [0.3, 0.5, 0.8, 1], "R", trade.cfg?.trailR]].map(([key, label, opts, unit, cur]) => /*#__PURE__*/React.createElement("div", {
     key: key,
     className: "mt-2"
   }, /*#__PURE__*/React.createElement("div", {
@@ -8416,10 +8492,10 @@ function CryptoScreener() {
     // 預設方向跟著分頁，但衍生品明確指向反向時，改推薦反向
     const suggest = dvOk && dvOk.bias != null && Math.abs(dvOk.bias) >= 1 ? dvOk.bias > 0 ? "bull" : "bear" : null;
     const bear = tradeSide != null ? tradeSide === "bear" : side === "bear";
-    const plan = bear ? detail.bear : null;
-    // 停損來源：空頭用結構停損，多頭用三刀流的綠線或 ATR 推算
-    const stop = bear ? plan?.stop : detail.blades?.ma60 ? detail.blades.ma60 * 0.995 : detail.price ? detail.price * 0.94 : null;
-    const ok = stop != null && detail.price != null && (bear ? stop > detail.price : stop < detail.price);
+    const cfgT = trade.cfg || {};
+    const [sPct, sDet] = stopPct(detail, bear, cfgT.stopMode || "tighter", cfgT.stopAtrMult ?? 1.5, cfgT.maxStopPct ?? 12, cfgT.minStopPct ?? 1.5);
+    const stop = sPct != null && detail.price ? bear ? detail.price * (1 + sPct / 100) : detail.price * (1 - sPct / 100) : null;
+    const ok = stop != null;
     const gate = tradeGate(detail, dvOk, bear);
     return /*#__PURE__*/React.createElement("div", {
       className: "mt-3 rounded p-3",
@@ -8453,7 +8529,7 @@ function CryptoScreener() {
         fontSize: 11,
         color: C.muted
       }
-    }, "停損 ", stop ? fmtPrice(stop) : "—")), suggest && suggest === "bear" !== bear && /*#__PURE__*/React.createElement("div", {
+    }, "停損 ", stop ? fmtPrice(stop) : "—", sPct != null && /*#__PURE__*/React.createElement("span", null, "\u3000", sPct.toFixed(1), "%（", sDet.used === "atr" ? "ATR" : "均線", "）"))), suggest && suggest === "bear" !== bear && /*#__PURE__*/React.createElement("div", {
       className: "mt-2 px-2.5 py-1.5 rounded",
       style: {
         background: C.panel,
@@ -8513,6 +8589,7 @@ function CryptoScreener() {
           side: bear ? "SHORT" : "LONG",
           entry: detail.price,
           stop,
+          stopPct: sPct,
           note: `${bear ? "空頭" : "多頭"}雷達 ${detail.score == null ? "—" : r1(detail.score)} 分（手動）`
         });
         if (j?.ok) {
