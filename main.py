@@ -471,7 +471,7 @@ def notify_trade_close(t):
             lines.append(f"累計 {p['count']} 筆　勝率 {p['winRate']}%　"
                          f"賺賠比 {p.get('payoff') or '—'}　期望值 {p['expectancyR']}R")
             a = trader.AUTO
-            lines.append(f"今日 {a['opened']} 筆　已實現 {a['closedR']:+.2f}R")
+            lines.append(f"今日 {a['opened']} 筆　已實現 {a['closedR']:+.2f}R（{a.get('closedUsd', 0.0):+.0f} U）")
             if a.get("blocked"):
                 lines.append(f"⚠ {a['blocked']}")
     return head, "\n".join(lines)

@@ -6438,7 +6438,11 @@ function CryptoScreener() {
     style: {
       color: (trade.auto.closedR ?? 0) > 0 ? UP : (trade.auto.closedR ?? 0) < 0 ? DOWN : C.bone
     }
-  }, (trade.auto.closedR ?? 0).toFixed(2), "R")), /*#__PURE__*/React.createElement("div", {
+  }, (trade.auto.closedR ?? 0).toFixed(2), "R", trade.auto.closedUsd != null && /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 11
+    }
+  }, "（", trade.auto.closedUsd > 0 ? "+" : "", trade.auto.closedUsd.toFixed(0), " U）"))), /*#__PURE__*/React.createElement("div", {
     className: "flex justify-between"
   }, /*#__PURE__*/React.createElement("span", {
     style: {
@@ -6450,7 +6454,12 @@ function CryptoScreener() {
     style: {
       color: C.muted
     }
-  }, "單筆風險"), /*#__PURE__*/React.createElement("span", null, trade.cfg?.riskPct ?? "—", "%"))), /*#__PURE__*/React.createElement("div", {
+  }, "單筆風險"), /*#__PURE__*/React.createElement("span", null, trade.cfg?.riskPct ?? "—", "%", trade.auto.oneR != null && /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 11,
+      color: C.muted
+    }
+  }, "\u30001R ≈ ", trade.auto.oneR.toFixed(0), " U")))), /*#__PURE__*/React.createElement("div", {
     className: "mt-3 pt-3",
     style: {
       borderTop: `1px solid ${C.line}`
@@ -6614,9 +6623,10 @@ function CryptoScreener() {
       background: "#241A1A",
       border: `1px solid ${C.red}`,
       fontSize: 11.5,
-      color: C.red
+      color: C.red,
+      lineHeight: 1.7
     }
-  }, trade.auto.blocked), /*#__PURE__*/React.createElement("div", {
+  }, "今日停止新開倉。", trade.auto.blockedAtR != null && /*#__PURE__*/React.createElement(React.Fragment, null, " 於 ", trade.auto.blockedAtR.toFixed(2), "R（", (trade.auto.blockedAtUsd ?? 0).toFixed(0), " U）觸發，"), "目前累計 ", (trade.auto.closedR ?? 0).toFixed(2), "R（", (trade.auto.closedUsd ?? 0).toFixed(0), " U）", trade.positions?.length > 0 && /*#__PURE__*/React.createElement(React.Fragment, null, "；已有 ", trade.positions.length, " 筆部位仍會依停損或停利出場，數字可能繼續變動"), "。 停損上限 ", trade.auto.dailyLossR, "R ≈ ", trade.auto.oneR != null ? (trade.auto.dailyLossR * trade.auto.oneR).toFixed(0) : "—", " U。"), /*#__PURE__*/React.createElement("div", {
     className: "mt-2.5 pt-2.5 flex items-center gap-2 flex-wrap",
     style: {
       borderTop: `1px solid ${C.line}`,

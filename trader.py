@@ -518,6 +518,8 @@ AUTO = {
     "day": None,               # 當前計算中的日期
     "opened": 0,               # 今日已開倉數
     "closedR": 0.0,            # 今日已實現 R
+    "closedUsd": 0.0,          # 今日已實現 U（R 對政策有意義，U 對人有意義）
+    "blockedAtR": None, "blockedAtUsd": None,   # 觸發停止那一刻的數字
     "lastClose": {},           # symbol → 最後平倉時間
     "blocked": None,           # 當日被停用的原因
 }
@@ -534,7 +536,10 @@ def auto_roll_day():
         AUTO["day"] = d
         AUTO["opened"] = 0
         AUTO["closedR"] = 0.0
+        AUTO["closedUsd"] = 0.0
         AUTO["blocked"] = None
+        AUTO["blockedAtR"] = None
+        AUTO["blockedAtUsd"] = None
         save_state()
 
 
@@ -573,7 +578,10 @@ def auto_can_trade(symbol):
     if AUTO["blocked"]:
         return False, AUTO["blocked"]
     if AUTO["closedR"] <= AUTO["dailyLossR"]:
-        AUTO["blocked"] = f"當日已虧損 {AUTO['closedR']:.2f}R，達停損上限，今日停止下單"
+        AUTO["blockedAtR"] = AUTO["closedR"]
+        AUTO["blockedAtUsd"] = AUTO.get("closedUsd", 0.0)
+        AUTO["blocked"] = (f"當日已虧損 {AUTO['closedR']:.2f}R（{AUTO.get('closedUsd', 0.0):+.0f} U），"
+                           f"達停損上限，今日停止新開倉；已有部位仍依停損出場")
         save_state()
         return False, AUTO["blocked"]
     if AUTO["opened"] >= AUTO["maxPerDay"]:
@@ -634,6 +642,7 @@ def record_close(pos, exit_px, reason):
     if rm is not None:
         auto_roll_day()
         AUTO["closedR"] += rm
+        AUTO["closedUsd"] = AUTO.get("closedUsd", 0.0) + (STATE["trades"][-1].get("pnl") or 0.0)
     save_state()
 
 
@@ -998,6 +1007,20 @@ def configure(**kw):
             for k, v in CFG.items() if k not in ("key", "secret")}
 
 
+_eq_memo = {"ts": 0, "eq": None}
+
+
+def _one_r_usd():
+    """1R 大約等於多少 U：最近權益 × 單筆風險 %。權益每 5 分鐘查一次。"""
+    if time.time() - _eq_memo["ts"] > 300 and CFG["key"] and CFG["secret"] and not CFG["dryRun"]:
+        eq, _ = account_equity()
+        if eq is not None:
+            _eq_memo["eq"] = eq
+        _eq_memo["ts"] = time.time()
+    eq = _eq_memo["eq"]
+    return round(eq * CFG["riskPct"] / 100.0, 2) if eq else None
+
+
 def status():
     pos = enrich_positions()
     return {
@@ -1012,7 +1035,8 @@ def status():
         "cfg": {k: v for k, v in CFG.items() if k not in ("key", "secret")},
         "lastRun": STATE["lastRun"],
         "symbols": len(_filters),
-        "auto": {k: AUTO[k] for k in
-                 ("on", "maxPerDay", "dailyLossR", "cooldownMin", "minScore",
-                  "opened", "closedR", "blocked", "day")},
+        "auto": {**{k: AUTO.get(k) for k in
+                    ("on", "maxPerDay", "dailyLossR", "cooldownMin", "minScore",
+                     "opened", "closedR", "closedUsd", "blocked", "blockedAtR", "blockedAtUsd", "day")},
+                 "oneR": _one_r_usd()},
     }
