@@ -208,6 +208,15 @@ def mark_price(symbol):
     return None
 
 
+def position_mode():
+    """單向或雙向持倉。程式下單不帶 positionSide，只支援單向；
+    雙向模式會被幣安拒單，所以上線前要確認。回傳 'oneway' / 'hedge' / None。"""
+    st, d = _request("GET", "/fapi/v1/positionSide/dual", signed=True)
+    if st == 200 and isinstance(d, dict) and "dualSidePosition" in d:
+        return "hedge" if d["dualSidePosition"] else "oneway"
+    return None
+
+
 def account_equity():
     st, d = _request("GET", "/fapi/v2/account", signed=True)
     if st != 200 or not isinstance(d, dict):

@@ -1000,6 +1000,20 @@ def live_checklist():
         ("Dockerfile CMD 帶 --live", "--live" in sys.argv),
         ("Telegram 已配對", bool(_tg.get("chats"))),
     ]
+    # 需要金鑰才查得到的兩項：查不到就標「未知」而不是失敗
+    if trader and trader.CFG["key"] and trader.CFG["secret"]:
+        try:
+            eq, _ = trader.account_equity()
+            items.append((f"合約錢包有餘額（目前 {eq:.0f} U）" if eq is not None else "合約錢包餘額（查不到）",
+                          bool(eq and eq > 0)))
+        except Exception:
+            items.append(("合約錢包餘額（查詢失敗）", False))
+        try:
+            pm = trader.position_mode()
+            items.append(("持倉模式為單向（程式不支援雙向對沖）",
+                          pm == "oneway") if pm else ("持倉模式（查不到）", False))
+        except Exception:
+            items.append(("持倉模式（查詢失敗）", False))
     return [{"item": a, "ok": b} for a, b in items]
 
 
