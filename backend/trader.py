@@ -376,7 +376,7 @@ def set_leverage(symbol, lev):
 
 
 
-def wait_position(symbol, want_qty, tries=12, gap=0.5):
+def wait_position(symbol, want_qty, tries=12, gap=0.5, side="LONG"):
     """等部位出現在帳戶上，回傳 (實際數量, 進場均價)。
 
     市價單成交與 positionRisk 更新之間有延遲，直接掛條件單會被拒。
@@ -385,7 +385,7 @@ def wait_position(symbol, want_qty, tries=12, gap=0.5):
     for i in range(tries):
         st, d = _request("GET", "/fapi/v2/positionRisk", {"symbol": symbol}, signed=True)
         if st == 200 and isinstance(d, list):
-            for p in d:
+            for p in _my_side_rows(d, symbol, side):
                 try:
                     amt = abs(float(p.get("positionAmt") or 0))
                     ep = float(p.get("entryPrice") or 0)
@@ -395,6 +395,59 @@ def wait_position(symbol, want_qty, tries=12, gap=0.5):
                     return amt, (ep or None)
         time.sleep(gap)
     return 0.0, None
+
+
+
+
+# ── 持倉模式（單向／雙向）────────────────────────────────────
+#
+# 模式是帳戶層級的設定，可能被共用同一個帳戶的其他程式切換。
+# 這裡自動偵測並調整下單參數：
+#   單向：用 reduceOnly 標示平倉單，不帶 positionSide
+#   雙向：每張單都帶 positionSide=LONG/SHORT，且不能帶 reduceOnly（會被拒）
+# positionRisk 在雙向模式下每個交易對回兩筆，要挑我們那一側。
+
+_mode = {"hedge": None, "ts": 0}
+
+
+def hedge_mode(force=False):
+    if not force and _mode["hedge"] is not None and time.time() - _mode["ts"] < 300:
+        return _mode["hedge"]
+    pm = position_mode()
+    if pm is not None:
+        _mode["hedge"] = (pm == "hedge")
+        _mode["ts"] = time.time()
+    return bool(_mode["hedge"])
+
+
+def _ps(side):
+    """進場單的方向參數。"""
+    return {"positionSide": side} if hedge_mode() else {}
+
+
+def _reduce(side):
+    """帶數量的平倉單（停利、移動停利、市價平倉）。"""
+    return {"positionSide": side} if hedge_mode() else {"reduceOnly": "true"}
+
+
+def _close_all(side):
+    """closePosition=true 的停損單。"""
+    d = {"closePosition": "true"}
+    if hedge_mode():
+        d["positionSide"] = side
+    return d
+
+
+def _my_side_rows(rows, symbol, side):
+    """從 positionRisk 回傳裡挑出這個交易對、屬於我們方向的那一筆。"""
+    out = []
+    for p in rows:
+        if p.get("symbol") != symbol:
+            continue
+        ps = p.get("positionSide", "BOTH")
+        if ps == "BOTH" or ps == side:
+            out.append(p)
+    return out
 
 
 def open_position(symbol_base, side, entry_hint, stop, info=None, note="", stop_pct=None):
@@ -437,7 +490,7 @@ def open_position(symbol_base, side, entry_hint, stop, info=None, note="", stop_
     # 這樣才拿得到實際成交均價。
     st, entry_res = _request("POST", "/fapi/v1/order", {
         "symbol": sym, "side": order_side, "type": "MARKET", "quantity": qty,
-        "newOrderRespType": "RESULT",
+        "newOrderRespType": "RESULT", **_ps(side),
     }, signed=True)
     if st != 200:
         return {"ok": False, "error": f"進場失敗：{entry_res.get('msg') or entry_res}"}
@@ -445,7 +498,7 @@ def open_position(symbol_base, side, entry_hint, stop, info=None, note="", stop_
     # 等部位真的出現在帳戶上再掛條件單。
     # 幣安的成交與部位更新之間有延遲，太早掛 closePosition=true 的單會被拒，
     # 錯誤訊息是「TIF GTE can only be used with open positions」。
-    actual_qty, actual_entry = wait_position(sym, qty)
+    actual_qty, actual_entry = wait_position(sym, qty, side=side)
     if actual_qty <= 0:
         return {"ok": False, "error": "進場單已送出，但 6 秒內查不到部位，請到幣安確認後手動處理"}
     qty = actual_qty
@@ -467,7 +520,7 @@ def open_position(symbol_base, side, entry_hint, stop, info=None, note="", stop_
     if breached:
         _request("POST", "/fapi/v1/order", {
             "symbol": sym, "side": close_side, "type": "MARKET",
-            "quantity": qty, "reduceOnly": "true",
+            "quantity": qty, **_reduce(side),
         }, signed=True)
         return {"ok": False, "error": (
             f"下單瞬間價格已越過預定停損（現價 {live:g}，停損 {stop_px:g}），"
@@ -476,14 +529,14 @@ def open_position(symbol_base, side, entry_hint, stop, info=None, note="", stop_
     # 停損：closePosition 確保無論部位多大都全平
     st2, r2, ep2 = place_conditional({
         "symbol": sym, "side": close_side, "type": "STOP_MARKET",
-        "stopPrice": stop_px, "closePosition": "true", "workingType": "MARK_PRICE",
+        "stopPrice": stop_px, "workingType": "MARK_PRICE", **_close_all(side),
     })
     if st2 != 200:
         errs.append(f"停損掛單失敗：{r2.get('msg') or r2}")
         # 沒有停損就不留倉
         _request("POST", "/fapi/v1/order", {
             "symbol": sym, "side": close_side, "type": "MARKET",
-            "quantity": qty, "reduceOnly": "true",
+            "quantity": qty, **_reduce(side),
         }, signed=True)
         return {"ok": False, "error": "；".join(errs) + "　已立即平倉，避免無停損部位"}
     sub.append({"type": "STOP_MARKET", "id": r2.get("algoId") or r2.get("orderId"),
@@ -496,7 +549,7 @@ def open_position(symbol_base, side, entry_hint, stop, info=None, note="", stop_
         st3, r3, ep3 = place_conditional({
             "symbol": sym, "side": close_side, "type": "TAKE_PROFIT_MARKET",
             "stopPrice": round_step(exits["tp1"], tick), "quantity": tp_qty,
-            "reduceOnly": "true", "workingType": "MARK_PRICE",
+            "workingType": "MARK_PRICE", **_reduce(side),
         })
         if st3 == 200:
             sub.append({"type": "TAKE_PROFIT_MARKET", "id": r3.get("algoId") or r3.get("orderId"),
@@ -511,7 +564,7 @@ def open_position(symbol_base, side, entry_hint, stop, info=None, note="", stop_
             "symbol": sym, "side": close_side, "type": "TRAILING_STOP_MARKET",
             "quantity": trail_qty, "callbackRate": exits["trailCallback"],
             "activationPrice": round_step(exits["trailActivate"], tick),
-            "reduceOnly": "true", "workingType": "MARK_PRICE",
+            "workingType": "MARK_PRICE", **_reduce(side),
         })
         if st4 == 200:
             sub.append({"type": "TRAILING_STOP_MARKET", "id": r4.get("algoId") or r4.get("orderId"),
@@ -650,7 +703,7 @@ def close_position(symbol, reason="手動平倉"):
     if not CFG["dryRun"]:
         _request("POST", "/fapi/v1/order", {
             "symbol": symbol, "side": close_side, "type": "MARKET",
-            "quantity": pos["qty"], "reduceOnly": "true",
+            "quantity": pos["qty"], **_reduce(pos["side"]),
         }, signed=True)
         cancel_conditional(symbol)
     px = mark_price(symbol) or pos["entry"]
@@ -696,8 +749,13 @@ def sync_positions():
             amt = float(p.get("positionAmt") or 0)
         except Exception:
             amt = 0.0
-        if abs(amt) > 0:
-            live[p["symbol"]] = p
+        if abs(amt) <= 0:
+            continue
+        mine = STATE["positions"].get(p["symbol"])
+        ps = p.get("positionSide", "BOTH")
+        if mine and ps not in ("BOTH", mine["side"]):
+            continue                     # 雙向模式下另一側不是我們的
+        live[p["symbol"]] = p
     closed = []
     for sym in list(STATE["positions"].keys()):
         if sym not in live:
@@ -733,6 +791,11 @@ def live_positions(max_age=10):
         try:
             amt = float(p.get("positionAmt") or 0)
             if abs(amt) <= 0:
+                continue
+            # 雙向模式同一交易對可能有兩側；只認我們帳本記錄的那一側
+            mine = STATE["positions"].get(p["symbol"])
+            ps = p.get("positionSide", "BOTH")
+            if mine and ps not in ("BOTH", mine["side"]):
                 continue
             out[p["symbol"]] = {
                 "mark": float(p.get("markPrice") or 0),
@@ -834,7 +897,7 @@ def guard_positions():
 
         st, r, ep = place_conditional({
             "symbol": sym, "side": close_side, "type": "STOP_MARKET",
-            "stopPrice": stop_px, "closePosition": "true", "workingType": "MARK_PRICE",
+            "stopPrice": stop_px, "workingType": "MARK_PRICE", **_close_all(pos["side"]),
         })
         msg = str((r or {}).get("msg") or r)
         if st == 200:
@@ -850,7 +913,7 @@ def guard_positions():
         if CFG.get("guardClose"):                 # 原則 4
             _request("POST", "/fapi/v1/order", {
                 "symbol": sym, "side": close_side, "type": "MARKET",
-                "quantity": pos["qty"], "reduceOnly": "true",
+                "quantity": pos["qty"], **_reduce(pos["side"]),
             }, signed=True)
             px = mark_price(sym) or pos["entry"]
             record_close(pos, px, "停損單遺失且無法補掛，強制平倉")
@@ -903,7 +966,7 @@ def move_to_breakeven(pos, mark):
 
     st, r, ep = place_conditional({
         "symbol": sym, "side": close_side, "type": "STOP_MARKET",
-        "stopPrice": new_stop, "closePosition": "true", "workingType": "MARK_PRICE",
+        "stopPrice": new_stop, "workingType": "MARK_PRICE", **_close_all(pos["side"]),
     })
     if st != 200:
         return {"symbol": sym, "ok": False, "why": str(r.get("msg") or r)[:100]}
@@ -1112,6 +1175,7 @@ def status():
     return {
         "enabled": STATE["enabled"],
         "net": "LIVE 正式網" if CFG["live"] else "TESTNET 模擬網",
+        "positionMode": ("hedge" if _mode["hedge"] else "oneway") if _mode["hedge"] is not None else None,
         "hasCreds": bool(CFG["key"] and CFG["secret"]),
         "positions": pos,
         "openPnl": round(sum((r.get("pnl") or 0) for r in pos), 2),

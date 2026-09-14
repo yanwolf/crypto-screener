@@ -1023,8 +1023,8 @@ def live_checklist():
             items.append(("合約錢包餘額（查詢失敗）", False))
         try:
             pm = trader.position_mode()
-            items.append(("持倉模式為單向（程式不支援雙向對沖）",
-                          pm == "oneway") if pm else ("持倉模式（查不到）", False))
+            items.append((f"持倉模式已偵測：{'雙向' if pm == 'hedge' else '單向'}（兩種都支援，自動適配）", True)
+                         if pm else ("持倉模式（查不到）", False))
         except Exception:
             items.append(("持倉模式（查詢失敗）", False))
     return [{"item": a, "ok": b} for a, b in items]
