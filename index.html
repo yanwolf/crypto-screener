@@ -3106,6 +3106,8 @@ function CryptoScreener() {
   const [tradeSide, setTradeSide] = useState(null); // null = 跟著分頁
   const [autoEdit, setAutoEdit] = useState(false);
   const [tradesOpen, setTradesOpen] = useState(false); // 交易明細預設收折
+  const [liveCheck, setLiveCheck] = useState(null); // 上線就緒清單（在模擬單頁直接查）
+  const [liveBusy, setLiveBusy] = useState(false);
   const [tradesLimit, setTradesLimit] = useState(10);
   const [view, setView] = useState("radar");
   const [batch, setBatch] = useState({
@@ -6380,7 +6382,105 @@ function CryptoScreener() {
     style: {
       color: C.muted
     }
-  }, "關閉")), trade.auto && /*#__PURE__*/React.createElement("div", {
+  }, "關閉")), /*#__PURE__*/React.createElement("div", {
+    className: "mt-3 rounded p-3",
+    style: {
+      background: C.panel2,
+      border: `1px solid ${trade.net && trade.net.includes("LIVE") ? C.red : C.line}`
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "flex items-center gap-2 flex-wrap"
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontFamily: FONT.display,
+      fontSize: 13
+    }
+  }, "接入正式網的準備"), liveCheck && /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 11.5,
+      color: C.muted
+    }
+  }, liveCheck.list.filter(x => x.ok).length, "/", liveCheck.list.length, " 就緒"), /*#__PURE__*/React.createElement("button", {
+    onClick: async () => {
+      setLiveBusy(true);
+      try {
+        const r = await fetch("/api/health?probe=1", {
+          cache: "no-store"
+        });
+        const j = await r.json();
+        setLiveCheck({
+          list: j.liveChecklist || [],
+          ip: j.egressIp || null,
+          live: !!j.live
+        });
+      } catch (e) {
+        setTradeMsg(["err", "連不到伺服器：" + e.message]);
+      } finally {
+        setLiveBusy(false);
+      }
+    },
+    disabled: liveBusy,
+    className: "ml-auto px-2.5 py-1 rounded",
+    style: {
+      background: C.panel,
+      border: `1px solid ${C.line}`,
+      color: C.muted,
+      fontSize: 11.5
+    }
+  }, liveBusy ? "檢查中…" : liveCheck ? "重新檢查" : "檢查")), !liveCheck && /*#__PURE__*/React.createElement("div", {
+    className: "mt-1.5",
+    style: {
+      fontSize: 11,
+      color: C.muted,
+      lineHeight: 1.6
+    }
+  }, "按「檢查」會列出還缺哪幾項，並顯示伺服器出口 IP 供幣安 API 白名單使用。 目前是模擬網，這裡只是預先看準備進度，不會切換任何東西。"), liveCheck && /*#__PURE__*/React.createElement("div", {
+    className: "mt-2"
+  }, liveCheck.ip && /*#__PURE__*/React.createElement("div", {
+    className: "mb-2 px-2.5 py-1.5 rounded flex items-center gap-2 flex-wrap",
+    style: {
+      background: C.panel,
+      border: `1px solid ${C.line}`,
+      fontSize: 11.5
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: C.muted
+    }
+  }, "伺服器出口 IP"), /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontFamily: FONT.data,
+      color: C.teal,
+      userSelect: "all"
+    }
+  }, liveCheck.ip), /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: C.muted,
+      fontSize: 10.5
+    }
+  }, "← 填入幣安 API 金鑰的 IP 白名單")), liveCheck.list.map((x, i) => /*#__PURE__*/React.createElement("div", {
+    key: i,
+    className: "flex items-center gap-2",
+    style: {
+      fontSize: 11.5,
+      lineHeight: 1.9
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: x.ok ? C.teal : C.gold
+    }
+  }, x.ok ? "✓" : "○"), /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: x.ok ? C.bone : C.muted
+    }
+  }, x.item))), /*#__PURE__*/React.createElement("div", {
+    className: "mt-1.5",
+    style: {
+      fontSize: 10.5,
+      color: C.muted,
+      lineHeight: 1.6
+    }
+  }, "完整步驟在專案的 GO_LIVE.md。條件不齊時正式網會拒絕啟動，不會誤上線。"))), trade.auto && /*#__PURE__*/React.createElement("div", {
     className: "mt-3 rounded p-3",
     style: {
       background: C.panel2,
