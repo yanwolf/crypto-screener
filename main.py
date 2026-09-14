@@ -1057,7 +1057,7 @@ def upstream_probe():
 # 狀態檔（Telegram 配對、監控設定、交易紀錄）絕對不能刪，
 # 它們跟快取放在同一個目錄，靠固定檔名保護。
 
-PROTECTED = {"telegram.json", "monitor.json", "trader.json"}
+PROTECTED = {"telegram.json", "monitor.json", "trader.json", "trader.live.json", "trader.testnet.json"}
 
 LAST_CLEAN = {"ts": None, "removed": 0, "freedMB": 0.0, "by": None}
 
@@ -1762,11 +1762,27 @@ def main():
         trader.CFG["riskPct"] = args.risk_pct
         trader.CFG["leverage"] = args.leverage
         trader.CFG["maxPositions"] = max(1, min(20, args.max_positions))
-        trader.load_state(os.path.join(CACHE_DIR, "trader.json"))
+        trader.load_state(trader.state_path(CACHE_DIR, want_live))
         net = "正式網（真實資金）" if want_live else "模擬網 Testnet"
 
         # 上次跑的是正式網、這次卻是模擬網：多半是部署設定被覆蓋了。
         # 真實部位還在幣安但這裡不再追蹤，必須大聲警告。
+        # 切回模擬網時，正式網帳本裡若還有持倉要講清楚：
+        # 那些部位仍在幣安、停損單仍有效，只是這裡不再追蹤，切回正式網會接續。
+        if not want_live:
+            try:
+                lp = os.path.join(CACHE_DIR, "trader.live.json")
+                if os.path.exists(lp):
+                    with open(lp) as f:
+                        live_pos = (json.load(f).get("state") or {}).get("positions") or {}
+                    if live_pos:
+                        m = (f"正式網帳本裡還有 {len(live_pos)} 筆持倉（{'、'.join(live_pos)}）。"
+                             f"它們仍在幣安、停損單仍有效，但模擬網模式不會追蹤或移損；切回正式網會自動接續。")
+                        sys.stderr.write(f"  ⚠ {m}\n")
+                        push_all("⚠ 正式網仍有持倉", m)
+            except Exception:
+                pass
+
         last_net = trader.STATE.get("lastNet")
         if last_net == "live" and not want_live:
             msg = ("上一次啟動是正式網，這次卻是模擬網。若不是你刻意切換，"

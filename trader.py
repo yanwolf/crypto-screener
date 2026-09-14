@@ -1036,6 +1036,21 @@ def save_state():
         pass
 
 
+def state_path(cache_dir, live):
+    """正式網與模擬網各自一份帳本。切換網路不會讓另一邊的部位被誤判平倉，
+    績效也永遠不會混在一起。"""
+    name = "trader.live.json" if live else "trader.testnet.json"
+    p = os.path.join(cache_dir, name)
+    # 相容：舊的單一帳本 trader.json 是模擬網時期的，第一次搬過去
+    legacy = os.path.join(cache_dir, "trader.json")
+    if not live and not os.path.exists(p) and os.path.exists(legacy):
+        try:
+            os.replace(legacy, p)
+        except OSError:
+            pass
+    return p
+
+
 def load_state(path):
     global STATE_FILE
     STATE_FILE = path
