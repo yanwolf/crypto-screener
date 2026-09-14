@@ -24,6 +24,25 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+# 進出場邏輯有實質改動時把這個版本號往上加，新交易會帶著它，
+# 績效就能分版本比較，不必靠記憶回想「那筆是改版前還是改版後」。
+STRATEGY_VERSION = "v2"         # 程式碼層的改動才手動加；參數改動會自動反映在標籤裡
+
+# 這些參數會影響交易結果；任何一個改了，就該算不同的策略
+PARAM_KEYS = ("stopMode", "stopAtrMult", "maxStopPct", "minStopPct",
+              "breakevenR", "trailR", "tp1R", "tp1Portion", "trailActivateR")
+
+
+def strategy_label(params=None, min_score=None):
+    """由程式版本 + 參數快照組成人看得懂的標籤。
+    同一組參數的交易會落在同一桶，參數一改就自動分桶。"""
+    p = params or {k: CFG.get(k) for k in PARAM_KEYS}
+    ms = min_score if min_score is not None else AUTO.get("minScore")
+    mode = {"tighter": "取近", "atr": "ATR", "ma": "均線"}.get(p.get("stopMode"), p.get("stopMode"))
+    return (f"{STRATEGY_VERSION}·{mode}{p.get('stopAtrMult')}×/{p.get('maxStopPct'):g}-{p.get('minStopPct'):g}%"
+            f"·移損{p.get('breakevenR'):g}R·回撤{p.get('trailR'):g}R"
+            f"·TP{p.get('tp1R'):g}R@{p.get('tp1Portion'):g}·門檻{ms}")
+
 TESTNET_BASE = "https://testnet.binancefuture.com"
 LIVE_BASE = "https://fapi.binance.com"
 
@@ -500,7 +519,10 @@ def open_position(symbol_base, side, entry_hint, stop, info=None, note="", stop_
         else:
             errs.append(f"移動停利掛單失敗：{r4.get('msg') or r4}")
 
+    params = {k: CFG.get(k) for k in PARAM_KEYS}
     pos = {
+        "version": strategy_label(params),
+        "params": params, "minScore": AUTO.get("minScore"),
         "symbol": sym, "side": side, "qty": qty, "entry": px,
         "stop": stop_px, "exits": exits, "sizing": detail,
         "orders": sub, "opened": int(time.time() * 1000),
@@ -643,6 +665,7 @@ def record_close(pos, exit_px, reason):
     STATE["trades"].append({
         "id": f"{pos['symbol']}-{int(time.time() * 1000)}",
         "excluded": False,
+        "version": pos.get("version") or "v1",
         "symbol": pos["symbol"], "side": pos["side"], "qty": pos["qty"],
         "entry": pos["entry"], "exit": exit_px, "pnl": round(pnl, 4),
         "rMultiple": round(pnl / r, 2) if r else None,
@@ -917,6 +940,35 @@ def manage_positions():
     return out
 
 
+def _stats(t):
+    """一組交易的核心統計。performance() 與分版本統計共用。"""
+    if not t:
+        return {"count": 0}
+    wins = [x for x in t if (x["pnl"] or 0) > 0]
+    losses = [x for x in t if (x["pnl"] or 0) <= 0]
+    win_r = [x["rMultiple"] for x in wins if x.get("rMultiple") is not None]
+    loss_r = [x["rMultiple"] for x in losses if x.get("rMultiple") is not None]
+    rs = [x["rMultiple"] for x in t if x.get("rMultiple") is not None]
+    avg_w = sum(win_r) / len(win_r) if win_r else 0.0
+    avg_l = sum(loss_r) / len(loss_r) if loss_r else 0.0
+    wr = len(wins) / len(t)
+    return {"count": len(t), "wins": len(wins), "winRate": round(wr * 100, 1),
+            "avgWinR": round(avg_w, 2), "avgLossR": round(avg_l, 2),
+            "payoff": round(abs(avg_w / avg_l), 2) if avg_l else None,
+            "expectancyR": round(wr * avg_w + (1 - wr) * avg_l, 3),
+            "totalR": round(sum(rs), 2) if rs else None}
+
+
+def performance_by_version():
+    """分策略版本的績效，讓改版前後可以直接比較。"""
+    groups = {}
+    for x in STATE["trades"]:
+        if x.get("excluded"):
+            continue
+        groups.setdefault(x.get("version") or "v1", []).append(x)
+    return {v: _stats(ts) for v, ts in sorted(groups.items())}
+
+
 def performance():
     """以 R 倍數為核心。大賺小賠的關鍵不是勝率，是平均獲利 R 要明顯大於
     平均虧損 R，所以這裡把兩者分開列出。
@@ -999,6 +1051,10 @@ def load_state(path):
             if not t.get("id"):
                 t["id"] = f"{t.get('symbol', 'X')}-{t.get('closed') or i}"
             t.setdefault("excluded", False)
+            if not t.get("version") or t["version"] in ("v1", "v2-atr"):
+                note = t.get("note") or ""
+                t["version"] = ("v2·早期（參數未記錄）" if ("（均線）" in note or "（ATR）" in note)
+                                else "v1·均線停損")
             if t.get("rMultiple") is not None:
                 t["rMultiple"] = round(float(t["rMultiple"]), 2)
             if t.get("pnl") is not None:
@@ -1046,6 +1102,8 @@ def status():
         "openPnl": round(sum((r.get("pnl") or 0) for r in pos), 2),
         "openR": round(sum((r.get("rMultiple") or 0) for r in pos), 2),
         "perf": performance(),
+        "perfByVersion": performance_by_version(),
+        "strategyVersion": strategy_label(),
         "trades": list(reversed(STATE["trades"][-100:])),
         "cfg": {k: v for k, v in CFG.items() if k not in ("key", "secret")},
         "lastRun": STATE["lastRun"],

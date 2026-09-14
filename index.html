@@ -6819,7 +6819,52 @@ function CryptoScreener() {
     style: {
       color: c
     }
-  }, v)))), /*#__PURE__*/React.createElement("div", {
+  }, v)))), trade.perfByVersion && Object.keys(trade.perfByVersion).length > 1 && /*#__PURE__*/React.createElement("div", {
+    className: "mt-3 pt-2.5",
+    style: {
+      borderTop: `1px solid ${C.line}`
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12,
+      color: C.bone,
+      marginBottom: 4
+    }
+  }, "分版本\u3000", /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 10.5,
+      color: C.muted
+    }
+  }, "目前 ", trade.strategyVersion)), Object.entries(trade.perfByVersion).map(([v, p]) => /*#__PURE__*/React.createElement("div", {
+    key: v,
+    className: "flex items-center gap-3 flex-wrap",
+    style: {
+      fontFamily: FONT.data,
+      fontSize: 11.5,
+      lineHeight: 1.9
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: v === trade.strategyVersion ? C.teal : C.muted,
+      fontSize: 10.5,
+      wordBreak: "break-all"
+    }
+  }, v, v === trade.strategyVersion ? "（目前）" : ""), /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: C.muted
+    }
+  }, p.count, " 筆"), /*#__PURE__*/React.createElement("span", null, "勝率 ", p.winRate, "%"), /*#__PURE__*/React.createElement("span", null, "賺賠 ", p.payoff ?? "—"), /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: (p.expectancyR ?? 0) > 0 ? UP : DOWN
+    }
+  }, "期望 ", p.expectancyR > 0 ? "+" : "", p.expectancyR, "R"))), /*#__PURE__*/React.createElement("div", {
+    className: "mt-1",
+    style: {
+      fontSize: 10.5,
+      color: C.muted,
+      lineHeight: 1.6
+    }
+  }, "標籤由參數自動組成：停損模式／ATR 倍數／距離上下限、移損、回撤、停利、分數門檻。 在介面改任何一項，之後的交易就自動歸入新桶，不必手動記版本。 樣本少時差異可能是行情而非策略，各累積 40 筆以上再下結論。")), /*#__PURE__*/React.createElement("div", {
     className: "mt-2.5",
     style: {
       fontSize: 11,
