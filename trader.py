@@ -522,7 +522,8 @@ AUTO = {
     "on": False,
     "maxPerDay": 6,            # 每日最多開幾筆
     "dailyLossR": -3.0,        # 當日累計虧損達 3R 就停止當天所有下單
-    "cooldownMin": 120,        # 同一檔幣平倉後多久才能再進
+    "cooldownMin": 120,        # 虧損平倉後多久才能再進（防報復性交易）
+    "cooldownWinMin": 15,      # 獲利平倉後多久才能再進（趨勢可能還在走，只擋掉同一根 K 的來回）
     "minScore": 62,            # 自動下單的分數門檻，比手動的 58 嚴格
     "day": None,               # 當前計算中的日期
     "opened": 0,               # 今日已開倉數
@@ -579,9 +580,12 @@ def auto_can_trade(symbol):
         detail += f"，持有 {held:.1f} 小時），不重複進場"
         return False, detail
     last = AUTO["lastClose"].get(symbol)
-    if last and (time.time() - last) < AUTO["cooldownMin"] * 60:
-        left = int((AUTO["cooldownMin"] * 60 - (time.time() - last)) / 60)
-        return False, f"剛平倉，冷卻中還剩 {left} 分鐘"
+    if last:
+        won = AUTO.get("lastCloseWin", {}).get(symbol, False)
+        cd = AUTO.get("cooldownWinMin", 15) if won else AUTO["cooldownMin"]
+        if (time.time() - last) < cd * 60:
+            left = int((cd * 60 - (time.time() - last)) / 60)
+            return False, f"剛{'獲利' if won else '虧損'}平倉，冷卻中還剩 {left} 分鐘（{'獲利後短冷卻' if won else '虧損後長冷卻'}）"
 
     # ── 全域額度 ──
     if AUTO["blocked"]:
@@ -647,6 +651,7 @@ def record_close(pos, exit_px, reason):
     })
     STATE["positions"].pop(pos["symbol"], None)
     AUTO["lastClose"][pos["symbol"]] = time.time()
+    AUTO.setdefault("lastCloseWin", {})[pos["symbol"]] = (STATE["trades"][-1].get("pnl") or 0) > 0
     rm = STATE["trades"][-1].get("rMultiple")
     if rm is not None:
         auto_roll_day()
@@ -1047,6 +1052,7 @@ def status():
         "symbols": len(_filters),
         "auto": {**{k: AUTO.get(k) for k in
                     ("on", "maxPerDay", "dailyLossR", "cooldownMin", "minScore",
-                     "opened", "closedR", "closedUsd", "blocked", "blockedAtR", "blockedAtUsd", "day")},
+                     "opened", "closedR", "closedUsd", "blocked", "blockedAtR", "blockedAtUsd", "day",
+                 "cooldownWinMin")},
                  "oneR": _one_r_usd()},
     }

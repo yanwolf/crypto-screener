@@ -838,7 +838,7 @@ def trade_handle(path, payload):
             trader.AUTO["on"] = bool(payload["on"])
             if trader.AUTO["on"]:
                 trader.AUTO["blocked"] = None      # 手動重啟時解除當日封鎖
-        for k in ("maxPerDay", "cooldownMin", "minScore"):
+        for k in ("maxPerDay", "cooldownMin", "cooldownWinMin", "minScore"):
             if k in payload:
                 trader.AUTO[k] = int(payload[k])
         if "dailyLossR" in payload:

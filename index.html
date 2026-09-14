@@ -6582,7 +6582,7 @@ function CryptoScreener() {
     }
   }, autoEdit ? "收起" : "調整")), autoEdit && /*#__PURE__*/React.createElement("div", {
     className: "mt-2"
-  }, [["maxPerDay", "每日最多開倉", [1, 2, 3, 4, 6, 10], "筆"], ["minScore", "分數門檻", [58, 62, 65, 70, 75, 80], "分"], ["dailyLossR", "當日停損上限", [1, 2, 3, 4, 5], "R"], ["cooldownMin", "平倉後冷卻", [30, 60, 120, 240, 480], "分鐘"]].map(([key, label, opts, unit]) => {
+  }, [["maxPerDay", "每日最多開倉", [1, 2, 3, 4, 6, 10], "筆"], ["minScore", "分數門檻", [58, 62, 65, 70, 75, 80], "分"], ["dailyLossR", "當日停損上限", [1, 2, 3, 4, 5], "R"], ["cooldownMin", "虧損平倉後冷卻", [30, 60, 120, 240, 480], "分鐘"], ["cooldownWinMin", "獲利平倉後冷卻", [0, 15, 30, 60], "分鐘"]].map(([key, label, opts, unit]) => {
     const cur = key === "dailyLossR" ? Math.abs(trade.auto.dailyLossR ?? 3) : trade.auto[key];
     return /*#__PURE__*/React.createElement("div", {
       key: key,
@@ -6785,7 +6785,7 @@ function CryptoScreener() {
       color: C.muted,
       lineHeight: 1.7
     }
-  }, "由背景監控觸發，套用與畫面相同的證據檢查，但分數門檻更嚴（", trade.auto.minScore, " 分）。 開倉與平倉都會推播 Telegram。同一檔平倉後 ", trade.auto.cooldownMin, " 分鐘內不再進場。 當日虧損達 ", trade.auto.dailyLossR, "R 會自動停止，隔日（UTC）重置。")), trade.perf && trade.perf.count > 0 ? /*#__PURE__*/React.createElement("div", {
+  }, "由背景監控觸發，套用與畫面相同的證據檢查，但分數門檻更嚴（", trade.auto.minScore, " 分）。 開倉與平倉都會推播 Telegram。同一檔虧損平倉後 ", trade.auto.cooldownMin, " 分鐘、獲利平倉後 ", trade.auto.cooldownWinMin ?? 15, " 分鐘內不再進場。 當日虧損達 ", trade.auto.dailyLossR, "R 會自動停止，隔日（UTC）重置。")), trade.perf && trade.perf.count > 0 ? /*#__PURE__*/React.createElement("div", {
     className: "mt-3 rounded p-3",
     style: {
       background: C.panel2,
