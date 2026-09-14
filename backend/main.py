@@ -55,6 +55,10 @@ import urllib.parse
 import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+# 前端建置結果的位置。開發時是 ../frontend/dist，Docker 映像裡是 backend/static
+STATIC_DIR = os.environ.get("STATIC_DIR") or next(
+    (p for p in (os.path.join(HERE, "static"), os.path.join(HERE, "..", "frontend", "dist"))
+     if os.path.exists(os.path.join(p, "index.html"))), os.path.join(HERE, "static"))
 PUBLIC_BASE = "https://api.coingecko.com/api/v3"
 PRO_BASE = "https://pro-api.coingecko.com/api/v3"
 # 鏈上資料來源：熱度用 GeckoTerminal，合約安全用 GoPlus
@@ -1327,7 +1331,7 @@ def fetch_upstream(path_qs: str, prefix: str = "/api/v3"):
 
 class Handler(http.server.SimpleHTTPRequestHandler):
     def __init__(self, *a, **kw):
-        super().__init__(*a, directory=HERE, **kw)
+        super().__init__(*a, directory=STATIC_DIR, **kw)
 
     # ── 路由 ──────────────────────────────────────────────
     def do_GET(self):
@@ -1395,7 +1399,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             if self.path.startswith(prefix + "/"):
                 return self.handle_proxy(prefix)
         if self.path in ("/", ""):
-            self.path = "/index.html" if os.path.exists(os.path.join(HERE, "index.html")) else "/crypto-screener.html"
+            self.path = "/index.html"
         return super().do_GET()
 
     def do_POST(self):
@@ -1853,8 +1857,8 @@ def main():
         print(f"        以每 {CFG['gap']} 秒一次估算，首輪約需 {args.prefetch * CFG['gap'] / 60:.0f} 分鐘")
         threading.Thread(target=prefetch_worker, args=(args.prefetch, args.prefetch_ttl), daemon=True).start()
 
-    if not any(os.path.exists(os.path.join(HERE, f)) for f in ("index.html", "crypto-screener.html")):
-        print(f"  ! 找不到 index.html，請把頁面檔放到 {HERE}")
+    if not os.path.exists(os.path.join(STATIC_DIR, "index.html")):
+        print(f"  ! 找不到 index.html（{STATIC_DIR}）。開發時先到 frontend 執行 npm run build")
 
     hosted = bool(os.environ.get("PORT"))          # Zeabur、Railway 等平台會設這個變數
     host = "0.0.0.0" if (args.lan or hosted) else "127.0.0.1"
