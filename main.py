@@ -997,7 +997,7 @@ def live_checklist():
         ("RISK_PCT ≤ 1", bool(trader) and trader.CFG["riskPct"] <= 1.0),
         ("LEVERAGE ≤ 5", bool(trader) and trader.CFG["leverage"] <= 5),
         ("ALLOW_LIVE=1", os.environ.get("ALLOW_LIVE", "") == "1"),
-        ("Dockerfile CMD 帶 --live", "--live" in sys.argv),
+        ("EXTRA_ARGS 含 --live", "--live" in sys.argv),
         ("Telegram 已配對", bool(_tg.get("chats"))),
     ]
     # 需要金鑰才查得到的兩項：查不到就標「未知」而不是失敗
@@ -1764,6 +1764,21 @@ def main():
         trader.CFG["maxPositions"] = max(1, min(20, args.max_positions))
         trader.load_state(os.path.join(CACHE_DIR, "trader.json"))
         net = "正式網（真實資金）" if want_live else "模擬網 Testnet"
+
+        # 上次跑的是正式網、這次卻是模擬網：多半是部署設定被覆蓋了。
+        # 真實部位還在幣安但這裡不再追蹤，必須大聲警告。
+        last_net = trader.STATE.get("lastNet")
+        if last_net == "live" and not want_live:
+            msg = ("上一次啟動是正式網，這次卻是模擬網。若不是你刻意切換，"
+                   "請檢查 Zeabur 的 ALLOW_LIVE 與 EXTRA_ARGS 是否還在。"
+                   "真實部位仍在幣安、停損單仍有效，但伺服器已不再追蹤它們。")
+            sys.stderr.write(f"\n  ⚠⚠ {msg}\n\n")
+            try:
+                push_all("⚠ 網路別異常", msg)
+            except Exception:
+                pass
+        trader.STATE["lastNet"] = "live" if want_live else "testnet"
+        trader.save_state()
         if trader.CFG["key"]:
             sys.stderr.write(f"  交易　{net}　風險 {args.risk_pct}%/筆　槓桿 {args.leverage}x　"
                              f"同時持倉上限 {trader.CFG['maxPositions']}　（連線資訊背景載入中）\n")

@@ -970,7 +970,7 @@ def save_state():
         return
     try:
         with open(STATE_FILE, "w") as f:
-            json.dump({"state": {k: STATE[k] for k in ("enabled", "positions", "trades")},
+            json.dump({"state": {k: STATE.get(k) for k in ("enabled", "positions", "trades", "lastNet")},
                        "auto": AUTO,
                        # 金鑰與網路別刻意不存：金鑰只該在環境變數，
                        # 網路別只該由啟動參數決定，避免存檔把正式網狀態帶回來
@@ -989,6 +989,7 @@ def load_state(path):
         STATE["enabled"] = st.get("enabled", False)
         STATE["positions"] = st.get("positions", {})
         STATE["trades"] = st.get("trades", [])
+        STATE["lastNet"] = st.get("lastNet")
         for i, t in enumerate(STATE["trades"]):
             if not t.get("id"):
                 t["id"] = f"{t.get('symbol', 'X')}-{t.get('closed') or i}"
