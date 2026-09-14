@@ -56,6 +56,10 @@ import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 # 前端建置結果的位置。開發時是 ../frontend/dist，Docker 映像裡是 backend/static
+# 第二個服務（例如模擬網）可以設 CG_UPSTREAM=https://正式網服務網址，
+# 把 CoinGecko 請求與深度資料時間戳都轉給它：共用快取與月額度，一份額度兩個服務。
+CG_UPSTREAM = os.environ.get("CG_UPSTREAM", "").strip().rstrip("/")
+
 STATIC_DIR = os.environ.get("STATIC_DIR") or next(
     (p for p in (os.path.join(HERE, "static"), os.path.join(HERE, "..", "frontend", "dist"))
      if os.path.exists(os.path.join(p, "index.html"))), os.path.join(HERE, "static"))
@@ -1251,11 +1255,6 @@ def effective_gap() -> float:
     return max(CFG["gap"], 6.0) if keyless_now() else CFG["gap"]
 
 
-# 第二個服務（例如模擬網）可以設 CG_UPSTREAM=https://正式網服務網址，
-# 把 CoinGecko 請求轉給它：共用快取與月額度，兩個服務只耗一份。
-CG_UPSTREAM = os.environ.get("CG_UPSTREAM", "").strip().rstrip("/")
-
-
 def upstream_url(path_qs: str) -> str:
     if CG_UPSTREAM:
         return CG_UPSTREAM + "/api/v3" + path_qs        # 對方會自己附金鑰
@@ -1337,7 +1336,17 @@ class Handler(http.server.SimpleHTTPRequestHandler):
     def do_GET(self):
         p = self.path.split("?")[0]
         if p == "/api/deep/ts":
-            body = json.dumps(deep_ts_map()).encode()
+            # 有上游時，深度資料的時間戳以上游為準——資料本來就在那邊
+            if CG_UPSTREAM:
+                try:
+                    req = urllib.request.Request(CG_UPSTREAM + "/api/deep/ts",
+                                                 headers={"User-Agent": "crypto-screener/relay"})
+                    with urllib.request.urlopen(req, timeout=10) as r:
+                        body = r.read()
+                except Exception:
+                    body = b"{}"
+            else:
+                body = json.dumps(deep_ts_map()).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Access-Control-Allow-Origin", "*")
@@ -1357,6 +1366,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 "pro": CFG["pro"], "engine": bool(engine),
                 "monitor": MON["on"], "cached": len(_cache),
                 "quotaExhausted": QUOTA["exhausted"], "keyless": keyless_now(),
+                "dataSource": CG_UPSTREAM or "direct",
                 "live": bool(trader and trader.CFG["live"]),
                 "liveChecklist": live_checklist(),
                 "disk": (len(os.listdir(CACHE_DIR)) if os.path.isdir(CACHE_DIR) else 0),
