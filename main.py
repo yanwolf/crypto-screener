@@ -477,7 +477,12 @@ def notify_trade_close(t):
     return head, "\n".join(lines)
 
 
+NOTIFY_PREFIX = os.environ.get("NOTIFY_PREFIX", "").strip()
+
+
 def push_all(title, text):
+    if NOTIFY_PREFIX:
+        title = f"{NOTIFY_PREFIX} {title}"
     for fn in (notify_telegram, notify_discord, notify_email):
         try:
             fn(title, text)
@@ -1242,7 +1247,14 @@ def effective_gap() -> float:
     return max(CFG["gap"], 6.0) if keyless_now() else CFG["gap"]
 
 
+# 第二個服務（例如模擬網）可以設 CG_UPSTREAM=https://正式網服務網址，
+# 把 CoinGecko 請求轉給它：共用快取與月額度，兩個服務只耗一份。
+CG_UPSTREAM = os.environ.get("CG_UPSTREAM", "").strip().rstrip("/")
+
+
 def upstream_url(path_qs: str) -> str:
+    if CG_UPSTREAM:
+        return CG_UPSTREAM + "/api/v3" + path_qs        # 對方會自己附金鑰
     keyless = keyless_now()
     base = PRO_BASE if (CFG["pro"] and not keyless) else PUBLIC_BASE
     url = base + path_qs
@@ -1815,6 +1827,10 @@ def main():
         else:
             sys.stderr.write(f"  交易　未設定 BN_KEY／BN_SECRET，模擬單功能停用（{net}）\n")
 
+    if CG_UPSTREAM:
+        sys.stderr.write(f"  上游　CoinGecko 請求轉給 {CG_UPSTREAM}（共用快取與額度）\n")
+    if NOTIFY_PREFIX:
+        sys.stderr.write(f"  通知　前綴「{NOTIFY_PREFIX}」\n")
     threading.Thread(target=selftest, daemon=True).start()
     threading.Thread(target=cleanup_worker, daemon=True).start()
     if trader:
