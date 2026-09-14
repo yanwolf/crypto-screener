@@ -78,6 +78,9 @@ export default function RadarPage({ s }) {
                 </span>
               )}
               {batch.running && <span style={{ color: C.teal }}>掃描中 {batch.done}/{batch.total}</span>}
+              {srvRefresh && srvRefresh.n === 0 && srvRefresh.source && srvRefresh.source !== "direct" && (
+                <span style={{ color: C.muted, fontFamily: FONT.data }}>深度資料由 {srvRefresh.source} 供應</span>
+              )}
               {srvRefresh && srvRefresh.n > 0 && (
                 <span style={{ color: C.muted, fontFamily: FONT.data }}>
                   伺服器滾動補抓　新鮮 <span style={{ color: C.teal }}>{srvRefresh.fresh}</span>

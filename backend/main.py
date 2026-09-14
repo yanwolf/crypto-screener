@@ -1371,9 +1371,10 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 "liveChecklist": live_checklist(),
                 "disk": (len(os.listdir(CACHE_DIR)) if os.path.isdir(CACHE_DIR) else 0),
                 "diskMB": cache_disk_mb(),
-                "refresh": {k: REFRESH[k] for k in
-                            ("last", "lastTs", "callsToday", "budget", "interval",
-                             "fresh", "stale", "never", "n")},
+                "refresh": {**{k: REFRESH[k] for k in
+                               ("last", "lastTs", "callsToday", "budget", "interval",
+                                "fresh", "stale", "never", "n")},
+                            "source": CG_UPSTREAM or "direct"},
                 "gap": CFG["gap"], "uptime": int(time.time() - START_TS),
             }
             if "probe=1" in (self.path.split("?", 1)[1] if "?" in self.path else ""):

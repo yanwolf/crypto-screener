@@ -310,6 +310,9 @@ function CryptoScreener() {
         const t0 = Date.now();
         const r = await withTimeout(fetch("/api/health?probe=1", { cache: "no-store" }), 20000, "health");
         const j = await r.json();
+        if (j.dataSource && j.dataSource !== "direct")
+          push(`資料來源：CoinGecko 請求轉發至 ${j.dataSource}（共用它的快取與額度）`, null);
+        if (j.keyless) push("目前為無金鑰降級模式：Demo 月額度已用盡，改走公開端點。每 6 小時會自動試著切回金鑰。", null);
         push(`伺服器在線（${Date.now() - t0}ms）　金鑰${j.hasKey ? `已設定（${j.keyLen} 字元${j.pro ? " · Pro" : ""}）` : "未設定"}　`
           + `記憶體快取 ${j.cached} 筆　磁碟快取 ${j.disk ?? "?"} 筆　已運行 ${Math.floor((j.uptime || 0) / 60)} 分`, true);
 
