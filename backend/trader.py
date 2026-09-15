@@ -100,8 +100,29 @@ def _sign(params: dict) -> str:
     return q + "&signature=" + sig
 
 
-def _request(method, path, params=None, signed=False, timeout=15):
-    """回傳 (status, data)。data 解析失敗時是原始文字。"""
+MODE_MISMATCH = {-4061, -1106}   # -4061 positionSide 與帳戶模式不符；-1106 帶了不該帶的參數
+
+
+def _request(method, path, params=None, signed=False, timeout=15, _retried=False):
+    """回傳 (status, data)。data 解析失敗時是原始文字。
+
+    帳戶持倉模式可能在快取的 5 分鐘內被別的程式切換，這時下單會被 -4061 / -1106 拒絕。
+    遇到就強制重新偵測模式、依 _pos/_kind 重組方向參數、原單重送一次，不等快取過期。
+    """
+    params = dict(params or {})
+    meta = {k: params.pop(k) for k in list(params) if k.startswith("_")}
+    st, d = _request_raw(method, path, params, signed, timeout)
+    code = d.get("code") if isinstance(d, dict) else None
+    if (not _retried and meta.get("_kind") and code in MODE_MISMATCH):
+        hedge = hedge_mode(force=True)
+        for k in ("positionSide", "reduceOnly", "closePosition"):
+            params.pop(k, None)
+        params.update(_mode_keys(meta["_kind"], meta["_pos"], hedge))
+        return _request(method, path, params, signed, timeout, _retried=True)
+    return st, d
+
+
+def _request_raw(method, path, params, signed, timeout):
     params = dict(params or {})
     if signed:
         if not CFG["key"] or not CFG["secret"]:
@@ -228,8 +249,8 @@ def mark_price(symbol):
 
 
 def position_mode():
-    """單向或雙向持倉。程式下單不帶 positionSide，只支援單向；
-    雙向模式會被幣安拒單，所以上線前要確認。回傳 'oneway' / 'hedge' / None。"""
+    """單向或雙向持倉。兩種都支援：下單參數由 hedge_mode() 自動適配。
+    回傳 'oneway' / 'hedge' / None。"""
     st, d = _request("GET", "/fapi/v1/positionSide/dual", signed=True)
     if st == 200 and isinstance(d, dict) and "dualSidePosition" in d:
         return "hedge" if d["dualSidePosition"] else "oneway"
@@ -420,22 +441,31 @@ def hedge_mode(force=False):
     return bool(_mode["hedge"])
 
 
+def _mode_keys(kind, side, hedge):
+    """依模式產生該張單需要的方向參數。kind: entry / reduce / close。"""
+    if kind == "entry":
+        return {"positionSide": side} if hedge else {}
+    if kind == "reduce":
+        return {"positionSide": side} if hedge else {"reduceOnly": "true"}
+    d = {"closePosition": "true"}
+    if hedge:
+        d["positionSide"] = side
+    return d
+
+
 def _ps(side):
-    """進場單的方向參數。"""
-    return {"positionSide": side} if hedge_mode() else {}
+    """進場單的方向參數。_pos/_kind 是給 _request 重送用的標記，送出前會剝掉。"""
+    return {"_pos": side, "_kind": "entry", **_mode_keys("entry", side, hedge_mode())}
 
 
 def _reduce(side):
     """帶數量的平倉單（停利、移動停利、市價平倉）。"""
-    return {"positionSide": side} if hedge_mode() else {"reduceOnly": "true"}
+    return {"_pos": side, "_kind": "reduce", **_mode_keys("reduce", side, hedge_mode())}
 
 
 def _close_all(side):
     """closePosition=true 的停損單。"""
-    d = {"closePosition": "true"}
-    if hedge_mode():
-        d["positionSide"] = side
-    return d
+    return {"_pos": side, "_kind": "close", **_mode_keys("close", side, hedge_mode())}
 
 
 def _my_side_rows(rows, symbol, side):
