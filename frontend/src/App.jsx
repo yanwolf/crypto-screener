@@ -409,7 +409,7 @@ function CryptoScreener() {
         setScans((prev) => ({ ...prev, [c.id]: extractScan(chart, c.vol) }));
       } catch (e) {
         if (e.message === "RATE" || e.message === "BLOCKED" || e.message === "NOPROXY") { setError(errText(e)); break; }
-        setScans((prev) => ({ ...prev, [c.id]: { err: true } }));
+        setScans((prev) => ({ ...prev, [c.id]: { err: true, errWhy: errText(e).slice(0, 40), ts: Date.now() } }));
       }
       setBatch((b) => ({ ...b, done: i + 1 }));
     }
@@ -822,8 +822,11 @@ function CryptoScreener() {
   const scannedCount = useMemo(() => Object.values(activeScans).filter((s) => s && !s.err).length, [activeScans]);
 
   /* 待掃佇列：先未掃、再過期，兩者都依預篩分數排序 */
+  const ERR_RETRY_MS = 6 * 3600000;    // 失敗的幣 6 小時後才再試（新幣要等歷史累積）
   const queue = useMemo(() => {
-    const un = universe.filter((r) => !r.scanned).sort((a, b) => (b.pre ?? 0) - (a.pre ?? 0));
+    const now = Date.now();
+    const recentlyFailed = (r) => r.scanErr && r.scanErrAt && now - r.scanErrAt < ERR_RETRY_MS;
+    const un = universe.filter((r) => !r.scanned && !recentlyFailed(r)).sort((a, b) => (b.pre ?? 0) - (a.pre ?? 0));
     const st = universe.filter((r) => r.scanned && r.stale).sort((a, b) => (b.pre ?? 0) - (a.pre ?? 0));
     return [...un, ...st];
   }, [universe]);
@@ -833,9 +836,10 @@ function CryptoScreener() {
     // 拆成三種狀態：新鮮（保鮮期內）、過期（掃過但超過保鮮期）、從未掃描
     const fresh = universe.filter((r) => r.scanned && !r.stale).length;
     const stale = universe.filter((r) => r.scanned && r.stale).length;
-    const never = universe.filter((r) => !r.scanned).length;
+    const failed = universe.filter((r) => r.scanErr).length;
+    const never = universe.filter((r) => !r.scanned && !r.scanErr).length;
     const gap = cfg.local ? 0.25 : cfg.key ? 0.9 : 2.4;   // 秒
-    return { done: fresh, fresh, stale, never, n, pct: (fresh / n) * 100,
+    return { done: fresh, fresh, stale, never, failed, n, pct: (fresh / n) * 100,
              todo: queue.length, etaMin: (queue.length * gap) / 60 };
   }, [universe, queue, cfg]);
 

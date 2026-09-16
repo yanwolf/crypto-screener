@@ -78,6 +78,11 @@ export default function RadarPage({ s }) {
                 </span>
               )}
               {batch.running && <span style={{ color: C.teal }}>掃描中 {batch.done}/{batch.total}</span>}
+              {coverage.failed > 0 && (
+                <span style={{ color: C.muted, fontFamily: FONT.data }}>
+                  無法分析 {coverage.failed} 檔（多為上市未滿 90 天的新幣，6 小時後自動重試）
+                </span>
+              )}
               {srvRefresh && srvRefresh.n === 0 && srvRefresh.source && srvRefresh.source !== "direct" && (
                 <span style={{ color: C.muted, fontFamily: FONT.data }}>深度資料由 {srvRefresh.source} 供應</span>
               )}

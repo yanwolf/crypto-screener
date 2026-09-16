@@ -68,7 +68,9 @@ function structure(bars) {
 function extractScan(chart, curVol) {
   const P = (chart.prices || []).map((r) => r[1]).filter(isFinite);
   const V = (chart.total_volumes || []).map((r) => r[1]).filter(isFinite);
-  if (P.length < 48 || V.length < 48) return { err: true };
+  // 歷史不足（多半是剛上市的新幣）：記下時間，讓掃描佇列一段時間內不要重試，
+  // 否則它會永遠排在最前面，把後面所有幣卡住。
+  if (P.length < 48 || V.length < 48) return { err: true, errWhy: "歷史不足 90 天", ts: Date.now() };
   const n = V.length, perDay = Math.max(1, Math.round(n / 90));
   const at = (arr, daysBack) => arr.slice(Math.max(0, arr.length - daysBack * perDay));
   const now = curVol != null && isFinite(curVol) ? curVol : V[n - 1];
@@ -112,7 +114,13 @@ function extractScan(chart, curVol) {
 /* ════ 雷達評分與白話解讀 ════════════════════════════════ */
 function analyze(r, sc) {
   const o = { ...r, scanned: !!(sc && !sc.err) };
-  if (!o.scanned) return { ...o, stage: "unknown", bearStage: "unknown", bladeState: "none", radar: null, bear: null, liq: null, reasons: [], bearReasons: [], why: "尚未掃描", bearWhy: "尚未掃描" };
+  if (!o.scanned) {
+    const errAt = sc && sc.err ? (sc.ts || null) : null;
+    const why = sc && sc.err ? `無法分析（${sc.errWhy || "資料取得失敗"}）` : "尚未掃描";
+    return { ...o, scanErr: !!(sc && sc.err), scanErrAt: errAt, scanTs: null,
+             stage: "unknown", bearStage: "unknown", bladeState: "none", radar: null, bear: null, liq: null,
+             reasons: [], bearReasons: [], why, bearWhy: why };
+  }
 
   Object.assign(o, sc);   // 量能與趨勢結構欄位一併帶進來
   /* 基準量來自歷史（變化慢、可快取），現量來自每 90 秒更新的行情端點。
