@@ -864,6 +864,77 @@ def enrich_positions():
     return rows
 
 
+
+
+# ── 影子追蹤：被持倉上限擋掉的訊號後來怎麼了 ──────────────────
+#
+# 「上限擋掉高分訊號很可惜」是感覺；這裡把它變成數字。
+# 被擋的訊號記下進場價與停損距離，72 小時後用逐時價格回頭算：
+# 先碰到停損（-1R）、先碰到 2R、還是都沒碰到（以 72 小時收盤算 R）。
+# 累積一批之後，就知道上限到底擋掉了多少期望值，再決定要不要調。
+
+MISSED = []          # 每筆 {sym, cid, side, price, stopPct, score, ts, result, r}
+
+
+def missed_record(sym, cid, side, price, stop_pct, score, why):
+    MISSED.append({"sym": sym, "cid": cid, "side": side, "price": price,
+                   "stopPct": stop_pct, "score": score, "why": why,
+                   "ts": int(time.time() * 1000), "result": None, "r": None})
+    del MISSED[:-200]
+    save_state()
+
+
+def missed_evaluate(hourly_prices_fn, horizon_h=72):
+    """對超過 72 小時、尚未評估的紀錄回頭算結果。
+    hourly_prices_fn(cid) 回傳 [(ts_ms, price), ...]（逐時，由 main.py 提供快取的 market_chart）。"""
+    now = time.time() * 1000
+    done = 0
+    for m in MISSED:
+        if m["result"] is not None or now - m["ts"] < horizon_h * 3600000:
+            continue
+        try:
+            series = hourly_prices_fn(m["cid"]) or []
+        except Exception:
+            continue
+        pts = [(t, p) for t, p in series if t >= m["ts"] and t <= m["ts"] + horizon_h * 3600000]
+        if len(pts) < 6:
+            continue
+        sgn = 1 if m["side"] == "LONG" else -1
+        entry = m["price"]
+        r_unit = entry * m["stopPct"] / 100.0
+        stop = entry - sgn * r_unit
+        tp2 = entry + sgn * 2 * r_unit
+        res, r = "none", None
+        for _, p in pts:
+            if (p - stop) * sgn <= 0:
+                res, r = "stop", -1.0
+                break
+            if (p - tp2) * sgn >= 0:
+                res, r = "tp2", 2.0
+                break
+        if res == "none":
+            r = round((pts[-1][1] - entry) * sgn / r_unit, 2)
+        m["result"], m["r"] = res, r
+        done += 1
+    if done:
+        save_state()
+    return done
+
+
+def missed_summary():
+    ev = [m for m in MISSED if m["result"] is not None]
+    pend = [m for m in MISSED if m["result"] is None]
+    if not ev:
+        return {"evaluated": 0, "pending": len(pend)}
+    rs = [m["r"] for m in ev]
+    return {"evaluated": len(ev), "pending": len(pend),
+            "tp2": sum(1 for m in ev if m["result"] == "tp2"),
+            "stop": sum(1 for m in ev if m["result"] == "stop"),
+            "none": sum(1 for m in ev if m["result"] == "none"),
+            "avgR": round(sum(rs) / len(rs), 2), "totalR": round(sum(rs), 2),
+            "recent": [{k: m[k] for k in ("sym", "side", "score", "result", "r", "ts")} for m in ev[-10:]]}
+
+
 # ── 績效統計 ────────────────────────────────────────────────
 
 
@@ -1121,6 +1192,7 @@ def save_state():
     try:
         with open(STATE_FILE, "w") as f:
             json.dump({"state": {k: STATE.get(k) for k in ("enabled", "positions", "trades", "lastNet")},
+                       "missed": MISSED,
                        "auto": AUTO,
                        # 金鑰與網路別刻意不存：金鑰只該在環境變數，
                        # 網路別只該由啟動參數決定，避免存檔把正式網狀態帶回來
@@ -1173,6 +1245,7 @@ def load_state(path):
         for k, v in (d.get("cfg") or {}).items():
             if k in PERSIST_CFG and v is not None:
                 CFG[k] = v
+        MISSED[:] = d.get("missed") or []
     except Exception:
         pass
 
@@ -1212,6 +1285,7 @@ def status():
         "openR": round(sum((r.get("rMultiple") or 0) for r in pos), 2),
         "perf": performance(),
         "perfByVersion": performance_by_version(),
+        "missed": missed_summary(),
         "strategyVersion": strategy_label(),
         "trades": list(reversed(STATE["trades"][-100:])),
         "cfg": {k: v for k, v in CFG.items() if k not in ("key", "secret")},

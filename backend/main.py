@@ -683,6 +683,13 @@ def auto_try_trade(ev, row):
     if r.get("skipped"):
         why = r.get("error") or ""
         stage = "holding" if "已有部位" in why else "cooldown" if "冷卻" in why else "risk"
+        # 被持倉上限擋掉的，記進影子追蹤，之後回頭看它們的表現
+        if "持倉已達" in why:
+            try:
+                trader.missed_record(sym, row.get("id"), "SHORT" if bear else "LONG",
+                                     price, pct, score, why)
+            except Exception:
+                pass
         return {"stage": stage, "why": why}
     return {"stage": "failed", "why": r.get("error")}
 
@@ -709,6 +716,21 @@ def fetch_deriv_server(base, chg24):
         "chg24": chg24,
     })
 
+
+
+def hourly_prices(cid):
+    """給影子追蹤用：從快取（或補抓）取 90 天逐時價格。"""
+    key = _deep_key(cid)
+    body, _ = cache_peek(key)
+    if body is None:
+        st, body = fetch_upstream(f"/coins/{cid}/market_chart?vs_currency=usd&days=90")
+        if st != 200:
+            return None
+        cache_put(key, body)
+    try:
+        return [(int(t), float(p)) for t, p in json.loads(body).get("prices", [])]
+    except Exception:
+        return None
 
 
 def position_worker(every_s=20):
@@ -772,6 +794,11 @@ def monitor_worker(interval_min):
         try:
             if MON["on"]:
                 mon_run_once()          # 額度用盡會自動降級為無金鑰，仍可續跑
+            if trader:
+                try:
+                    trader.missed_evaluate(hourly_prices)
+                except Exception as e:
+                    sys.stderr.write(f"  ~ 影子追蹤評估失敗：{e}\n")
 
                 MON["lastError"] = None
         except Exception as e:

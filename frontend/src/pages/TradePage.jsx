@@ -161,6 +161,39 @@ export default function TradePage({ s }) {
               )}
             </div>
 
+            {/* 影子追蹤：被持倉上限擋掉的訊號後來怎麼了 */}
+            {trade.missed && (trade.missed.evaluated > 0 || trade.missed.pending > 0) && (
+              <div className="mt-3 rounded p-3" style={{ background: C.panel2, border: `1px solid ${C.line}` }}>
+                <div className="flex items-center gap-2 flex-wrap">
+                  <span style={{ fontFamily: FONT.display, fontSize: 13 }}>被持倉上限擋掉的訊號</span>
+                  <span style={{ fontSize: 11, color: C.muted }}>
+                    已評估 {trade.missed.evaluated}　待評估 {trade.missed.pending}
+                  </span>
+                </div>
+                {trade.missed.evaluated > 0 ? (
+                  <>
+                    <div className="mt-2 grid grid-cols-2 gap-x-4 gap-y-1" style={{ fontFamily: FONT.data, fontSize: 12 }}>
+                      <div className="flex justify-between"><span style={{ color: C.muted }}>72h 內到 2R</span><span style={{ color: UP }}>{trade.missed.tp2}</span></div>
+                      <div className="flex justify-between"><span style={{ color: C.muted }}>先碰停損</span><span style={{ color: DOWN }}>{trade.missed.stop}</span></div>
+                      <div className="flex justify-between"><span style={{ color: C.muted }}>都沒碰到</span><span>{trade.missed.none}</span></div>
+                      <div className="flex justify-between"><span style={{ color: C.muted }}>平均</span>
+                        <span style={{ color: trade.missed.avgR > 0 ? UP : trade.missed.avgR < 0 ? DOWN : C.bone }}>
+                          {trade.missed.avgR > 0 ? "+" : ""}{trade.missed.avgR}R
+                        </span></div>
+                    </div>
+                    <div className="mt-2" style={{ fontSize: 10.5, color: C.muted, lineHeight: 1.7 }}>
+                      這是「如果沒有上限會怎樣」的近似：用逐時收盤價回算，先碰停損記 -1R、先到 2R 記 +2R，都沒碰到以 72 小時收盤算。
+                      沒有模擬移損與移動停利，實際會略好於此。累積 20 筆以上再比：若平均 R 明顯高於已成交的期望值，才值得調高上限。
+                    </div>
+                  </>
+                ) : (
+                  <div className="mt-1.5" style={{ fontSize: 11, color: C.muted }}>
+                    被擋掉的訊號會在 72 小時後用歷史價格回算結果，累積後顯示在這裡。
+                  </div>
+                )}
+              </div>
+            )}
+
             {/* 自動下單 */}
             {trade.auto && (
               <div className="mt-3 rounded p-3"
