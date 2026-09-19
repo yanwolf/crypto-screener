@@ -1144,7 +1144,8 @@ def upstream_probe():
 # 狀態檔（Telegram 配對、監控設定、交易紀錄）絕對不能刪，
 # 它們跟快取放在同一個目錄，靠固定檔名保護。
 
-PROTECTED = {"telegram.json", "monitor.json", "trader.json", "trader.live.json", "trader.testnet.json"}
+PROTECTED = {"telegram.json", "monitor.json", "trader.json", "trader.live.json",
+             "trader.testnet.json", "last_startup.json"}
 
 LAST_CLEAN = {"ts": None, "removed": 0, "freedMB": 0.0, "by": None}
 
@@ -1928,13 +1929,64 @@ def main():
         sys.stderr.write(f"  通知　前綴「{NOTIFY_PREFIX}」\n")
     threading.Thread(target=selftest, daemon=True).start()
     threading.Thread(target=cleanup_worker, daemon=True).start()
-    if LIVE_BLOCKED:
-        def _warn_live():
-            time.sleep(8)
-            push_all("⚠ 正式網未啟動", "設定了 --live 但條件不足，已降級為模擬網並停用下單：\n"
-                     + "\n".join("· " + p for p in LIVE_BLOCKED)
-                     + "\n補齊後重新部署即可。資料代理與雷達仍正常運作。")
-        threading.Thread(target=_warn_live, daemon=True).start()
+    def _startup_report():
+        """啟動後推一則狀態摘要。正常與異常都推——
+        只有壞消息會通知的話，沒消息時分不出是『一切正常』還是『服務掛了』。
+        同樣內容 6 小時內不重複，避免連續部署洗版。"""
+        time.sleep(12)          # 等背景的連線與帳戶資訊載入
+        live = bool(trader and trader.CFG["live"])
+        lines = []
+        head = "正式網運作中" if live else "模擬網運作中"
+        if LIVE_BLOCKED:
+            head = "⚠ 正式網未啟動，已降級為模擬網"
+            lines += ["設定了 --live 但條件不足，下單已停用："]
+            lines += ["· " + p for p in LIVE_BLOCKED]
+            lines.append("")
+
+        if trader and trader.CFG["key"]:
+            b, err = trader.account_balance(max_age=0)
+            if b:
+                lines.append(f"帳戶　權益 {b['equity']:,.2f} U　可用 {b['avail']:,.2f} U")
+                cs, _ = trader.capital_state()
+                if cs:
+                    lines.append(f"本金　階梯 {cs['tier']:,.0f} U × {cs['usablePct']}% ＝ 可動用 {cs['usable']:,.0f} U")
+            else:
+                lines.append(f"帳戶　查不到餘額（{err}）")
+            n = len(trader.STATE["positions"])
+            a = trader.AUTO
+            lines.append(f"持倉　{n} 筆　自動下單 {'啟用' if a['on'] else '關閉'}"
+                         f"（風險 {trader.CFG['riskPct']}%/筆　槓桿 {trader.CFG['leverage']}x　"
+                         f"上限 {trader.CFG['maxPositions']} 筆）")
+            p = trader.performance()
+            if p.get("count"):
+                lines.append(f"績效　{p['count']} 筆　勝率 {p['winRate']}%　"
+                             f"賺賠 {p.get('payoff') or '—'}　期望 {p['expectancyR']:+.3f}R")
+        else:
+            lines.append("交易　未設定幣安金鑰，僅作為雷達與資料服務")
+
+        mon = "運作中" if MON["on"] else "未啟用"
+        lines.append(f"監控　{mon}　資料來源 {CG_UPSTREAM or 'CoinGecko 直連'}")
+        text = "\n".join(lines)
+
+        # 去重：同一份摘要 6 小時內只推一次
+        sig = hashlib.sha1((head + text).encode()).hexdigest()[:16]
+        p = os.path.join(CACHE_DIR, "last_startup.json")
+        try:
+            with open(p) as f:
+                prev = json.load(f)
+            if prev.get("sig") == sig and time.time() - prev.get("ts", 0) < 6 * 3600:
+                sys.stderr.write("  ~ 啟動摘要與前次相同，6 小時內不重複推播\n")
+                return
+        except Exception:
+            pass
+        try:
+            with open(p, "w") as f:
+                json.dump({"sig": sig, "ts": time.time()}, f)
+        except Exception:
+            pass
+        push_all(head, text)
+
+    threading.Thread(target=_startup_report, daemon=True).start()
     if trader:
         threading.Thread(target=position_worker,
                          args=(float(os.environ.get("POSITION_POLL", 20)),),
