@@ -885,36 +885,42 @@ def missed_record(sym, cid, side, price, stop_pct, score, why):
 
 
 def missed_evaluate(hourly_prices_fn, horizon_h=72):
-    """對超過 72 小時、尚未評估的紀錄回頭算結果。
-    hourly_prices_fn(cid) 回傳 [(ts_ms, price), ...]（逐時，由 main.py 提供快取的 market_chart）。"""
+    """每輪都走一次已有的逐時資料：先碰到停損或 2R 就立刻記結果（先碰到誰算誰），
+    72 小時內都沒碰到才以 72 小時收盤算。不必等滿 72 小時才有數字。
+    注意：逐時資料只有收盤價，沒有高低，小時內的針刺兩邊都會漏，方向大致對稱。
+    hourly_prices_fn(cid) 回傳 [(ts_ms, price), ...]（由 main.py 提供快取的 market_chart）。"""
     now = time.time() * 1000
     done = 0
     for m in MISSED:
-        if m["result"] is not None or now - m["ts"] < horizon_h * 3600000:
+        if m["result"] is not None:
             continue
+        expired = now - m["ts"] >= horizon_h * 3600000
         try:
             series = hourly_prices_fn(m["cid"]) or []
         except Exception:
             continue
         pts = [(t, p) for t, p in series if t >= m["ts"] and t <= m["ts"] + horizon_h * 3600000]
-        if len(pts) < 6:
+        if not pts or (not expired and len(pts) < 2):
             continue
         sgn = 1 if m["side"] == "LONG" else -1
         entry = m["price"]
         r_unit = entry * m["stopPct"] / 100.0
         stop = entry - sgn * r_unit
         tp2 = entry + sgn * 2 * r_unit
-        res, r = "none", None
-        for _, p in pts:
+        res, r, hit_t = "none", None, None
+        for t_, p in pts:
             if (p - stop) * sgn <= 0:
-                res, r = "stop", -1.0
+                res, r, hit_t = "stop", -1.0, t_
                 break
             if (p - tp2) * sgn >= 0:
-                res, r = "tp2", 2.0
+                res, r, hit_t = "tp2", 2.0, t_
                 break
         if res == "none":
+            if not expired:
+                continue                    # 還沒碰到、也還沒到期：下一輪再看
             r = round((pts[-1][1] - entry) * sgn / r_unit, 2)
         m["result"], m["r"] = res, r
+        m["hours"] = round((hit_t - m["ts"]) / 3600000, 1) if hit_t else horizon_h
         done += 1
     if done:
         save_state()
@@ -932,7 +938,7 @@ def missed_summary():
             "stop": sum(1 for m in ev if m["result"] == "stop"),
             "none": sum(1 for m in ev if m["result"] == "none"),
             "avgR": round(sum(rs) / len(rs), 2), "totalR": round(sum(rs), 2),
-            "recent": [{k: m[k] for k in ("sym", "side", "score", "result", "r", "ts")} for m in ev[-10:]]}
+            "recent": [{k: m.get(k) for k in ("sym", "side", "score", "result", "r", "ts", "hours")} for m in ev[-10:]]}
 
 
 # ── 績效統計 ────────────────────────────────────────────────
