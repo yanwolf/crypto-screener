@@ -393,8 +393,31 @@ def cancel_conditional(symbol):
 
 # ── 下單 ────────────────────────────────────────────────────
 
+def max_leverage(symbol):
+    """這個交易對目前帳戶能用的最高槓桿。新子帳戶常被限制在 5x 或更低，
+    小市值幣本身的分層也可能只給 10x 以下。"""
+    st, d = _request("GET", "/fapi/v1/leverageBracket", {"symbol": symbol}, signed=True)
+    try:
+        rows = d if isinstance(d, list) else [d]
+        brackets = rows[0].get("brackets") or []
+        return max(int(b.get("initialLeverage") or 0) for b in brackets) or None
+    except Exception:
+        return None
+
+
 def set_leverage(symbol, lev):
-    return _request("POST", "/fapi/v1/leverage", {"symbol": symbol, "leverage": int(lev)}, signed=True)
+    """設定槓桿。被拒時退而求其次用帳戶允許的最高值，
+    回傳 (實際槓桿, 說明)。沉默失敗會讓保證金佔用與強平距離都跟預期不符。"""
+    st, d = _request("POST", "/fapi/v1/leverage", {"symbol": symbol, "leverage": int(lev)}, signed=True)
+    if st == 200:
+        return int(lev), None
+    mx = max_leverage(symbol)
+    if mx and mx < lev:
+        st2, _ = _request("POST", "/fapi/v1/leverage", {"symbol": symbol, "leverage": int(mx)}, signed=True)
+        if st2 == 200:
+            return int(mx), f"帳戶或該交易對上限 {mx}x，已改用 {mx}x（設定值 {lev}x）"
+    msg = str((d or {}).get("msg") or d)[:80]
+    return None, f"設定槓桿失敗（{msg}），沿用帳戶現有值"
 
 
 
@@ -505,7 +528,7 @@ def open_position(symbol_base, side, entry_hint, stop, info=None, note="", stop_
     if stop_pct is not None and stop_pct > 0:
         stop = px * (1 - stop_pct / 100.0) if side == "LONG" else px * (1 + stop_pct / 100.0)
 
-    qty, detail = size_position(equity, px, stop, info)
+    qty, detail = size_position(equity, px, stop, info, lev=lev_used or CFG["leverage"])
     if qty <= 0:
         return {"ok": False, "error": f"部位大小不合格：{detail.get('reason')}", "detail": detail}
 
@@ -514,7 +537,7 @@ def open_position(symbol_base, side, entry_hint, stop, info=None, note="", stop_
         return {"ok": True, "dryRun": True, "symbol": sym, "side": side,
                 "qty": qty, "entry": px, "exits": exits, "sizing": detail}
 
-    set_leverage(sym, CFG["leverage"])
+    lev_used, lev_note = set_leverage(sym, CFG["leverage"])
     order_side = "BUY" if side == "LONG" else "SELL"
     close_side = "SELL" if side == "LONG" else "BUY"
 
@@ -607,11 +630,12 @@ def open_position(symbol_base, side, entry_hint, stop, info=None, note="", stop_
     params = {k: CFG.get(k) for k in PARAM_KEYS}
     pos = {
         "version": strategy_label(params),
+        "leverage": lev_used or CFG["leverage"],
         "params": params, "minScore": AUTO.get("minScore"),
         "symbol": sym, "side": side, "qty": qty, "entry": px,
         "stop": stop_px, "exits": exits, "sizing": detail,
         "orders": sub, "opened": int(time.time() * 1000),
-        "note": note, "warnings": errs,
+        "note": note, "warnings": (errs + ([lev_note] if lev_note else [])),
     }
     STATE["positions"][sym] = pos
     save_state()

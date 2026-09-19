@@ -1081,6 +1081,13 @@ def live_checklist():
         except Exception:
             items.append(("合約錢包餘額（查詢失敗）", False))
         try:
+            mx = trader.max_leverage("BTCUSDT")
+            if mx:
+                items.append((f"帳戶可用槓桿上限 {mx}x（設定值 {trader.CFG['leverage']}x）",
+                              mx >= trader.CFG["leverage"]))
+        except Exception:
+            pass
+        try:
             pm = trader.position_mode()
             items.append((f"持倉模式已偵測：{'雙向' if pm == 'hedge' else '單向'}（兩種都支援，自動適配）", True)
                          if pm else ("持倉模式（查不到）", False))

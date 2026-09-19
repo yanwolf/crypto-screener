@@ -9,8 +9,8 @@ export default function TradePage({ s }) {
 <div className="mt-3">
             {/* 網路別橫幅：正式網必須一眼看出來 */}
             <div className="px-3 py-2 rounded flex items-center gap-2 flex-wrap"
-              style={{ background: trade.net && trade.net.includes("LIVE") ? "#2A1414" : C.panel2,
-                       border: `1px solid ${trade.net && trade.net.includes("LIVE") ? C.red : C.line}` }}>
+              style={{ background: trade.net && trade.net.includes("LIVE") ? "#241F0F" : C.panel2,
+                       border: `1px solid ${trade.net && trade.net.includes("LIVE") ? C.gold : C.line}` }}>
               <div className="flex rounded overflow-hidden" style={{ border: `1px solid ${C.line}` }}>
                 {tradeTargets.map((t, i) => (
                   <button key={i} onClick={() => setTradeIdx(i)} className="px-2.5 py-1"
@@ -25,7 +25,7 @@ export default function TradePage({ s }) {
                 </button>
               </div>
               <span style={{ fontFamily: FONT.display, fontSize: 13,
-                             color: trade.net && trade.net.includes("LIVE") ? C.red : C.teal }}>
+                             color: trade.net && trade.net.includes("LIVE") ? C.gold : C.teal }}>
                 {trade.net || "讀取中…"}
               </span>
               {trade.hasCreds === false && (
@@ -114,7 +114,7 @@ export default function TradePage({ s }) {
             )}
 
             {/* 上線就緒：放在交易頁，不必去連線設定找 */}
-            <div className="mt-3 rounded p-3" style={{ background: C.panel2, border: `1px solid ${trade.net && trade.net.includes("LIVE") ? C.red : C.line}` }}>
+            <div className="mt-3 rounded p-3" style={{ background: C.panel2, border: `1px solid ${trade.net && trade.net.includes("LIVE") ? C.gold : C.line}` }}>
               <div className="flex items-center gap-2 flex-wrap">
                 <span style={{ fontFamily: FONT.display, fontSize: 13 }}>接入正式網的準備</span>
                 {liveCheck && (
@@ -658,6 +658,9 @@ export default function TradePage({ s }) {
                       <span style={{ color: p.rMultiple > 0 ? UP : p.rMultiple < 0 ? DOWN : C.bone }}>
                         {p.rMultiple > 0 ? "+" : ""}{Number(p.rMultiple).toFixed(2)}R
                       </span>
+                    )}
+                    {p.leverage && (
+                      <span style={{ color: C.muted, fontSize: 10.5 }}>{p.leverage}x</span>
                     )}
                     {p.toStopPct != null && (
                       <span style={{ marginLeft: "auto",
