@@ -62,6 +62,7 @@ CFG = {
     "trailR": 0.5,                 # 移動停利回撤，以 R 為單位；不同波動的幣才會一致
     "breakevenR": 1.0,             # 到幾 R 把停損移到成本；0 = 關閉
     "guardClose": False,           # 停損補不回來時是否強制平倉。預設只警告
+    "conflictTighten": False,      # 反向訊號通過閘門時，把持有部位的停損拉到成本
     "trailActivateR": 2.0,         # 到 2R 才啟動移動停利
     "minNotional": 5.0,
     "dryRun": False,               # True 時只計算不送單，供離線驗證
@@ -70,7 +71,8 @@ CFG = {
 # 會存檔的設定項。live / key / secret 一律不存。
 PERSIST_CFG = ("riskPct", "maxPositions", "leverage", "stopAtrMult",
                "tp1R", "tp1Portion", "trailCallback", "trailActivateR",
-               "trailR", "breakevenR", "guardClose", "stopMode", "maxStopPct", "minStopPct")
+               "trailR", "breakevenR", "guardClose", "stopMode", "maxStopPct", "minStopPct",
+               "conflictTighten")
 
 _filters = {}                      # symbol → 精度與限制
 _filters_ts = 0
@@ -756,6 +758,7 @@ def record_close(pos, exit_px, reason):
         "reason": reason, "note": pos.get("note", ""),
     })
     STATE["positions"].pop(pos["symbol"], None)
+    conflict_on_close(pos["symbol"], STATE["trades"][-1].get("rMultiple"))
     AUTO["lastClose"][pos["symbol"]] = time.time()
     AUTO.setdefault("lastCloseWin", {})[pos["symbol"]] = (STATE["trades"][-1].get("pnl") or 0) > 0
     rm = STATE["trades"][-1].get("rMultiple")
@@ -941,6 +944,51 @@ def missed_summary():
             "recent": [{k: m.get(k) for k in ("sym", "side", "score", "result", "r", "ts", "hours")} for m in ev[-10:]]}
 
 
+
+
+# ── 反向訊號追蹤：持有中的部位收到反方向訊號時怎麼辦 ────────
+#
+# 先記錄、後決定。記下訊號當下部位的 R 與訊號是否通過閘門，
+# 部位平倉時補上最終 R。累積後看「反向訊號之後平均再走了多少 R」：
+# 明顯為負 → 該收緊；不明顯 → 該無視。
+# conflictTighten 開啟時，通過閘門的反向訊號會把停損拉到成本（保護，不反手）。
+
+CONFLICTS = []
+
+
+def conflict_record(sym, held_side, held_r, sig_side, score, gate_ok):
+    CONFLICTS.append({"sym": sym, "held": held_side, "rAtSignal": held_r, "sigSide": sig_side,
+                      "score": score, "gateOk": gate_ok, "ts": int(time.time() * 1000),
+                      "finalR": None, "closedTs": None})
+    del CONFLICTS[:-200]
+    save_state()
+
+
+def conflict_on_close(sym, final_r):
+    """部位平倉時回填最終 R（同一檔可能有多筆未回填的紀錄，全部補上）。"""
+    for c in CONFLICTS:
+        if c["sym"] == sym and c["finalR"] is None:
+            c["finalR"] = final_r
+            c["closedTs"] = int(time.time() * 1000)
+
+
+def conflict_summary():
+    done = [c for c in CONFLICTS if c["finalR"] is not None]
+    pend = [c for c in CONFLICTS if c["finalR"] is None]
+    if not done:
+        return {"evaluated": 0, "pending": len(pend)}
+    drift = [c["finalR"] - c["rAtSignal"] for c in done]
+    gate = [c for c in done if c["gateOk"]]
+    return {"evaluated": len(done), "pending": len(pend),
+            "avgRAtSignal": round(sum(c["rAtSignal"] for c in done) / len(done), 2),
+            "avgFinalR": round(sum(c["finalR"] for c in done) / len(done), 2),
+            "avgDrift": round(sum(drift) / len(drift), 2),
+            "worseAfter": sum(1 for d in drift if d < -0.3),
+            "betterAfter": sum(1 for d in drift if d > 0.3),
+            "gatePassed": len(gate),
+            "gatePassedDrift": round(sum(c["finalR"] - c["rAtSignal"] for c in gate) / len(gate), 2) if gate else None}
+
+
 # ── 績效統計 ────────────────────────────────────────────────
 
 
@@ -1047,7 +1095,7 @@ def cancel_stop_orders(symbol, pos):
     return ok
 
 
-def move_to_breakeven(pos, mark):
+def move_to_breakeven(pos, mark, force=False):
     """到達設定的 R 倍數後，把停損移到成本價。
 
     移動停利要到 2R 才啟動，1R 到 2R 之間的回落無法保護；
@@ -1056,12 +1104,13 @@ def move_to_breakeven(pos, mark):
     """
     if pos.get("beMoved"):
         return None
-    be = (pos.get("exits") or {}).get("breakeven")
-    if be is None:
-        return None
     sgn = 1 if pos["side"] == "LONG" else -1
-    if (mark - be) * sgn < 0:
-        return None                       # 還沒到
+    if not force:
+        be = (pos.get("exits") or {}).get("breakeven")
+        if be is None or (mark - be) * sgn < 0:
+            return None                   # 還沒到
+    elif (mark - pos["entry"]) * sgn <= 0:
+        return None                       # 強制移損也要在成本之上才有意義
 
     sym = pos["symbol"]
     f = _filters.get(sym) or {}
@@ -1212,7 +1261,7 @@ def save_state():
     try:
         with open(STATE_FILE, "w") as f:
             json.dump({"state": {k: STATE.get(k) for k in ("enabled", "positions", "trades", "lastNet")},
-                       "missed": MISSED,
+                       "missed": MISSED, "conflicts": CONFLICTS,
                        "auto": AUTO,
                        # 金鑰與網路別刻意不存：金鑰只該在環境變數，
                        # 網路別只該由啟動參數決定，避免存檔把正式網狀態帶回來
@@ -1266,6 +1315,7 @@ def load_state(path):
             if k in PERSIST_CFG and v is not None:
                 CFG[k] = v
         MISSED[:] = d.get("missed") or []
+        CONFLICTS[:] = d.get("conflicts") or []
     except Exception:
         pass
 
@@ -1306,6 +1356,7 @@ def status():
         "perf": performance(),
         "perfByVersion": performance_by_version(),
         "missed": missed_summary(),
+        "conflicts": conflict_summary(),
         "strategyVersion": strategy_label(),
         "trades": list(reversed(STATE["trades"][-100:])),
         "cfg": {k: v for k, v in CFG.items() if k not in ("key", "secret")},

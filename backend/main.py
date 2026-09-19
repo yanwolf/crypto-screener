@@ -635,6 +635,34 @@ def auto_try_trade(ev, row):
     score = ev.get("score")
     if score is None:
         score = row.get("bear") if bear else row.get("radar")   # 空頭分數存在 row["bear"]
+
+    # 持有反向部位：記錄這一刻的 R，並依設定決定是否收緊
+    held = trader.STATE["positions"].get(sym + "USDT")
+    if held and held["side"] != ("SHORT" if bear else "LONG"):
+        try:
+            live = trader.live_positions(max_age=5).get(sym + "USDT") or {}
+            r_amt = ((held.get("exits") or {}).get("R") or 0) * (held.get("qty") or 0)
+            held_r = round(live["pnl"] / r_amt, 2) if (live.get("pnl") is not None and r_amt) else None
+            # 先看這則反向訊號能不能過閘門（不下單，只判斷）
+            dv_c = None
+            try:
+                dv_c = fetch_deriv_server(sym, row.get("m24"))
+            except Exception:
+                pass
+            blocks_c, _ = engine.trade_gate({"score": score, "stage": row.get("stage"), "rvol7": row.get("rvol7")}, dv_c, bear)
+            gate_ok = (score is not None and score >= trader.AUTO["minScore"] and not blocks_c)
+            trader.conflict_record(sym + "USDT", held["side"], held_r, "SHORT" if bear else "LONG", score, gate_ok)
+            note = f"持有中的{'多' if held['side'] == 'LONG' else '空'}單收到反向訊號（目前 {held_r:+.2f}R）" if held_r is not None else "持有中的部位收到反向訊號"
+            if gate_ok and trader.CFG.get("conflictTighten") and live.get("mark"):
+                ev2 = trader.move_to_breakeven(held, live["mark"], force=True)
+                if ev2 and ev2.get("ok"):
+                    push_all("反向訊號 → 停損移至成本",
+                             f"{sym}USDT 持有中的{'多' if held['side'] == 'LONG' else '空'}單收到通過閘門的反向訊號，"
+                             f"停損從 {ev2['old']:g} 移到 {ev2['new']:g}（目前 {held_r:+.2f}R）。")
+                    note += "，已將停損移至成本"
+            return {"stage": "holding", "why": note + "；反向訊號不反手，已記錄供事後比對"}
+        except Exception as e:
+            sys.stderr.write(f"  ~ 反向訊號記錄失敗 {sym}: {e}\n")
     if score is None:
         return {"stage": "nodata",
                 "why": "取不到這檔的評分（掃描資料可能尚未涵蓋），本輪不下單"}
@@ -846,7 +874,7 @@ def trade_handle(path, payload):
                   "stopAtrMult": (0.5, 5.0), "tp1R": (1.0, 10.0), "tp1Portion": (0.0, 1.0),
                   "trailCallback": (0.1, 10.0), "trailActivateR": (0.5, 10.0),
                   "trailR": (0.0, 3.0), "breakevenR": (0.0, 5.0), "guardClose": (0, 1),
-                  "maxStopPct": (3.0, 25.0), "minStopPct": (0.5, 5.0)}
+                  "maxStopPct": (3.0, 25.0), "minStopPct": (0.5, 5.0), "conflictTighten": (0, 1)}
         kw = {}
         for k, (lo, hi) in limits.items():
             if k in payload:
@@ -855,7 +883,7 @@ def trade_handle(path, payload):
                 except (TypeError, ValueError):
                     continue
                 v = max(lo, min(hi, v))
-                kw[k] = bool(v) if k == "guardClose" else int(v) if k in ("maxPositions", "leverage") else v
+                kw[k] = bool(v) if k in ("guardClose", "conflictTighten") else int(v) if k in ("maxPositions", "leverage") else v
         if payload.get("stopMode") in ("ma", "atr", "tighter"):
             kw["stopMode"] = payload["stopMode"]
         return 200, {"cfg": trader.configure(**kw)}

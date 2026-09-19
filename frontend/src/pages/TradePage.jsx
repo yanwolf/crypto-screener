@@ -201,6 +201,47 @@ export default function TradePage({ s }) {
               </div>
             )}
 
+            {/* 反向訊號追蹤：持有中的部位收到反方向訊號後，後來怎麼了 */}
+            {trade.conflicts && (trade.conflicts.evaluated > 0 || trade.conflicts.pending > 0) && (
+              <div className="mt-3 rounded p-3" style={{ background: C.panel2, border: `1px solid ${C.line}` }}>
+                <div className="flex items-center gap-2 flex-wrap">
+                  <span style={{ fontFamily: FONT.display, fontSize: 13 }}>持有中收到反向訊號</span>
+                  <span style={{ fontSize: 11, color: C.muted }}>
+                    已平倉 {trade.conflicts.evaluated}　持有中 {trade.conflicts.pending}
+                  </span>
+                  <label className="ml-auto flex items-center gap-1.5 cursor-pointer" style={{ fontSize: 11.5, color: trade.cfg?.conflictTighten ? C.teal : C.muted }}>
+                    <input type="checkbox" checked={!!trade.cfg?.conflictTighten} style={{ accentColor: C.teal }}
+                      onChange={async (e) => {
+                        const j = await tradeCall("config", { conflictTighten: e.target.checked ? 1 : 0 });
+                        if (j && j.cfg) setTrade((x) => ({ ...x, cfg: j.cfg }));
+                      }} />
+                    反向訊號過閘門時移損到成本
+                  </label>
+                </div>
+                {trade.conflicts.evaluated > 0 ? (
+                  <>
+                    <div className="mt-2 grid grid-cols-2 gap-x-4 gap-y-1" style={{ fontFamily: FONT.data, fontSize: 12 }}>
+                      <div className="flex justify-between"><span style={{ color: C.muted }}>訊號當下平均</span><span>{trade.conflicts.avgRAtSignal > 0 ? "+" : ""}{trade.conflicts.avgRAtSignal}R</span></div>
+                      <div className="flex justify-between"><span style={{ color: C.muted }}>最終平均</span><span>{trade.conflicts.avgFinalR > 0 ? "+" : ""}{trade.conflicts.avgFinalR}R</span></div>
+                      <div className="flex justify-between"><span style={{ color: C.muted }}>之後平均再走</span>
+                        <span style={{ color: trade.conflicts.avgDrift > 0 ? UP : trade.conflicts.avgDrift < 0 ? DOWN : C.bone }}>
+                          {trade.conflicts.avgDrift > 0 ? "+" : ""}{trade.conflicts.avgDrift}R
+                        </span></div>
+                      <div className="flex justify-between"><span style={{ color: C.muted }}>變差／變好</span><span>{trade.conflicts.worseAfter} / {trade.conflicts.betterAfter}</span></div>
+                    </div>
+                    <div className="mt-2" style={{ fontSize: 10.5, color: C.muted, lineHeight: 1.7 }}>
+                      「之後平均再走」明顯為負，代表反向訊號有預警價值，該開啟上面的收緊；接近零或為正，代表該無視。
+                      不同時間框架的訊號本來就常打架，累積 20 筆以上再判斷。
+                    </div>
+                  </>
+                ) : (
+                  <div className="mt-1.5" style={{ fontSize: 11, color: C.muted }}>
+                    持有中的部位收到反向訊號時會記下當時的 R，平倉後回填最終 R，累積後顯示在這裡。反向訊號不會反手。
+                  </div>
+                )}
+              </div>
+            )}
+
             {/* 自動下單 */}
             {trade.auto && (
               <div className="mt-3 rounded p-3"
