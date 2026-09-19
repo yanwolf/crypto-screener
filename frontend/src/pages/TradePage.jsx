@@ -66,6 +66,13 @@ export default function TradePage({ s }) {
               </div>
             </div>
 
+            {trade.liveBlocked && trade.liveBlocked.length > 0 && (
+              <div className="mt-2 px-3 py-2 rounded" style={{ background: "#241A1A", border: `1px solid ${C.red}`, fontSize: 12, color: C.red, lineHeight: 1.8 }}>
+                設定了正式網（--live / ALLOW_LIVE）但條件不足，已降級為模擬網並停用下單：
+                {trade.liveBlocked.map((x, i) => <div key={i}>· {x}</div>)}
+                <div style={{ color: C.muted, fontSize: 11 }}>補齊後重新部署即可。雷達與資料代理不受影響。</div>
+              </div>
+            )}
             {targetEdit && (
               <div className="mt-2 rounded p-3" style={{ background: C.panel2, border: `1px solid ${C.line}` }}>
                 <div style={{ fontSize: 12, color: C.bone, marginBottom: 6 }}>交易服務</div>

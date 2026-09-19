@@ -78,6 +78,7 @@ STALE_GRACE = 600.0       # 過期後仍可先送舊資料的寬限秒數（背�
 OHLC_TTL = 1800.0         # 90 日 K 線快取半小時，這種資料不會秒變
 
 START_TS = time.time()
+LIVE_BLOCKED = []          # 正式網被拒絕啟動的原因；空代表正常
 QUOTA = {"exhausted": False, "ts": 0}
 _cache = {}
 _cache_lock = threading.Lock()
@@ -817,6 +818,7 @@ def trade_handle(path, payload):
         st = trader.status()
         st["adminRequired"] = bool(os.environ.get("ADMIN_KEY", "").strip())
         st["diskMB"] = cache_disk_mb()
+        st["liveBlocked"] = list(LIVE_BLOCKED)
         st["poll"] = float(os.environ.get("POSITION_POLL", 20))
         st["readiness"] = live_readiness()
         return 200, st
@@ -1395,6 +1397,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 "quotaExhausted": QUOTA["exhausted"], "keyless": keyless_now(),
                 "dataSource": CG_UPSTREAM or "direct",
                 "live": bool(trader and trader.CFG["live"]),
+                "liveBlocked": list(LIVE_BLOCKED),
                 "liveChecklist": live_checklist(),
                 "disk": (len(os.listdir(CACHE_DIR)) if os.path.isdir(CACHE_DIR) else 0),
                 "diskMB": cache_disk_mb(),
@@ -1805,11 +1808,16 @@ def main():
             if not (args.bn_key and args.bn_secret):
                 problems.append("BN_KEY／BN_SECRET 未設定")
             if problems:
-                sys.stderr.write("\n  ✕ 正式網啟動條件不足，拒絕啟動：\n")
+                # 不能讓整個服務崩潰：這台可能還是另一個服務的資料供應者。
+                # 降級成模擬網、停用下單，服務照常跑，並把原因放到看得到的地方。
+                LIVE_BLOCKED[:] = problems
+                want_live = False
+                sys.stderr.write("\n  ✕ 正式網啟動條件不足，已降級為模擬網並停用下單：\n")
                 for p in problems:
                     sys.stderr.write(f"     · {p}\n")
-                sys.stderr.write("     修正後再部署。若要先回模擬網，移除 ALLOW_LIVE 即可。\n\n")
-                sys.exit(2)
+                sys.stderr.write("     補齊後重新部署即可切回正式網；資料代理與雷達不受影響。\n\n")
+                trader.CFG["key"] = ""
+                trader.CFG["secret"] = ""
         trader.CFG["key"] = args.bn_key.strip()
         trader.CFG["secret"] = args.bn_secret.strip()
         trader.CFG["live"] = want_live
@@ -1875,6 +1883,13 @@ def main():
         sys.stderr.write(f"  通知　前綴「{NOTIFY_PREFIX}」\n")
     threading.Thread(target=selftest, daemon=True).start()
     threading.Thread(target=cleanup_worker, daemon=True).start()
+    if LIVE_BLOCKED:
+        def _warn_live():
+            time.sleep(8)
+            push_all("⚠ 正式網未啟動", "設定了 --live 但條件不足，已降級為模擬網並停用下單：\n"
+                     + "\n".join("· " + p for p in LIVE_BLOCKED)
+                     + "\n補齊後重新部署即可。資料代理與雷達仍正常運作。")
+        threading.Thread(target=_warn_live, daemon=True).start()
     if trader:
         threading.Thread(target=position_worker,
                          args=(float(os.environ.get("POSITION_POLL", 20)),),
