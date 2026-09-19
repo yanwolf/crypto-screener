@@ -87,6 +87,15 @@ export default function TradePage({ s }) {
               </div>
             )}
 
+            {trade.autoOn && trade.signalSource && !trade.signalSource.monitorOn && (
+              <div className="mt-2 px-3 py-2 rounded" style={{ background: "#241A1A", border: `1px solid ${C.red}`, fontSize: 12, color: C.red, lineHeight: 1.8 }}>
+                自動下單已啟用，但這個服務的背景監控未開啟，**不會收到任何訊號**，因此永遠不會下單。
+                <div style={{ color: C.muted, fontSize: 11 }}>
+                  訊號只來自這個服務自己的監控，或開著它網址的瀏覽器。在這裡切換服務只改變你在看誰，不會把訊號送過去。
+                  請直接開該服務的網址 → 提醒設定 → 啟用監控。
+                </div>
+              </div>
+            )}
             {trade.liveBlocked && trade.liveBlocked.length > 0 && (
               <div className="mt-2 px-3 py-2 rounded" style={{ background: "#241A1A", border: `1px solid ${C.red}`, fontSize: 12, color: C.red, lineHeight: 1.8 }}>
                 設定了正式網（--live / ALLOW_LIVE）但條件不足，已降級為模擬網並停用下單：

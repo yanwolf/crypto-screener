@@ -1459,6 +1459,7 @@ def status():
         "enabled": STATE["enabled"],
         "net": "LIVE 正式網" if CFG["live"] else "TESTNET 模擬網",
         "positionMode": ("hedge" if _mode["hedge"] else "oneway") if _mode["hedge"] is not None else None,
+        "autoOn": AUTO["on"],
         "hasCreds": bool(CFG["key"] and CFG["secret"]),
         "positions": pos,
         "openPnl": round(sum((r.get("pnl") or 0) for r in pos), 2),

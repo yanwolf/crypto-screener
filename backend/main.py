@@ -856,6 +856,13 @@ def trade_handle(path, payload):
         st["adminRequired"] = bool(os.environ.get("ADMIN_KEY", "").strip())
         st["diskMB"] = cache_disk_mb()
         st["liveBlocked"] = list(LIVE_BLOCKED)
+        st["signalSource"] = {
+            "monitorOn": MON["on"],
+            "monitorSynced": bool(MON["cfg"]),
+            "lastRun": MON.get("lastRun"),
+            "scope": MON.get("scope"),
+            "lastPush": MON.get("lastPushTs"),
+        }
         st["poll"] = float(os.environ.get("POSITION_POLL", 20))
         st["readiness"] = live_readiness()
         return 200, st
@@ -1516,6 +1523,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         # 網頁送來的訊號也要跑一次下單判斷，並把結果附在訊息後面。
         # 否則同一批訊號會因為來源不同，有的有「是否下單」有的沒有。
         ev = payload.get("event")
+        if isinstance(ev, dict):
+            MON["lastPushTs"] = int(time.time() * 1000)
         if isinstance(ev, dict) and trader:
             try:
                 outcome = auto_try_trade(ev, payload.get("row") or {})
@@ -1966,6 +1975,15 @@ def main():
 
         mon = "運作中" if MON["on"] else "未啟用"
         lines.append(f"監控　{mon}　資料來源 {CG_UPSTREAM or 'CoinGecko 直連'}")
+
+        # 自動下單開著、但這台沒有訊號來源：等於永遠不會下單
+        if trader and trader.AUTO["on"] and not MON["on"]:
+            head = "⚠ 自動下單不會觸發"
+            lines.append("")
+            lines.append("自動下單已啟用，但這台的背景監控未開啟，不會收到任何訊號。")
+            lines.append("訊號只來自「這台自己的監控」或「開著這台網址的瀏覽器」——"
+                         "在交易頁切換服務只改變你在看誰，不會把訊號送過去。")
+            lines.append("請直接開這台的網址 → 提醒設定 → 啟用監控。")
         text = "\n".join(lines)
 
         # 去重：同一份摘要 6 小時內只推一次
