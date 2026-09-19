@@ -647,22 +647,24 @@ export default function TradePage({ s }) {
               </div>
             )}
 
-            {/* 持倉 */}
-            <div className="mt-3 flex items-baseline gap-2 flex-wrap">
-              <span style={{ fontFamily: FONT.display, fontSize: 13 }}>
-                目前持倉 {trade.positions?.length || 0} 筆
-              </span>
-              {trade.positions?.length > 0 && trade.poll && (
-                <span style={{ fontSize: 10.5, color: C.muted }}>
-                  伺服器每 {trade.poll} 秒與交易所對帳
+            {/* 持倉。未實現固定佔一行：數字寬度會變，跟標題同行會忽上忽下 */}
+            <div className="mt-3">
+              <div className="flex items-baseline gap-2 flex-wrap">
+                <span style={{ fontFamily: FONT.display, fontSize: 13 }}>
+                  目前持倉 {trade.positions?.length || 0} 筆
                 </span>
-              )}
+                {trade.positions?.length > 0 && trade.poll && (
+                  <span style={{ fontSize: 10.5, color: C.muted }}>
+                    伺服器每 {trade.poll} 秒與交易所對帳
+                  </span>
+                )}
+              </div>
               {trade.positions?.length > 0 && trade.openPnl != null && (
-                <span style={{ fontFamily: FONT.data, fontSize: 12,
-                               color: trade.openPnl > 0 ? UP : trade.openPnl < 0 ? DOWN : C.muted }}>
-                  未實現 {trade.openPnl > 0 ? "+" : ""}{trade.openPnl} U
-                  {trade.openR != null && `　${trade.openR > 0 ? "+" : ""}${trade.openR}R`}
-                </span>
+                <div style={{ fontFamily: FONT.data, fontSize: 12, marginTop: 2,
+                              color: trade.openPnl > 0 ? UP : trade.openPnl < 0 ? DOWN : C.muted }}>
+                  未實現 {trade.openPnl > 0 ? "+" : ""}{trade.openPnl.toFixed(2)} U
+                  {trade.openR != null && `　${trade.openR > 0 ? "+" : ""}${trade.openR.toFixed(2)}R`}
+                </div>
               )}
             </div>
             {(trade.positions || []).map((p) => (
@@ -682,29 +684,27 @@ export default function TradePage({ s }) {
                   </button>
                 </div>
                 {/* 即時損益：這筆現在賺賠多少，以及離停損還有多遠 */}
+                {/* 用格線固定各段位置：數字長度會變，靠 flex 自動排會忽上忽下 */}
                 {p.mark != null && (
-                  <div className="mt-2 px-2.5 py-1.5 rounded flex items-center gap-3 flex-wrap"
+                  <div className="mt-2 px-2.5 py-1.5 rounded"
                     style={{ background: C.panel, border: `1px solid ${(p.pnl ?? 0) >= 0 ? C.line : C.red}`,
-                             fontFamily: FONT.data, fontSize: 12 }}>
-                    <span style={{ color: C.muted }}>現價</span>
-                    <span>{fmtPrice(p.mark)}</span>
-                    <span style={{ color: (p.pnl ?? 0) > 0 ? UP : (p.pnl ?? 0) < 0 ? DOWN : C.bone, fontSize: 13 }}>
-                      {(p.pnl ?? 0) > 0 ? "+" : ""}{(p.pnl ?? 0).toFixed(2)} U
+                             fontFamily: FONT.data, fontSize: 12,
+                             display: "grid", gridTemplateColumns: "1fr auto", alignItems: "center", gap: "2px 8px" }}>
+                    <span style={{ whiteSpace: "nowrap" }}>
+                      <span style={{ color: C.muted }}>現價 </span>{fmtPrice(p.mark)}
+                      {p.leverage && <span style={{ color: C.muted, fontSize: 10.5 }}>　{p.leverage}x</span>}
                     </span>
-                    {p.rMultiple != null && (
-                      <span style={{ color: p.rMultiple > 0 ? UP : p.rMultiple < 0 ? DOWN : C.bone }}>
-                        {p.rMultiple > 0 ? "+" : ""}{Number(p.rMultiple).toFixed(2)}R
-                      </span>
-                    )}
-                    {p.leverage && (
-                      <span style={{ color: C.muted, fontSize: 10.5 }}>{p.leverage}x</span>
-                    )}
                     {p.toStopPct != null && (
-                      <span style={{ marginLeft: "auto",
+                      <span style={{ textAlign: "right", whiteSpace: "nowrap",
                                      color: p.toStopPct < 2 ? C.red : p.toStopPct < 5 ? C.gold : C.muted, fontSize: 11 }}>
                         距停損 {p.toStopPct}%
                       </span>
                     )}
+                    <span style={{ gridColumn: "1 / -1", whiteSpace: "nowrap",
+                                   color: (p.pnl ?? 0) > 0 ? UP : (p.pnl ?? 0) < 0 ? DOWN : C.bone, fontSize: 13 }}>
+                      {(p.pnl ?? 0) > 0 ? "+" : ""}{(p.pnl ?? 0).toFixed(2)} U
+                      {p.rMultiple != null && `　${p.rMultiple > 0 ? "+" : ""}${Number(p.rMultiple).toFixed(2)}R`}
+                    </span>
                   </div>
                 )}
 
