@@ -605,6 +605,10 @@ def open_position(symbol_base, side, entry_hint, stop, info=None, note="", stop_
     if stop_pct is not None and stop_pct > 0:
         stop = px * (1 - stop_pct / 100.0) if side == "LONG" else px * (1 + stop_pct / 100.0)
 
+    # 先設槓桿：名目上限與保證金上限都要用實際生效的倍數，
+    # 所以這一步必須在計算部位大小之前。
+    lev_used, lev_note = set_leverage(sym, CFG["leverage"])
+
     cap = None
     cs, _ = capital_state()
     if cs:
@@ -622,7 +626,6 @@ def open_position(symbol_base, side, entry_hint, stop, info=None, note="", stop_
         return {"ok": True, "dryRun": True, "symbol": sym, "side": side,
                 "qty": qty, "entry": px, "exits": exits, "sizing": detail}
 
-    lev_used, lev_note = set_leverage(sym, CFG["leverage"])
     order_side = "BUY" if side == "LONG" else "SELL"
     close_side = "SELL" if side == "LONG" else "BUY"
 
