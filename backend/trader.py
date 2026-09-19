@@ -1071,18 +1071,32 @@ def move_to_breakeven(pos, mark):
     new_stop = round_step(new_stop, tick) if tick else new_stop
     close_side = "SELL" if pos["side"] == "LONG" else "BUY"
 
+    # 幣安不允許同方向同時有兩張 closePosition 停損，所以不能「先掛新再取消舊」。
+    # 順序：取消舊的 → 掛新的 → 掛不上就立刻把舊的掛回去。裸倉窗口約一秒。
+    old = pos["stop"]
+    cancel_stop_orders(sym, pos)
     st, r, ep = place_conditional({
         "symbol": sym, "side": close_side, "type": "STOP_MARKET",
         "stopPrice": new_stop, "workingType": "MARK_PRICE", **_close_all(pos["side"]),
     })
     if st != 200:
-        return {"symbol": sym, "ok": False, "why": str(r.get("msg") or r)[:100]}
+        why = str(r.get("msg") or r)[:100]
+        # 把舊停損掛回去，絕不留裸倉
+        st2, r2, ep2 = place_conditional({
+            "symbol": sym, "side": close_side, "type": "STOP_MARKET",
+            "stopPrice": old, "workingType": "MARK_PRICE", **_close_all(pos["side"]),
+        })
+        if st2 == 200:
+            pos["orders"] = [o for o in (pos.get("orders") or []) if _order_type(o) != "STOP_MARKET"]
+            pos["orders"].append({"type": "STOP_MARKET", "id": r2.get("algoId") or r2.get("orderId"), "px": old, "via": ep2})
+            save_state()
+            return {"symbol": sym, "ok": False, "why": f"新停損掛不上（{why}），已恢復原停損"}
+        # 連舊的都掛不回：守衛執行緒下一輪會補掛，這裡先回報
+        return {"symbol": sym, "ok": False, "why": f"新停損掛不上且原停損也掛不回（{why}），守衛將補掛", "naked": True}
 
-    cancel_stop_orders(sym, pos)
-    old = pos["stop"]
     pos["stop"] = new_stop
     pos["beMoved"] = True
-    pos["orders"] = [o for o in (pos.get("orders") or []) if o.get("type") != "STOP_MARKET"]
+    pos["orders"] = [o for o in (pos.get("orders") or []) if _order_type(o) != "STOP_MARKET"]
     pos["orders"].append({"type": "STOP_MARKET", "id": r.get("algoId") or r.get("orderId"),
                           "px": new_stop, "via": ep})
     save_state()

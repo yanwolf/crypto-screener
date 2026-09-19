@@ -763,6 +763,8 @@ def position_worker(every_s=20):
                         sys.stderr.write(f"  $ {ev['symbol']} 停損移至成本 {ev['new']:g}\n")
                     else:
                         sys.stderr.write(f"  ! {ev['symbol']} 移損失敗：{ev.get('why')}\n")
+                        if ev.get("naked"):
+                            push_all("⚠ 停損暫時遺失", f"{ev['symbol']} 移損時新舊停損都掛不上，守衛會在下一輪補掛。\n{ev.get('why')}")
 
                 # 確認停損還在。預設只警告不平倉——
                 # 一次誤判造成的平倉，比暫時裸倉幾十秒的損失更大。
