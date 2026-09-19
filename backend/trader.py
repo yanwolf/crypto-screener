@@ -30,7 +30,8 @@ STRATEGY_VERSION = "v2"         # 程式碼層的改動才手動加；參數改�
 
 # 這些參數會影響交易結果；任何一個改了，就該算不同的策略
 PARAM_KEYS = ("stopMode", "stopAtrMult", "maxStopPct", "minStopPct",
-              "breakevenR", "trailR", "tp1R", "tp1Portion", "trailActivateR")
+              "breakevenR", "trailR", "tp1R", "tp1Portion", "trailActivateR",
+              "riskPct", "usablePct")
 
 
 def strategy_label(params=None, min_score=None):
@@ -41,7 +42,8 @@ def strategy_label(params=None, min_score=None):
     mode = {"tighter": "取近", "atr": "ATR", "ma": "均線"}.get(p.get("stopMode"), p.get("stopMode"))
     return (f"{STRATEGY_VERSION}·{mode}{p.get('stopAtrMult')}×/{p.get('maxStopPct'):g}-{p.get('minStopPct'):g}%"
             f"·移損{p.get('breakevenR'):g}R·回撤{p.get('trailR'):g}R"
-            f"·TP{p.get('tp1R'):g}R@{p.get('tp1Portion'):g}·門檻{ms}")
+            f"·TP{p.get('tp1R'):g}R@{p.get('tp1Portion'):g}"
+            f"·險{p.get('riskPct'):g}%/{p.get('usablePct'):g}%·門檻{ms}")
 
 TESTNET_BASE = "https://testnet.binancefuture.com"
 LIVE_BASE = "https://fapi.binance.com"
@@ -63,6 +65,8 @@ CFG = {
     "breakevenR": 1.0,             # 到幾 R 把停損移到成本；0 = 關閉
     "guardClose": False,           # 停損補不回來時是否強制平倉。預設只警告
     "conflictTighten": False,      # 反向訊號通過閘門時，把持有部位的停損拉到成本
+    "useTier": True,               # 風險基準用本金階梯而非實際餘額
+    "usablePct": 75,               # 保證金總額上限＝階梯本金 × 此比例
     "trailActivateR": 2.0,         # 到 2R 才啟動移動停利
     "minNotional": 5.0,
     "dryRun": False,               # True 時只計算不送單，供離線驗證
@@ -72,7 +76,7 @@ CFG = {
 PERSIST_CFG = ("riskPct", "maxPositions", "leverage", "stopAtrMult",
                "tp1R", "tp1Portion", "trailCallback", "trailActivateR",
                "trailR", "breakevenR", "guardClose", "stopMode", "maxStopPct", "minStopPct",
-               "conflictTighten")
+               "conflictTighten", "useTier", "usablePct")
 
 _filters = {}                      # symbol → 精度與限制
 _filters_ts = 0
@@ -259,19 +263,80 @@ def position_mode():
     return None
 
 
-def account_equity():
+_bal = {"ts": 0, "data": None}
+
+
+def account_balance(max_age=20):
+    """合約錢包的完整餘額。短暫快取，避免每次下單與對帳都重查。
+
+    wallet  錢包餘額（不含未實現）
+    equity  保證金餘額 = 錢包 + 未實現損益，這才是帳戶真正的價值
+    avail   可用餘額（扣掉已佔用的保證金）
+    used    已佔用保證金
+    """
+    if _bal["data"] and time.time() - _bal["ts"] < max_age:
+        return _bal["data"], None
     st, d = _request("GET", "/fapi/v2/account", signed=True)
     if st != 200 or not isinstance(d, dict):
         return None, (d.get("msg") or d.get("error") or f"HTTP {st}") if isinstance(d, dict) else str(st)
     try:
-        return float(d["totalWalletBalance"]), None
+        f = lambda k: float(d.get(k) or 0)
+        out = {"wallet": f("totalWalletBalance"), "equity": f("totalMarginBalance"),
+               "avail": f("availableBalance"), "used": f("totalPositionInitialMargin"),
+               "upnl": f("totalUnrealizedProfit")}
+        if not out["equity"]:
+            out["equity"] = out["wallet"] + out["upnl"]
+        _bal["ts"] = time.time()
+        _bal["data"] = out
+        return out, None
     except Exception:
-        return None, "回應缺少 totalWalletBalance"
+        return None, "回應欄位解析失敗"
+
+
+def account_equity():
+    """部位大小用的權益。用錢包餘額而非保證金餘額：
+    浮盈浮虧會讓部位大小隨行情漂移，那不是我們要的。"""
+    b, err = account_balance()
+    return (b["wallet"] if b else None), err
 
 
 # ── 部位大小 ────────────────────────────────────────────────
 
-def size_position(equity, entry, stop, info, risk_pct=None, lev=None):
+
+
+# ── 本金階梯與可動用比例 ──────────────────────────────────
+#
+# 兩個用途，跟 pump-dump-hunter 同一套想法：
+# 1. 階梯：部位大小不隨每一塊錢連續變動，而是踩在級距上。
+#    同一批交易的 1R 金額才會一致，統計才可比；獲利也不會立刻自動放大部位。
+# 2. 可動用比例：保證金總額不得超過階梯本金的 75%，留緩衝給浮虧與手續費。
+#    crypto-screener 的部位由風險反推，不是由資金分配，所以這裡是「上限」而非「配額」。
+
+CAPITAL_TIERS = [500, 1000, 1500, 2000, 3000, 5000, 8000, 12000, 20000, 30000, 50000]
+
+
+def tier_capital(wallet):
+    """取不超過錢包餘額的最大級距；低於最小級距就用實際餘額。"""
+    if not wallet:
+        return None
+    ok = [x for x in CAPITAL_TIERS if x <= wallet]
+    return float(ok[-1]) if ok else float(wallet)
+
+
+def capital_state():
+    """回傳本金階梯與保證金使用狀況。"""
+    b, err = account_balance()
+    if not b:
+        return None, err
+    base = tier_capital(b["wallet"])
+    usable = base * CFG.get("usablePct", 75) / 100.0
+    return {"wallet": b["wallet"], "tier": base, "usablePct": CFG.get("usablePct", 75),
+            "usable": round(usable, 2), "used": b["used"],
+            "free": round(usable - b["used"], 2),
+            "perPosCap": round(usable / max(1, CFG["maxPositions"]), 2)}, None
+
+
+def size_position(equity, entry, stop, info, risk_pct=None, lev=None, margin_cap=None):
     """由「單筆願意虧多少」反推數量，而不是由金額反推。
 
     停損距離越遠 → 數量越小 → 每筆最大虧損維持一致。
@@ -287,7 +352,10 @@ def size_position(equity, entry, stop, info, risk_pct=None, lev=None):
         out["reason"] = "缺少權益、進場價或停損距離"
         return 0.0, out
 
-    risk_amt = equity * risk_pct / 100.0
+    # 風險基準用階梯本金，不是實際餘額：同一級距內每筆的 1R 金額固定
+    base = tier_capital(equity) if CFG.get("useTier", True) else equity
+    out["tier"] = base
+    risk_amt = base * risk_pct / 100.0
     out["riskAmt"] = risk_amt
     qty = risk_amt / dist
 
@@ -302,6 +370,14 @@ def size_position(equity, entry, stop, info, risk_pct=None, lev=None):
         notional = qty * entry
         out["reason"] = "受槓桿上限縮減"
 
+    # 保證金上限：單筆不得超過配額，也不得讓總保證金超過可動用額度
+    if margin_cap is not None and margin_cap > 0:
+        max_notional = margin_cap * lev
+        if notional > max_notional:
+            qty = round_step(max_notional / entry, step)
+            notional = qty * entry
+            out["reason"] = f"受保證金上限縮減（可用 {margin_cap:.0f} U × {lev}x）"
+
     min_qty = (info or {}).get("minQty") or 0
     min_not = max((info or {}).get("minNotional") or 0, CFG["minNotional"])
     if qty < min_qty or notional < min_not:
@@ -313,6 +389,7 @@ def size_position(equity, entry, stop, info, risk_pct=None, lev=None):
 
     out["qty"] = qty
     out["notional"] = notional
+    out["margin"] = round(notional / lev, 2) if lev else None
     return qty, out
 
 
@@ -528,7 +605,15 @@ def open_position(symbol_base, side, entry_hint, stop, info=None, note="", stop_
     if stop_pct is not None and stop_pct > 0:
         stop = px * (1 - stop_pct / 100.0) if side == "LONG" else px * (1 + stop_pct / 100.0)
 
-    qty, detail = size_position(equity, px, stop, info, lev=lev_used or CFG["leverage"])
+    cap = None
+    cs, _ = capital_state()
+    if cs:
+        cap = min(cs["perPosCap"], max(0.0, cs["free"]))
+        if cap <= 0:
+            return {"ok": False, "error": (
+                f"保證金已用滿：可動用 {cs['usable']:.0f} U（階梯 {cs['tier']:.0f} U × {cs['usablePct']}%），"
+                f"已佔用 {cs['used']:.0f} U"), "capital": cs}
+    qty, detail = size_position(equity, px, stop, info, lev=lev_used or CFG["leverage"], margin_cap=cap)
     if qty <= 0:
         return {"ok": False, "error": f"部位大小不合格：{detail.get('reason')}", "detail": detail}
 
@@ -821,7 +906,8 @@ def sync_positions():
             record_close(pos, px, "交易所出場（停損或停利觸發）")
             closed.append(sym)
     STATE["lastRun"] = int(time.time() * 1000)
-    return {"closed": closed, "open": list(live.keys())}
+    b, _ = account_balance(max_age=0)
+    return {"closed": closed, "open": list(live.keys()), "balance": b}
 
 
 
@@ -1376,6 +1462,8 @@ def status():
         "hasCreds": bool(CFG["key"] and CFG["secret"]),
         "positions": pos,
         "openPnl": round(sum((r.get("pnl") or 0) for r in pos), 2),
+        "balance": (account_balance()[0] if (CFG["key"] and CFG["secret"] and not CFG["dryRun"]) else None),
+        "capital": (capital_state()[0] if (CFG["key"] and CFG["secret"] and not CFG["dryRun"]) else None),
         "openR": round(sum((r.get("rMultiple") or 0) for r in pos), 2),
         "perf": performance(),
         "perfByVersion": performance_by_version(),

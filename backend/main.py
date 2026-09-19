@@ -451,6 +451,9 @@ def notify_trade_open(r):
     if r.get("warnings"):
         lines.append("注意　" + "；".join(r["warnings"]))
     net = "正式網" if (trader and trader.CFG["live"]) else "模擬網"
+    b, _ = trader.account_balance() if trader else (None, None)
+    if b:
+        lines.append(f"帳戶　權益 {b['equity']:,.2f} U　可用 {b['avail']:,.2f} U")
     lines.append(f"（{net}）")
     return "自動開倉", "\n".join(lines)
 
@@ -481,6 +484,10 @@ def notify_trade_close(t):
                          f"賺賠比 {p.get('payoff') or '—'}　期望值 {p['expectancyR']}R")
             a = trader.AUTO
             lines.append(f"今日 {a['opened']} 筆　已實現 {a['closedR']:+.2f}R（{a.get('closedUsd', 0.0):+.0f} U）")
+            b, _ = trader.account_balance(max_age=0)
+            if b:
+                lines.append(f"帳戶　權益 {b['equity']:,.2f} U　可用 {b['avail']:,.2f} U"
+                             + (f"　未實現 {b['upnl']:+,.2f} U" if abs(b['upnl']) > 0.01 else ""))
             if a.get("blocked"):
                 lines.append(f"⚠ {a['blocked']}")
     return head, "\n".join(lines)
@@ -874,7 +881,8 @@ def trade_handle(path, payload):
                   "stopAtrMult": (0.5, 5.0), "tp1R": (1.0, 10.0), "tp1Portion": (0.0, 1.0),
                   "trailCallback": (0.1, 10.0), "trailActivateR": (0.5, 10.0),
                   "trailR": (0.0, 3.0), "breakevenR": (0.0, 5.0), "guardClose": (0, 1),
-                  "maxStopPct": (3.0, 25.0), "minStopPct": (0.5, 5.0), "conflictTighten": (0, 1)}
+                  "maxStopPct": (3.0, 25.0), "minStopPct": (0.5, 5.0), "conflictTighten": (0, 1),
+                  "usablePct": (20.0, 100.0), "useTier": (0, 1)}
         kw = {}
         for k, (lo, hi) in limits.items():
             if k in payload:
@@ -883,7 +891,7 @@ def trade_handle(path, payload):
                 except (TypeError, ValueError):
                     continue
                 v = max(lo, min(hi, v))
-                kw[k] = bool(v) if k in ("guardClose", "conflictTighten") else int(v) if k in ("maxPositions", "leverage") else v
+                kw[k] = bool(v) if k in ("guardClose", "conflictTighten", "useTier") else int(v) if k in ("maxPositions", "leverage") else v
         if payload.get("stopMode") in ("ma", "atr", "tighter"):
             kw["stopMode"] = payload["stopMode"]
         return 200, {"cfg": trader.configure(**kw)}

@@ -66,6 +66,27 @@ export default function TradePage({ s }) {
               </div>
             </div>
 
+            {trade.balance && (
+              <div className="mt-2 px-3 py-2 rounded flex items-center gap-x-4 gap-y-1 flex-wrap"
+                style={{ background: C.panel2, border: `1px solid ${C.line}`, fontFamily: FONT.data, fontSize: 12 }}>
+                <span><span style={{ color: C.muted }}>權益 </span>{trade.balance.equity.toFixed(2)} U</span>
+                <span><span style={{ color: C.muted }}>可用 </span>{trade.balance.avail.toFixed(2)} U</span>
+                <span><span style={{ color: C.muted }}>保證金 </span>{trade.balance.used.toFixed(2)} U</span>
+                {Math.abs(trade.balance.upnl) > 0.01 && (
+                  <span style={{ color: trade.balance.upnl > 0 ? UP : DOWN }}>
+                    未實現 {trade.balance.upnl > 0 ? "+" : ""}{trade.balance.upnl.toFixed(2)} U
+                  </span>
+                )}
+                {trade.capital && (
+                  <span style={{ color: C.muted, fontSize: 10.5, marginLeft: "auto" }}>
+                    階梯 {trade.capital.tier.toFixed(0)} U × {trade.capital.usablePct}% ＝ 可動用 {trade.capital.usable.toFixed(0)} U，
+                    剩 <span style={{ color: trade.capital.free < trade.capital.perPosCap ? C.gold : C.muted }}>{trade.capital.free.toFixed(0)} U</span>
+                    　每筆上限 {trade.capital.perPosCap.toFixed(0)} U
+                  </span>
+                )}
+              </div>
+            )}
+
             {trade.liveBlocked && trade.liveBlocked.length > 0 && (
               <div className="mt-2 px-3 py-2 rounded" style={{ background: "#241A1A", border: `1px solid ${C.red}`, fontSize: 12, color: C.red, lineHeight: 1.8 }}>
                 設定了正式網（--live / ALLOW_LIVE）但條件不足，已降級為模擬網並停用下單：
@@ -359,6 +380,11 @@ export default function TradePage({ s }) {
                             ))}
                           </div>
                           <div className="mt-1" style={{ fontSize: 10.5, color: C.muted, lineHeight: 1.6 }}>
+                            風險基準採本金階梯（500／1000／1500／2000／3000／5000…）而非實際餘額：
+                            同一級距內每筆的 1R 金額固定，統計才可比，獲利也不會立刻放大部位。
+                            可動用比例是保證金總額上限，留緩衝給浮虧與手續費。
+                          </div>
+                          <div className="mt-1" style={{ fontSize: 10.5, color: C.muted, lineHeight: 1.6 }}>
                             現價離小綠 15% 以上時，用均線定停損會寬到讓部位失去意義、2R 遠到等不到；
                             取近的能把距離壓回該幣的實際波動範圍。
                           </div>
@@ -366,6 +392,7 @@ export default function TradePage({ s }) {
                         {[
                           ["maxPositions", "同時持倉上限", [1, 2, 3, 5, 8], "筆", trade.cfg?.maxPositions],
                           ["riskPct", "單筆風險", [0.25, 0.5, 1, 1.5, 2], "%", trade.cfg?.riskPct],
+                          ["usablePct", "可動用保證金比例", [50, 60, 75, 90, 100], "%", trade.cfg?.usablePct],
                           ["stopAtrMult", "ATR 停損倍數", [1, 1.5, 2, 2.5, 3], "×ATR", trade.cfg?.stopAtrMult],
                           ["maxStopPct", "停損距離上限", [6, 8, 10, 12, 15], "%", trade.cfg?.maxStopPct],
                           ["breakevenR", "移損到成本（0 = 關閉）", [0, 0.8, 1, 1.5, 2], "R", trade.cfg?.breakevenR],
