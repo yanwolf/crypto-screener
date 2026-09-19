@@ -11,6 +11,7 @@ export default function AlertsPage({ s }) {
             <section className="rounded p-3.5" style={{ background: C.panel, border: `1px solid ${alertCfg.on ? C.teal : C.line}` }}>
               <div className="flex flex-wrap items-center gap-3">
                 <h2 style={{ fontFamily: FONT.display, fontSize: 17 }}>訊號監控</h2>
+                <span style={{ fontSize: 11, color: C.muted }}>網頁開著時才運作</span>
                 <button onClick={() => setAlertCfg({ ...alertCfg, on: !alertCfg.on })} className="px-3 py-1.5 rounded"
                   style={{ background: alertCfg.on ? C.teal : C.panel2, color: alertCfg.on ? C.ink : C.muted, border: `1px solid ${alertCfg.on ? C.teal : C.line}`, fontSize: 12.5 }}>
                   {alertCfg.on ? "監控中，點此停止" : "開啟監控"}
@@ -43,6 +44,7 @@ export default function AlertsPage({ s }) {
             <section className="rounded p-3.5" style={{ background: C.panel, border: `1px solid ${mon && mon.on ? C.teal : C.line}` }}>
               <div className="flex flex-wrap items-center gap-2 mb-2">
                 <h3 style={{ fontFamily: FONT.display, fontSize: 15 }}>伺服器背景監控</h3>
+                <span style={{ fontSize: 11, color: C.gold }}>自動下單的訊號來源</span>
                 {!local ? <span style={{ fontSize: 11.5, color: C.gold }}>需要伺服器版本才能使用</span>
                   : mon == null ? <span style={{ fontSize: 11.5, color: C.muted }}>讀取中…</span>
                   : !mon.engine ? <span style={{ fontSize: 11.5, color: C.red }}>伺服器缺少 engine.py</span>

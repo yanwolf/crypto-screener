@@ -1980,10 +1980,9 @@ def main():
         if trader and trader.AUTO["on"] and not MON["on"]:
             head = "⚠ 自動下單不會觸發"
             lines.append("")
-            lines.append("自動下單已啟用，但這台的背景監控未開啟，不會收到任何訊號。")
-            lines.append("訊號只來自「這台自己的監控」或「開著這台網址的瀏覽器」——"
-                         "在交易頁切換服務只改變你在看誰，不會把訊號送過去。")
-            lines.append("請直接開這台的網址 → 提醒設定 → 啟用監控。")
+            lines.append("自動下單已啟用，但這台的「伺服器背景監控」未啟動，不會收到任何訊號。")
+            lines.append("注意不是提醒設定頁上方那個「訊號監控」（只在網頁開著時運作），")
+            lines.append("而是下方的「伺服器背景監控」→ 按「同步並啟動背景監控」。")
         text = "\n".join(lines)
 
         # 去重：同一份摘要 6 小時內只推一次
