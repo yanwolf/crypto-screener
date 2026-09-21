@@ -826,11 +826,8 @@ def open_position(symbol_base, side, entry_hint, stop, info=None, note="", stop_
         STATE["pending"].pop(sym, None)
         save_state()
 
-        # 停損：closePosition 確保無論部位多大都全平
-        st2, r2, ep2 = place_conditional({
-            "symbol": sym, "side": close_side, "type": "STOP_MARKET",
-            "stopPrice": stop_px, "workingType": "MARK_PRICE", **_close_all(side),
-        })
+        # 停損：統一走 place_stop（第 2 條 r20）。部位剛由成交確認過，直接帶自己的數量
+        _s, st2, r2, ep2 = place_stop(pos, stop_px, own=pos["qty"])
         if st2 != 200:
             errs.append(f"停損掛單失敗：{r2.get('msg') or r2}")
             # 沒有停損就不留倉
@@ -1068,6 +1065,42 @@ def _market_close(symbol, side, qty, base=0.0):
     return False, why
 
 
+def _own_live(pos):
+    """逐幣確認自己在交易所上的數量（扣基準）。回傳 (數量, 狀態)：ok / unknown（查不到）/ gone（沒了）。"""
+    live = _live_qty(pos["symbol"], pos["side"])
+    if live is None:
+        return None, "unknown"
+    own = live - float(pos.get("base") or 0)
+    return (own, "ok") if own > 1e-12 else (0.0, "gone")
+
+
+def place_stop(pos, price, own=None):
+    """送出停損單的唯一入口（第 2 條 r19、r20）。第一次掛、認領、守衛補掛、移損掛新、移損失敗掛回，全部走這裡。
+
+    - 先逐幣確認自己的部位（扣基準）：查不到 → "unknown"（這輪不動、不算掛單失敗）；
+      沒了 → "gone"（不掛，交給對帳）。部位其實已被平掉、只是還沒偵測到時，掛出去的就是孤兒 reduce-only 單。
+      剛確認過（例如成交確認、認領時手上就有數量）可以直接傳 own。
+    - 有基準（同側有別人的部位）時用自己的數量＋reduce-only，數量取「交易所−基準」與帳上的小者；
+      closePosition 是「平掉這一側全部」，會把別人的部位一起平掉。沒有基準時維持 closePosition（出一半後自動涵蓋剩餘）。
+    回傳 (狀態, status, data, 端點)，狀態：placed / failed / unknown / gone。
+    """
+    if own is None:
+        own, s = _own_live(pos)
+        if s != "ok":
+            return s, None, None, None
+    sym, side = pos["symbol"], pos["side"]
+    params = {"symbol": sym, "side": "SELL" if side == "LONG" else "BUY", "type": "STOP_MARKET",
+              "stopPrice": price, "workingType": "MARK_PRICE"}
+    if float(pos.get("base") or 0) > 0:
+        step = (_filters.get(sym) or {}).get("step") or 0
+        q = min(float(pos["qty"]), float(own))
+        params.update(quantity=round_step(q, step) if step else q, **_reduce(side))
+    else:
+        params.update(_close_all(side))
+    st, r, ep = place_conditional(params)
+    return ("placed" if st == 200 else "failed"), st, r, ep
+
+
 def _set_pending_close(pos, reason, why):
     """平倉沒平掉：記待平倉旗標、告警第 1 次（第 8 條 r13）。停損與停利不動，守衛照常運作。"""
     pc = pos.get("pendingClose")
@@ -1087,22 +1120,27 @@ def retry_pending_closes():
     """每輪重試待平倉的部位。只有這條路會為待平倉的部位送平倉單（第 8 條 r14）。"""
     events = []
     for sym, pos in list(STATE["positions"].items()):
-        pc = pos.get("pendingClose")
-        if not pc:
-            continue
-        closed, why = _market_close(sym, pos["side"], pos["qty"], pos.get("base") or 0)
-        if closed == "gone":
-            events.append({"symbol": sym, "action": "gone"})     # 交給對帳記帳
-            continue
-        if closed:
-            px = mark_price(sym) or pos["entry"]
-            n = pc["attempts"]
-            record_close(pos, px, pc["reason"])
-            _notify("已平倉", f"{sym} {pc['reason']}（已補上：先前平倉失敗 {n} 次）。")
-            events.append({"symbol": sym, "action": "closed", "fails": n})
-            continue
-        _set_pending_close(pos, pc["reason"], why)
-        events.append({"symbol": sym, "action": "retry", "attempt": pc["attempts"]})
+        try:
+            pc = pos.get("pendingClose")
+            if not pc:
+                continue
+            closed, why = _market_close(sym, pos["side"], pos["qty"], pos.get("base") or 0)
+            if closed == "gone":
+                events.append({"symbol": sym, "action": "gone"})     # 交給對帳記帳
+                continue
+            if closed:
+                px = mark_price(sym) or pos["entry"]
+                n = pc["attempts"]
+                record_close(pos, px, pc["reason"])
+                _notify("已平倉", f"{sym} {pc['reason']}（已補上：先前平倉失敗 {n} 次）。")
+                events.append({"symbol": sym, "action": "closed", "fails": n})
+                continue
+            _set_pending_close(pos, pc["reason"], why)
+            events.append({"symbol": sym, "action": "retry", "attempt": pc["attempts"]})
+        except Exception as e:
+            _pos_step_error("待平倉重試", sym, e)
+        else:
+            _pos_step_ok("待平倉重試", sym)
     return events
 
 
@@ -1170,22 +1208,28 @@ def retry_leftovers():
         return events
     keep = []
     for lf in STATE.get("leftovers") or []:
-        if lf.get("via") == "algo":
-            st, d = _request("DELETE", "/fapi/v1/algoOrder", {"symbol": lf["symbol"], "algoId": lf["id"]}, signed=True)
+        try:
+            if lf.get("via") == "algo":
+                st, d = _request("DELETE", "/fapi/v1/algoOrder", {"symbol": lf["symbol"], "algoId": lf["id"]}, signed=True)
+            else:
+                st, d = _request("DELETE", "/fapi/v1/order", {"symbol": lf["symbol"], "orderId": lf["id"]}, signed=True)
+            code = d.get("code") if isinstance(d, dict) else None
+            msg = str((d or {}).get("msg") if isinstance(d, dict) else d)
+            if st == 200 or code in (-2011, -2013) or "Unknown" in msg or "not exist" in msg.lower():
+                events.append({"action": "recovered", **lf})
+                # 第 1 次失敗一定告警過（平倉當下），所以撤掉時一律發恢復
+                _notify("殘留單已撤掉", f"{lf['symbol']} {lf['type']} #{lf['id']}\n（已補上：先前撤單失敗 {lf['attempts']} 次）")
+                continue
+            lf["attempts"] += 1
+            lf["lastErr"] = msg[:80]
+            keep.append(lf)
+            events.append({"action": "alert", "alert": alert_due(lf["attempts"]), **lf})
+            _leftover_failed(lf)
+        except Exception as e:
+            _pos_step_error("殘留單重試", f"{lf.get('symbol')}#{lf.get('id')}", e)
+            keep.append(lf)                  # 出錯的這張留在清單，下輪再試
         else:
-            st, d = _request("DELETE", "/fapi/v1/order", {"symbol": lf["symbol"], "orderId": lf["id"]}, signed=True)
-        code = d.get("code") if isinstance(d, dict) else None
-        msg = str((d or {}).get("msg") if isinstance(d, dict) else d)
-        if st == 200 or code in (-2011, -2013) or "Unknown" in msg or "not exist" in msg.lower():
-            events.append({"action": "recovered", **lf})
-            # 第 1 次失敗一定告警過（平倉當下），所以撤掉時一律發恢復
-            _notify("殘留單已撤掉", f"{lf['symbol']} {lf['type']} #{lf['id']}\n（已補上：先前撤單失敗 {lf['attempts']} 次）")
-            continue
-        lf["attempts"] += 1
-        lf["lastErr"] = msg[:80]
-        keep.append(lf)
-        events.append({"action": "alert", "alert": alert_due(lf["attempts"]), **lf})
-        _leftover_failed(lf)
+            _pos_step_ok("殘留單重試", f"{lf.get('symbol')}#{lf.get('id')}")
     if (STATE.get("leftovers") or []) != keep:
         STATE["leftovers"] = keep
         save_state()
@@ -1259,9 +1303,7 @@ def adopt_pending(live):
                                f"（交易所合併均價 {merged_entry:g}）"] if estimated else
                               [f"送單前這一側已有 {base:g}，交易所均價 {entry:g} 是合併過的，不是這張單的成交價"]
                               if base > 0 else [])}
-        st, r, ep = place_conditional({"symbol": sym, "side": close_side, "type": "STOP_MARKET",
-                                       "stopPrice": stop_px, "workingType": "MARK_PRICE",
-                                       **_close_all(side)})
+        _s, st, r, ep = place_stop(pos, stop_px, own=qty)      # 認領時剛從交易所看到（已扣基準）
         if st == 200:
             pos["orders"].append({"type": "STOP_MARKET", "id": r.get("algoId") or r.get("orderId"),
                                   "px": stop_px, "via": ep})
@@ -1312,6 +1354,14 @@ def record_close(pos, exit_px, reason):
                 f"部位已平倉（{reason}），不再重試。")
     n_rf = _replace_fails.pop(sym_, 0)
     _missing_streak.pop(sym_, None)
+    # 第 8 條 r19：以幣名為鍵的出錯次數也要跟著部位結束清掉，否則同幣下一筆會接著數
+    errs = {"停損檢查": _guard_errors.pop(sym_, 0)}
+    for k in [k for k in _pos_errors if k[1] == sym_]:
+        errs[k[0]] = _pos_errors.pop(k)
+    errs = {k: v for k, v in errs.items() if v}
+    if errs:
+        _notify("出錯狀態結束：部位已平倉",
+                f"{sym_} 部位已平倉（{reason}）。先前出錯：" + "、".join(f"{k} {v} 次" for k, v in errs.items()) + "，不再重試。")
     if n_rf:
         _notify("補掛失敗狀態結束：部位已平倉",
                 f"{sym_} 先前補掛停損失敗 {n_rf} 次，部位已平倉（{reason}），不再重試。")
@@ -1406,43 +1456,53 @@ def sync_positions():
     # 已成交的動作要先通知（第 8 條 r10），也要馬上更新帳上數量：
     # 否則平倉時用全部數量 × 最後出場價算損益，而且雙向模式下手動平倉會因超量被拒。
     for sym, row in live.items():
-        pos = STATE["positions"][sym]
-        if row.get("_unverified"):
-            continue
         try:
-            q_live = abs(float(row.get("positionAmt") or 0)) - float(pos.get("base") or 0)
-        except (TypeError, ValueError):
-            continue
-        step = (_filters.get(sym) or {}).get("step") or 0
-        if q_live <= 0 or pos["qty"] - q_live <= max(step * 0.5, 1e-12):
-            continue
-        reduced = pos["qty"] - q_live
-        tp = next((o for o in pos.get("orders") or [] if _order_type(o) == "TAKE_PROFIT_MARKET"), None)
-        if tp and tp.get("qty") and abs(float(tp["qty"]) - reduced) <= max(step, 1e-12) and tp.get("px"):
-            px, how = float(tp["px"]), "第一目標停利"
-            pos["orders"] = [o for o in pos["orders"] if o is not tp]       # 已觸發，不再追蹤
+            pos = STATE["positions"][sym]
+            if row.get("_unverified"):
+                continue
+            try:
+                q_live = abs(float(row.get("positionAmt") or 0)) - float(pos.get("base") or 0)
+            except (TypeError, ValueError):
+                continue
+            step = (_filters.get(sym) or {}).get("step") or 0
+            if q_live <= 0 or pos["qty"] - q_live <= max(step * 0.5, 1e-12):
+                continue
+            reduced = pos["qty"] - q_live
+            tp = next((o for o in pos.get("orders") or [] if _order_type(o) == "TAKE_PROFIT_MARKET"), None)
+            if tp and tp.get("qty") and abs(float(tp["qty"]) - reduced) <= max(step, 1e-12) and tp.get("px"):
+                px, how = float(tp["px"]), "第一目標停利"
+                pos["orders"] = [o for o in pos["orders"] if o is not tp]       # 已觸發，不再追蹤
+            else:
+                px, how = (mark_price(sym) or pos["entry"]), "部分減碼（價格以標記價估計）"
+            sgn = 1 if pos["side"] == "LONG" else -1
+            part_pnl = (px - pos["entry"]) * sgn * reduced
+            pos.setdefault("qty0", pos["qty"])
+            pos.setdefault("partials", []).append({"qty": reduced, "px": px, "pnl": round(part_pnl, 4),
+                                                   "ts": int(time.time() * 1000), "how": how})
+            pos["qty"] = q_live
+            save_state()
+            r_unit = (pos.get("exits") or {}).get("R") or 0
+            _notify(f"部分出場：{how}",
+                    f"{sym} {'做多' if sgn > 0 else '做空'}　出場 {reduced:g} @ {px:g}"
+                    f"（{part_pnl:+.2f} U" + (f"，{part_pnl / (r_unit * pos['qty0']):+.2f}R" if r_unit else "") + "）\n"
+                    f"剩餘 {q_live:g}，移動停利與停損繼續保護。")
+        except Exception as e:
+            _pos_step_error("部分出場偵測", sym, e)
         else:
-            px, how = (mark_price(sym) or pos["entry"]), "部分減碼（價格以標記價估計）"
-        sgn = 1 if pos["side"] == "LONG" else -1
-        part_pnl = (px - pos["entry"]) * sgn * reduced
-        pos.setdefault("qty0", pos["qty"])
-        pos.setdefault("partials", []).append({"qty": reduced, "px": px, "pnl": round(part_pnl, 4),
-                                               "ts": int(time.time() * 1000), "how": how})
-        pos["qty"] = q_live
-        save_state()
-        r_unit = (pos.get("exits") or {}).get("R") or 0
-        _notify(f"部分出場：{how}",
-                f"{sym} {'做多' if sgn > 0 else '做空'}　出場 {reduced:g} @ {px:g}"
-                f"（{part_pnl:+.2f} U" + (f"，{part_pnl / (r_unit * pos['qty0']):+.2f}R" if r_unit else "") + "）\n"
-                f"剩餘 {q_live:g}，移動停利與停損繼續保護。")
+            _pos_step_ok("部分出場偵測", sym)
 
     closed = []
     for sym in list(STATE["positions"].keys()):
-        if sym not in live:
-            pos = STATE["positions"][sym]
-            px = mark_price(sym) or pos["entry"]
-            record_close(pos, px, "交易所出場（停損或停利觸發）")
-            closed.append(sym)
+        try:
+            if sym not in live:
+                pos = STATE["positions"][sym]
+                px = mark_price(sym) or pos["entry"]
+                record_close(pos, px, "交易所出場（停損或停利觸發）")
+                closed.append(sym)
+        except Exception as e:
+            _pos_step_error("平倉記帳", sym, e)
+        else:
+            _pos_step_ok("平倉記帳", sym)
     STATE["lastRun"] = int(time.time() * 1000)
     b, _ = account_balance(max_age=0)
     return {"closed": closed, "open": list(live.keys()), "balance": b}
@@ -1708,6 +1768,25 @@ def has_stop_order(orders, pos):
 _missing_streak = {}          # symbol → 連續幾次確認停損不在
 _replace_fails = {}           # symbol → 補掛連續失敗幾次（告警節奏用）
 _guard_errors = {}            # symbol → 停損檢查程式出錯幾次（告警節奏用）
+_pos_errors = {}              # (步驟, 鍵) → 程式出錯幾次（第 8 條 r19：同一部位每一步各自 try）
+
+
+def _pos_step_error(step, key, e):
+    """某個部位的某一步出錯：寫錯誤區＋照節奏推播（第 14 條：不能被 try 吞掉）。"""
+    k = (step, str(key))
+    n = _pos_errors.get(k, 0) + 1
+    _pos_errors[k] = n
+    sys.stderr.write(f"  ! {key} {step}出錯（第 {n} 次）：{type(e).__name__}: {str(e)[:100]}\n")
+    if alert_due(n):
+        _notify(f"⚠ {step}出錯（第 {n} 次）",
+                f"{key} {step}時程式出錯：{type(e).__name__}: {str(e)[:120]}\n"
+                f"其他部位與其他步驟照常執行。每 {CFG.get('positionPoll', 20):g} 秒重試一次。")
+
+
+def _pos_step_ok(step, key):
+    n = _pos_errors.pop((step, str(key)), 0)
+    if n:
+        _notify(f"{step}恢復", f"{key} {step}恢復正常（已補上：先前出錯 {n} 次）。")
 
 
 def _guard_one(sym, pos, events):
@@ -1738,10 +1817,12 @@ def _guard_one(sym, pos, events):
     tick = f.get("tick") or 0.0
     stop_px = round_step(pos["stop"], tick) if tick else pos["stop"]
 
-    st, r, ep = place_conditional({
-        "symbol": sym, "side": close_side, "type": "STOP_MARKET",
-        "stopPrice": stop_px, "workingType": "MARK_PRICE", **_close_all(pos["side"]),
-    })
+    # 第 2 條 r19：補掛前確認部位（扣基準）。對帳出錯時守衛照樣會跑，部位可能其實已被平掉
+    status, st, r, ep = place_stop(pos, stop_px)
+    if status == "unknown":
+        return                                    # 查不到：這輪不動，不算補掛失敗
+    if status == "gone":
+        return                                    # 自己的部位已經沒了：不補，交給對帳記平倉
     msg = str((r or {}).get("msg") or r)
     code = r.get("code") if isinstance(r, dict) else None
     if code == -2021 and not pos.get("pendingClose"):
@@ -1895,13 +1976,16 @@ def move_to_breakeven(pos, mark, force=False, reason=None):
         return {"symbol": sym, "ok": False, "retry": True, "attempt": n, "alert": alert_due(n),
                 "want": want, "current": cur, "why": why, **extra}
 
+    # 第 2 條 r20：移損看起來是「更新」停損，實際上是新掛一張。撤舊之前先確認部位（扣基準）：
+    # 查不到 → 這輪不動、不算失敗（下輪重試）；已經沒了 → 不動，交給對帳。
+    own, s_ = _own_live(pos)
+    if s_ != "ok":
+        return None
+
     if not cancel_stop_orders(sym, pos):
         return _fail("撤不掉舊停損，這輪不動，下輪重試")
 
-    st, r, ep = place_conditional({
-        "symbol": sym, "side": close_side, "type": "STOP_MARKET",
-        "stopPrice": want, "workingType": "MARK_PRICE", **_close_all(pos["side"]),
-    })
+    _s, st, r, ep = place_stop(pos, want, own=own)
     if st == 200:
         pos["stop"] = want
         pos["beMoved"] = True
@@ -1923,10 +2007,7 @@ def move_to_breakeven(pos, mark, force=False, reason=None):
     # 其他失敗、以及 -2021（價格已穿過想要的停損）：都先把舊停損掛回去，絕不留裸倉。
     # 第 8 條 r14：交易所停損要等平倉確認之後才撤。-2021 時舊停損已經為了「移動」撤掉了，
     # 所以先恢復它，再送平倉單；平掉了才由 record_close 撤，沒平掉就記待平倉、停損繼續保護。
-    st2, r2, ep2 = place_conditional({
-        "symbol": sym, "side": close_side, "type": "STOP_MARKET",
-        "stopPrice": old, "workingType": "MARK_PRICE", **_close_all(pos["side"]),
-    })
+    _s, st2, r2, ep2 = place_stop(pos, old, own=own)          # 剛確認過，直接帶數量（時間要緊）
     pos["orders"] = [o for o in (pos.get("orders") or []) if _order_type(o) != "STOP_MARKET"]
     if st2 == 200:
         pos["orders"].append({"type": "STOP_MARKET", "id": r2.get("algoId") or r2.get("orderId"),
@@ -1967,7 +2048,11 @@ def manage_positions():
             if ev:
                 out.append(ev)
         except Exception as e:
+            # 以前只放進事件、main 寫一行錯誤區就沒了——錯誤被吞掉（第 14 條）
+            _pos_step_error("移損", sym, e)
             out.append({"symbol": sym, "ok": False, "why": str(e)[:100]})
+        else:
+            _pos_step_ok("移損", sym)
     return out
 
 

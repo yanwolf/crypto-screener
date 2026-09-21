@@ -783,15 +783,20 @@ def hourly_prices(cid):
 def _step(name, fn):
     """背景迴圈的一個步驟：各自接住例外，一步出錯不影響其他步驟（第 8 條 r17）。"""
     try:
-        return fn()
+        out = fn()
     except Exception as e:
         sys.stderr.write(f"  ! 部位監看［{name}］失敗：{type(e).__name__}: {str(e)[:100]}\n")
         _step_errors[name] = _step_errors.get(name, 0) + 1
         n = _step_errors[name]
         if trader and trader.alert_due(n):
             push_all(f"⚠ 部位監看［{name}］出錯（第 {n} 次）",
-                     f"{type(e).__name__}: {str(e)[:150]}\n其他步驟（停損守衛等）照常執行。")
+                     f"{type(e).__name__}: {str(e)[:150]}\n其他步驟（停損守衛、待平倉重試等）照常執行。")
         return None
+    # 第 8 條 r19：恢復時歸零並通知，否則下次出錯會接著舊的次數數
+    n = _step_errors.pop(name, 0)
+    if n:
+        push_all(f"部位監看［{name}］恢復", f"已補上：先前出錯 {n} 次。")
+    return out
 
 
 _step_errors = {}
@@ -808,16 +813,25 @@ def position_round(every_s=20):
         if trader.STATE["positions"] or trader.STATE.get("pending"):
             before = len(trader.STATE["trades"])
             _step("對帳", trader.sync_positions)
-            for t in trader.STATE["trades"][before:]:
-                ti, tx = notify_trade_close(t)
-                push_all(ti, tx)
-            for a in list(trader.ADOPTED):
-                push_all("⚠ 認領未記帳的部位",
-                         f"{a['symbol']} 送單後程式沒記到帳，對帳時在交易所找到並接手。\n"
-                         f"數量 {a['qty']:g}　進場 {a['entry']:g}　停損 {a['stop']:g}"
-                         f"（{'已補掛' if a['stopOk'] else '補掛失敗，守衛會再試'}）\n"
-                         f"只補掛了停損，停利與移動停利沒有掛，請留意。")
-            trader.ADOPTED.clear()
+
+            # 通知也是一步：它出錯不能讓後面的守衛與待平倉重試（出場）跳過（第 8 條 r20）
+            def _notify_closes():
+                for t in trader.STATE["trades"][before:]:
+                    ti, tx = notify_trade_close(t)
+                    push_all(ti, tx)
+            _step("平倉通知", _notify_closes)
+
+            def _notify_adopted():
+                try:
+                    for a in list(trader.ADOPTED):
+                        push_all("⚠ 認領未記帳的部位",
+                                 f"{a['symbol']} 送單後程式沒記到帳，對帳時在交易所找到並接手。\n"
+                                 f"數量 {a['qty']:g}　進場 {a['entry']:g}　停損 {a['stop']:g}"
+                                 f"（{'已補掛' if a['stopOk'] else '補掛失敗，守衛會再試'}）\n"
+                                 f"只補掛了停損，停利與移動停利沒有掛，請留意。")
+                finally:
+                    trader.ADOPTED.clear()
+            _step("認領通知", _notify_adopted)
 
             # 主動管理：到 1R 把停損移到成本（失敗記下想要的停損、每輪重試，第 8 條）
             for ev in _step("移損", trader.manage_positions) or []:

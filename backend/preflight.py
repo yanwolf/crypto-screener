@@ -15,7 +15,7 @@ import time
 
 import trader as T
 
-VERSION = "2026-09-21r18"        # 與 BINANCE_LESSONS.md 最上面的版本一致
+VERSION = "2026-09-21r21"        # 與 BINANCE_LESSONS.md 最上面的版本一致
 
 
 def _msg(d):
@@ -102,6 +102,18 @@ def check():
     mine = set(T.STATE.get("positions") or {})
     ghost = mine - live_syms if st == 200 else set()
     extra = live_syms - mine if st == 200 else set()
+    # 第 2 條 r20：全量表裡沒有，不等於交易所沒有（空清單＝查詢異常）。逐幣確認後再下結論。
+    unknown = set()
+    for s_ in sorted(ghost):
+        pos_ = T.STATE["positions"][s_]
+        q = T._live_qty(s_, pos_["side"])
+        if q is None:
+            unknown.add(s_)
+        elif q - float(pos_.get("base") or 0) > 1e-12:
+            live_syms.add(s_)                      # 逐幣查到了：其實還在
+    ghost -= unknown | live_syms
+    if unknown:
+        add("帳與交易所不符", "warn", f"查不到：{'、'.join(sorted(unknown))}（全量表沒有、逐幣也查不到，無法確認，不下結論）", 2)
     if ghost:
         add("帳與交易所不符", "warn", f"帳上有但交易所沒有：{'、'.join(sorted(ghost))}（下一輪對帳會記為平倉）", 2)
     if extra:
@@ -121,7 +133,8 @@ def check():
             for o in tr.get("orders") or []:
                 if o.get("id"):
                     ours.add(str(o["id"]))
-        orphan = [o for o in rows if o.get("symbol") not in live_syms]
+        # 查不到的幣不能判成孤兒（它的停損可能正在保護一個查不到的部位）
+        orphan = [o for o in rows if o.get("symbol") not in live_syms and o.get("symbol") not in unknown]
         per_sym = {}
         for o in rows:
             per_sym[o.get("symbol")] = per_sym.get(o.get("symbol"), 0) + 1

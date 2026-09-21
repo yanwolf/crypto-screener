@@ -14,7 +14,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "backend"))
 sys.path.insert(0, ROOT)
 import trader as T                                              # noqa: E402
-from tests.fake_exchange import Ex, Clock, PROGRAM_ERRORS, Pre, need  # noqa: E402
+from tests.fake_exchange import Ex17, Clock, PROGRAM_ERRORS, Pre, need  # noqa: E402
 
 RESULTS = []
 
@@ -40,32 +40,6 @@ def case(tag, desc, allow=()):
         return fn
     return deco
 
-
-class Ex17(Ex):
-    """補：帶 symbol 的部位查詢可指定回空清單；可指定某幣的部位表只在全量查詢時缺漏。"""
-
-    def __init__(self, mode="oneway"):
-        super().__init__(mode)
-        self.symbol_empty = 0             # 帶 symbol 的 positionRisk 回空清單的次數
-        self.symbol_empty_after_market = False   # 平倉市價單送出之後，帶 symbol 的查詢才開始回空清單
-        self.full_missing = False         # 全量 positionRisk 永遠缺漏所有幣（模擬全量表異常）
-
-    def __call__(self, method, path, params, signed, timeout):
-        params = dict(params or {})
-        if path == "/fapi/v2/positionRisk":
-            if params.get("symbol") and self.symbol_empty_after_market and any(
-                    c[1] == "/fapi/v1/order" and c[2].get("type") == "MARKET" and c[2].get("reduceOnly")
-                    for c in self.calls):
-                self.calls.append((method, path, params))
-                return 200, []
-            if params.get("symbol") and self.symbol_empty > 0:
-                self.symbol_empty -= 1
-                self.calls.append((method, path, params))
-                return 200, []
-            if not params.get("symbol") and self.full_missing:
-                self.calls.append((method, path, params))
-                return 200, []
-        return super().__call__(method, path, params, signed, timeout)
 
 
 def fresh(mode="oneway"):
@@ -164,6 +138,8 @@ def _():
     need(any(c[1] == "/fapi/v2/positionRisk" for c in ex.calls[n0:]), "對帳沒有跑")
     if "XUSDT" not in T.STATE["pending"] and "XUSDT" not in T.STATE["positions"]:
         return "全量表缺漏就判定未成交，交易所上的部位沒人管"
+    # 對照組：逐幣查詢正常時，全量表缺漏也要靠逐幣查到並認領
+    need("XUSDT" in T.STATE["positions"], "對照組：逐幣查得到部位卻沒認領，上面的「沒丟」可能只是什麼都沒做")
 
 
 @case("2-e", "撤孤兒單前確認沒有部位：逐幣查詢回空清單時不能撤")
@@ -176,6 +152,11 @@ def _():
     need(any(c[1] == "/fapi/v2/positionRisk" for c in ex.calls[n0:]), "沒有查部位")
     if r.get("ok") or any(c[0] == "DELETE" for c in ex.calls[n0:]):
         return "查部位回空清單被當成「沒有部位」就撤了"
+    # 對照組：查部位正常、確實沒有部位時，同一張孤兒單要撤得掉
+    m0 = len(ex.calls)
+    r2 = T.cancel_orphan("XUSDT", "5001")
+    need(r2.get("ok") and any(c[0] == "DELETE" for c in ex.calls[m0:]),
+         f"對照組：確實沒有部位時也撤不掉（{r2}），上面的「沒撤」可能是別的原因")
 
 
 # ════ 第 3 條 r16：基準查不到不送、基準走完生命週期 ═════════
@@ -194,6 +175,10 @@ def _():
         return "沒送單卻留下 pending"
     if r.get("ok"):
         return "沒送單卻回報成功"
+    # 對照組：基準查得到時，同樣的呼叫確實會送單
+    m0 = len(ex.calls)
+    r2 = T.open_position("X", "LONG", 100.0, None, stop_pct=5)
+    need(markets(ex, m0, reduce=False), f"對照組：基準查得到時也沒送單（{r2.get('error')}），上面的「沒送」可能是別的原因")
 
 
 @case("3-i", "有基準時認領：用基準均價反推這張單的成交價，並講明是估計值")

@@ -228,3 +228,56 @@ def entry_sent(ex, since=0):
             if not ps or (ps == "LONG") == (prm.get("side") == "BUY"):
                 return True
     return False
+
+
+class Ex17(Ex):
+    """補：帶 symbol 的部位查詢可指定回空清單；可指定某幣的部位表只在全量查詢時缺漏。"""
+
+    def __init__(self, mode="oneway"):
+        super().__init__(mode)
+        self.symbol_empty = 0             # 帶 symbol 的 positionRisk 回空清單的次數
+        self.symbol_empty_after_market = False   # 平倉市價單送出之後，帶 symbol 的查詢才開始回空清單
+        self.full_missing = False         # 全量 positionRisk 永遠缺漏所有幣（模擬全量表異常）
+
+    def __call__(self, method, path, params, signed, timeout):
+        params = dict(params or {})
+        if path == "/fapi/v2/positionRisk":
+            if params.get("symbol") and self.symbol_empty_after_market and any(
+                    c[1] == "/fapi/v1/order" and c[2].get("type") == "MARKET" and c[2].get("reduceOnly")
+                    for c in self.calls):
+                self.calls.append((method, path, params))
+                return 200, []
+            if params.get("symbol") and self.symbol_empty > 0:
+                self.symbol_empty -= 1
+                self.calls.append((method, path, params))
+                return 200, []
+            if not params.get("symbol") and self.full_missing:
+                self.calls.append((method, path, params))
+                return 200, []
+        return super().__call__(method, path, params, signed, timeout)
+
+
+def realistic(fn, positions=None):
+    """把簡化的 _request 替身包一層：查部位（positionRisk）時依帳上部位回傳真實格式的列，其他照原替身。
+
+    行為改成「掛停損前先確認部位」後，替身對查部位回 {} 會被當成查不到、這輪不動（第 2 條 r20）。
+    要補的是模擬環境，不是放寬程式（用法第 5 點 r13）。positions 不給就讀 T.STATE（呼叫當下，不綁舊物件）。
+    """
+    def wrapped(m, path, params=None, signed=False, timeout=15):
+        if path == "/fapi/v2/positionRisk":
+            src = positions if positions is not None else T.STATE["positions"]
+            sym = (params or {}).get("symbol")
+            rows = []
+            for s, p in src.items():
+                if sym and s != sym:
+                    continue
+                q = float(p.get("qty") or 0) + float(p.get("base") or 0)
+                rows.append({"symbol": s, "positionSide": "BOTH",
+                             "positionAmt": str(q if p.get("side") == "LONG" else -q),
+                             "entryPrice": str(p.get("entry") or 0), "markPrice": str(p.get("entry") or 0),
+                             "unRealizedProfit": "0"})
+            if sym and not rows:
+                rows = [{"symbol": sym, "positionSide": "BOTH", "positionAmt": "0", "entryPrice": "0"}]
+            return 200, rows
+        return fn(m, path, params, signed, timeout)
+    return wrapped

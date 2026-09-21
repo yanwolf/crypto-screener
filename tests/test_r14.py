@@ -141,8 +141,8 @@ def _():
     for _ in range(4):
         T.guard_positions()
     after = len([c for c in ex.calls if c[2].get("type") == "STOP_MARKET"])
-    if not any(c[1] == "/fapi/v1/openOrders" for c in ex.calls[n0:]):
-        return "守衛沒有查舊端點（Algo 查詢失敗就整個跳過，等於沒檢查）"
+    need(any(c[1] == "/fapi/v1/openOrders" for c in ex.calls[n0:]),
+         "守衛沒有查舊端點（Algo 查詢失敗就整個跳過，等於沒檢查）")
     if after != before:
         return f"舊端點停損還在，卻補掛了 {after - before} 次"
 
@@ -155,7 +155,9 @@ def _():
     T.STATE["pending"]["XUSDT"] = {"side": "LONG", "qty": 1.0, "stopPct": 5, "note": "", "params": {},
                                    "ts": int(clock.now * 1000)}
     clock.now += 150
+    n0 = len(ex.calls)
     T.sync_positions()
+    need(any(c[1] == "/fapi/v2/positionRisk" for c in ex.calls[n0:]), "對帳沒有跑（前提）")
     if "XUSDT" not in T.STATE["pending"]:
         return "150 秒時交易所還沒反映就把 pending 丟了"
     alerts()
@@ -173,6 +175,8 @@ def _():
     ex, clock = fresh()
     T.AUTO["on"] = True
     T.auto_roll_day()
+    ok0, why0 = T.auto_can_trade("XUSDT")
+    need(ok0, f"對照組：沒有 pending 時本來就不能下單（{why0}），下面的「不能」可能是別的原因")
     T.STATE["pending"]["XUSDT"] = {"side": "LONG", "qty": 1.0, "ts": int(clock.now * 1000)}
     ok, why = T.auto_can_trade("XUSDT")
     if ok:
@@ -241,7 +245,10 @@ def _():
     open_long(ex)
     ex.pos[("XUSDT", "LONG")] = [0, 0]                        # 剛被停損
     n0 = len(market_calls(ex))
+    c0 = len(ex.calls)
     r = T.close_position("XUSDT")
+    need(any(c[1] == "/fapi/v2/positionRisk" and c[2].get("symbol") for c in ex.calls[c0:]),
+         "平倉前沒有查部位（前提：「不送單」要是因為確認了那一側不在）")
     if len(market_calls(ex)) != n0:
         return "那一側已不在，仍送出了平倉單"
     if r.get("ok") or "XUSDT" not in T.STATE["positions"]:
@@ -256,7 +263,9 @@ def _():
     q_mine = T.STATE["positions"]["XUSDT"]["qty"]
     ex.pos[("XUSDT", "LONG")][0] -= q_mine                    # 自己的被停損，剩別人的 2.0
     n0 = len(market_calls(ex))
+    c0 = len(ex.calls)
     T.close_position("XUSDT")
+    need(any(c[1] == "/fapi/v2/positionRisk" and c[2].get("symbol") for c in ex.calls[c0:]), "平倉前沒有查部位（前提）")
     if len(market_calls(ex)) != n0:
         return f"送出了平倉單，會平掉別人的部位（交易所剩 {ex.pos[('XUSDT', 'LONG')][0]}）"
 
@@ -287,8 +296,10 @@ def _():
         return st, d
     T._request_raw = lost
     alerts()
+    n0 = len(ex.calls)
     r = T.close_position("XUSDT")
     a = alerts()
+    need(any(c[2].get("type") == "MARKET" and c[2].get("reduceOnly") for c in ex.calls[n0:]), "平倉單沒有送出（前提）")
     if not r.get("ok") or "XUSDT" in T.STATE["positions"]:
         return "成交了卻沒記成已平倉"
     if any("失敗" in x["title"] for x in a):
@@ -373,6 +384,15 @@ def _():
         T.guard_positions()
     if len(market_calls(ex)) != n0:
         return f"待平倉期間其他路徑又送了 {len(market_calls(ex)) - n0} 張平倉單"
+    # 對照組：同樣設定、沒有待平倉旗標時，移損穿價那條路徑確實會送平倉單
+    ex2, _c = fresh()
+    open_long(ex2)
+    p2 = T.STATE["positions"]["XUSDT"]
+    ex2.reject_algo = lambda params: ((400, {"code": -2021, "msg": "Order would immediately trigger."})
+                                      if float(params.get("triggerPrice") or 0) > 99.5 else None)
+    m0 = len(market_calls(ex2))
+    T.move_to_breakeven(p2, 106.0)
+    need(len(market_calls(ex2)) > m0, "對照組：沒有待平倉時移損穿價也沒送平倉單，上面的「沒送」可能是別的原因")
 
 
 @case("8-g", "全量部位表偶發回空清單：要逐幣確認，不能直接判定全部平倉")
@@ -381,7 +401,10 @@ def _():
     open_long(ex)
     ex.full_list_empty = 1
     n0 = len([c for c in ex.calls if c[0] == "DELETE"])
+    c0 = len(ex.calls)
     T.sync_positions()
+    need(any(c[1] == "/fapi/v2/positionRisk" and not c[2].get("symbol") for c in ex.calls[c0:]),
+         "對帳沒有查全量表（前提）")
     if "XUSDT" not in T.STATE["positions"]:
         return "部位表回空清單就把部位記成平倉"
     if len([c for c in ex.calls if c[0] == "DELETE"]) != n0:

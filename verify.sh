@@ -59,14 +59,12 @@ python3 -m tests.test_r14
 echo "── 12. r15→r17 逐段檢查項目 ──"
 python3 -m tests.test_r17
 
-echo "── 13. 前提斷言突變檢查（用法第 5 點 r17）──"
-# 讓逐幣部位查詢一律回空清單（基準查不到 → 不送單）。會送單的測試必須明確失敗，不能空跑通過。
-for t in test_r11 test_r14 test_r17; do
-  out=$(MUTATE_SYMBOL_EMPTY=1 python3 -m tests.$t 2>&1 || true)
-  n=$(echo "$out" | grep -c "前提不成立" || true)
-  if [ "$n" -lt 1 ]; then echo "  ✕ $t 在前提被破壞時沒有任何「前提不成立」"; exit 1; fi
-  echo "✓ $t：前提被破壞時 $n 項明確失敗"
-done
+echo "── 13. r18→r20 逐段檢查項目 ──"
+python3 -m tests.test_r20
+
+echo "── 14. 測試本身的檢查（用法第 5 點）──"
+python3 -m tests.check_tests          # 每個案例從 fresh() 開始（第 14 種）、否定句要有前提（r19）
+python3 -m tests.mutation_check       # 逐項突變比對：仍通過的必須在豁免清單（r18、r20）
 
 echo
 echo "全部通過"

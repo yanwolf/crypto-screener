@@ -14,7 +14,9 @@ import time
 import importlib
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "backend"))
-import trader as T                                              # noqa: E402
+import trader as T
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from tests.fake_exchange import realistic                     # noqa: E402
 
 FAIL = []
 
@@ -102,7 +104,7 @@ check(not T.has_stop_order([{"algoId": 5, "orderType": "STOP_MARKET", "side": "B
 fresh()
 T.STATE["positions"] = {"XUSDT": pos("LONG", stop_id=111)}
 T.open_algo_orders = lambda sym, **kw: (others, True)
-T._request = lambda m, p, params=None, signed=False, timeout=15: (200, {"algoId": 222})
+T._request = realistic(lambda m, p, params=None, signed=False, timeout=15: (200, {"algoId": 222}))
 for _ in range(3):
     ev = T.guard_positions()
 check(ev and ev[0]["action"] == "restored", "7c 連續三輪確認不在後應補掛")
@@ -128,7 +130,7 @@ def ex8(m, path, params=None, signed=False, timeout=15):
     return 200, {}
 
 
-T._request = ex8
+T._request = realistic(ex8, positions={"XUSDT": p})
 e1 = T.move_to_breakeven(p, be + 0.5)
 check(e1 and e1.get("retry") and e1.get("attempt") == 1 and e1.get("alert"),
       f"8 第一次失敗應回報 attempt=1 並告警，實際 {e1}")
@@ -170,9 +172,9 @@ check(e3 and e3.get("exited") and closed, f"8 價格已穿過想要的停損（-
 fresh()
 p = pos("LONG")
 placed = []
-T._request = lambda m, path, params=None, signed=False, timeout=15: (
+T._request = realistic(lambda m, path, params=None, signed=False, timeout=15: (
     (400, {"code": -1000, "msg": "internal error"}) if m == "DELETE"
-    else (placed.append(1) or (200, {"algoId": 1})))
+    else (placed.append(1) or (200, {"algoId": 1}))), positions={"XUSDT": p})
 e4 = T.move_to_breakeven(p, p["exits"]["breakeven"] + 0.5)
 check(e4 and e4.get("retry") and not placed, "8 撤不掉舊停損時不該掛新的")
 check(any(o["id"] == 111 for o in p["orders"]), "8 撤舊失敗時舊 id 要留在帳上，平倉時一起撤")
@@ -230,14 +232,14 @@ check(due == [1, 5, 30, 150, 270, 390], f"告警節奏應為 1,5,30,150,270,390�
 fresh()
 T.STATE["positions"] = {"XUSDT": pos("LONG", stop_id=111)}
 T.open_algo_orders = lambda sym, **kw: ([], True)                 # 停損不在
-T._request = lambda m, p, params=None, signed=False, timeout=15: (400, {"code": -1000, "msg": "busy"})
+T._request = realistic(lambda m, p, params=None, signed=False, timeout=15: (400, {"code": -1000, "msg": "busy"}))
 alerts = []
 for _ in range(2 + 31):                                     # 前 2 輪只累計不補掛，之後 31 次補掛失敗
     for ev in T.guard_positions():
         if ev["action"] == "alert" and ev["alert"]:
             alerts.append(ev["attempt"])
 check(alerts == [1, 5, 30], f"第 2 條補掛失敗告警應在第 1、5、30 次，實際 {alerts}")
-T._request = lambda m, p, params=None, signed=False, timeout=15: (200, {"algoId": 777})
+T._request = realistic(lambda m, p, params=None, signed=False, timeout=15: (200, {"algoId": 777}))
 ev = T.guard_positions()
 check(ev and ev[0]["action"] == "restored" and ev[0]["fails"] == 31, f"補上時應回報先前失敗次數，實際 {ev}")
 

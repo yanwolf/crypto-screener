@@ -117,8 +117,7 @@ def _():
     T._request_raw = spy
     T._request("POST", "/fapi/v1/order", {"symbol": "XUSDT", "side": "BUY", "type": "MARKET",
                                          "quantity": 1, **T._ps("LONG")}, signed=True)
-    if not seen:
-        return "沒有重送"
+    need(seen, "沒有重送（前提）")
     if seen[0] is True:
         return "重送之前就把反轉值（雙向）寫進了快取"
 
@@ -144,6 +143,7 @@ def _():
     ex._mode_ok = lambda params, k: (False, -4061)
     T._request("POST", "/fapi/v1/order", {"symbol": "XUSDT", "side": "BUY", "type": "MARKET",
                                          "quantity": 1, **T._ps("LONG")}, signed=True)
+    need(len([c for c in ex.calls if c[1] == "/fapi/v1/order"]) >= 2, "沒有重送（前提：要測的是重送失敗之後）")
     if T._mode["hedge"] is not None:
         return f"重送失敗後快取應清空，實際仍是 {T._mode['hedge']}"
 
@@ -171,6 +171,10 @@ def _():
     q, _ = T.wait_position("XUSDT", 1.0, tries=1, gap=0, side="LONG")
     if q > 0:
         return f"把別人的空單 {q} 當成自己的多單已成交"
+    # 對照組（否定句斷言藏在正向描述裡，r19）：自己的多單真的在時，同一個呼叫要找得到
+    ex.pos[("XUSDT", "LONG")] = [1.0, 100.0]
+    q2, _ = T.wait_position("XUSDT", 1.0, tries=1, gap=0, side="LONG")
+    need(q2 > 0, "對照組：自己的多單在時也找不到，上面的「沒當成已成交」可能是查詢本身失敗")
 
 
 # ════ 第 8 條：計數與恢復的位置 ═══════════════════════════
@@ -366,7 +370,9 @@ def _():
     open_long(ex)
     stops_before = len(ex.algo)
     ex.reject_market.add("XUSDT")
+    n0 = len(ex.calls)
     r = T.close_position("XUSDT")
+    need(any(c[2].get("type") == "MARKET" and c[2].get("reduceOnly") for c in ex.calls[n0:]), "平倉單沒有送出（前提）")
     if "XUSDT" not in T.STATE["positions"]:
         return "平倉單被拒，帳上卻記成已平倉"
     if len(ex.algo) < stops_before:
@@ -385,8 +391,11 @@ def _():
             ex.algo.pop(o)
     ex.reject_algo = lambda params: (400, {"code": -1000, "msg": "busy"}) if params.get("type") == "STOP_MARKET" else None
     ex.reject_market.add("XUSDT")
+    n0 = len(ex.calls)
     for _ in range(4):
         T.guard_positions()
+    need(any(c[2].get("type") == "MARKET" and c[2].get("reduceOnly") for c in ex.calls[n0:]),
+         "守衛沒有走到強制平倉（前提）")
     if "XUSDT" not in T.STATE["positions"]:
         return "強制平倉單被拒，帳上卻記成已平倉"
 
@@ -400,11 +409,17 @@ def _():
     ex.reject_algo = lambda params: ((400, {"code": -2021, "msg": "Order would immediately trigger."})
                                      if float(params.get("triggerPrice") or 0) > 99.5 else None)
     ex.reject_market.add("XUSDT")
+    n0 = len(ex.calls)
     T.move_to_breakeven(p, 106.0)
+    need(any(c[0] == "DELETE" for c in ex.calls[n0:]), "移損沒有撤舊停損（前提：要測的是撤了之後）")
+    need(any(c[2].get("type") == "MARKET" and c[2].get("reduceOnly") for c in ex.calls[n0:]), "沒有送出平倉單（前提）")
     if "XUSDT" not in T.STATE["positions"]:
         return "平倉單被拒，帳上卻記成已平倉"
+    # 第 13 種：舊停損在測試前就存在，所以要看「這一步之後」有沒有重新掛上，不看最終狀態
+    replaced = [c[2] for c in ex.calls[n0:] if c[1] == "/fapi/v1/algoOrder" and c[0] == "POST"
+                and c[2].get("type") == "STOP_MARKET" and abs(float(c[2].get("triggerPrice") or 0) - old) < 1e-6]
     live_stops = [v for v in ex.algo.values() if v.get("type") == "STOP_MARKET"]
-    if not any(abs(float(v["triggerPrice"]) - old) < 1e-6 for v in live_stops):
+    if not replaced or not any(abs(float(v["triggerPrice"]) - old) < 1e-6 for v in live_stops):
         return f"舊停損撤了、新的沒掛、平倉失敗 → 裸倉（交易所停損：{[v.get('triggerPrice') for v in live_stops]}）"
 
 
@@ -455,6 +470,7 @@ def _():
     ex.reject_algo = once
     T.place_conditional({"symbol": "XUSDT", "side": "SELL", "type": "STOP_MARKET", "stopPrice": 95.0,
                          "workingType": "MARK_PRICE", **T._close_all("LONG")})
+    need(n["i"] == 1, "第一張沒有收到 -1000（前提）")
     st, _, via = T.place_conditional({"symbol": "XUSDT", "side": "SELL", "type": "STOP_MARKET", "stopPrice": 95.0,
                                       "workingType": "MARK_PRICE", **T._close_all("LONG")})
     if T._algo_supported[0] is False or via != "algo" or st != 200:

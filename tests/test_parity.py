@@ -18,6 +18,8 @@ import importlib
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "backend"))
 import trader as T                                              # noqa: E402
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from tests.fake_exchange import realistic                       # noqa: E402
 
 FAIL = []
 
@@ -123,7 +125,8 @@ for side in ("LONG", "SHORT"):
     T._filters["YUSDT"] = {"tick": 0.01, "step": 0.1, "minQty": 0.1, "minNotional": 5, "status": "TRADING"}
     pos = {"symbol": "YUSDT", "side": side, "qty": 1.0, "entry": entry, "stop": stop,
            "exits": T.plan_exits(entry, stop, side), "orders": [{"type": "STOP_MARKET", "id": 9, "via": "algo"}]}
-    T._request = lambda m, p, params=None, signed=False, timeout=15: (200, {"algoId": 10})
+    T._request = realistic(lambda m, p, params=None, signed=False, timeout=15: (200, {"algoId": 10}),
+                           positions={"YUSDT": pos})         # 移損前會先確認部位（第 2 條 r20）
     be = pos["exits"]["breakeven"]
     check(T.move_to_breakeven(dict(pos), be - sgn * 0.02) is None, f"{side} 未到 breakeven 就移損")
     ev = T.move_to_breakeven(dict(pos), be + sgn * 0.02)
