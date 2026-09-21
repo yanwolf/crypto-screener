@@ -723,13 +723,15 @@ def open_position(symbol_base, side, entry_hint, stop, info=None, note="", stop_
     params = {k: CFG.get(k) for k in PARAM_KEYS}
     # r14：送單前先記下這一側原有的數量。共用帳號、先前的孤兒倉、同側加碼都會讓交易所那一列
     # 包含不屬於這張單的部位；成交確認與認領都要扣掉它，否則數量與均價都會錯。
-    base = _live_qty(sym, side)
+    base, base_entry = _live_row(sym, side)
     base_warn = None
     if base is None:
-        base, base_warn = 0.0, "送單前查不到這一側原有數量，以 0 計"
+        # 第 3 條 r16：基準查不到就不送單——當成 0 送出，之後認領、平倉都會把別人的部位算成自己的
+        return {"ok": False, "error": "送單前查不到這一側原有數量（基準），這次不下單"}
     STATE["pending"][sym] = {"side": side, "qty": qty, "stop": stop, "stopPct": stop_pct,
                              "note": note, "params": params, "minScore": AUTO.get("minScore"),
                              "leverage": lev_used or CFG["leverage"], "base": base,
+                             "baseEntry": base_entry if base else None,
                              "ts": int(time.time() * 1000)}
     save_state()
 
@@ -1007,15 +1009,32 @@ def auto_open(symbol_base, side, entry, stop, note="", on_event=None, stop_pct=N
     return r
 
 
-def _live_qty(symbol, side):
-    """交易所上這個幣、這個方向的數量；查不到回 None（查不到不等於沒有，第 2 條）。"""
+def _live_row(symbol, side):
+    """帶 symbol 查這一側：回傳 (數量, 均價)；查不到回 (None, None)。
+
+    第 2 條 r17：帶 symbol 查時交易所一定會回這個幣的列（單向 1 列 BOTH、雙向 2 列，數量 0 也會回）。
+    回 200 加空清單、或裡面沒有這個幣的列＝查詢異常，要當成「查不到」，不能當成「數量 0」。
+    有這個幣的列、但不是這一側（雙向只回另一側之類）也當成查不到。
+    """
     st, d = _request("GET", "/fapi/v2/positionRisk", {"symbol": symbol}, signed=True)
     if st != 200 or not isinstance(d, list):
-        return None
-    for p in d:
-        if p.get("symbol") == symbol and _row_side(p) == side:
-            return abs(float(p.get("positionAmt") or 0))
-    return 0.0
+        return None, None
+    rows = [p for p in d if p.get("symbol") == symbol]
+    if not rows:
+        return None, None
+    for p in rows:
+        if (p.get("positionSide") or "BOTH") == "BOTH" or p.get("positionSide") == side:
+            s = _row_side(p)
+            amt = abs(float(p.get("positionAmt") or 0))
+            if s is None or s == side:
+                return (amt if s == side else 0.0), float(p.get("entryPrice") or 0)
+            return 0.0, 0.0                   # 單向列，但方向相反：這一側是 0
+    return None, None
+
+
+def _live_qty(symbol, side):
+    """交易所上這個幣、這個方向的數量；查不到回 None（查不到不等於沒有，第 2 條）。"""
+    return _live_row(symbol, side)[0]
 
 
 def _market_close(symbol, side, qty, base=0.0):
@@ -1120,9 +1139,11 @@ def cancel_orphan(symbol, algo_id):
             if str(o.get("id")) == str(algo_id):
                 return {"ok": False, "error": f"這張單屬於帳上的 {p['symbol']} 部位，不是孤兒單"}
     st, d = _request("GET", "/fapi/v2/positionRisk", {"symbol": symbol}, signed=True)
-    if st != 200 or not isinstance(d, list):
+    rows = [r for r in d if r.get("symbol") == symbol] if st == 200 and isinstance(d, list) else []
+    if not rows:
+        # 第 2 條 r17：沒有這個幣的列（含空清單）＝查不到，不是「沒有部位」
         return {"ok": False, "error": "查不到這個幣的部位，為安全起見不撤（查不到不等於不存在）"}
-    if any(abs(float(r.get("positionAmt") or 0)) > 0 for r in d):
+    if any(abs(float(r.get("positionAmt") or 0)) > 0 for r in rows):
         return {"ok": False, "error": f"{symbol} 目前有部位，這張單可能正在保護它，不撤"}
     st, d = _request("DELETE", "/fapi/v1/algoOrder", {"symbol": symbol, "algoId": algo_id}, signed=True)
     if st == 200:
@@ -1194,12 +1215,19 @@ def adopt_pending(live):
         own = (abs(float(lp.get("positionAmt") or 0)) - base) if lp else 0.0
         if own <= 1e-12:
             # r13：這一輪沒看到不能立刻丟——交易所可能還沒反映。180 秒過了才判定未成交並通知。
-            if age > PENDING_EXPIRE_SEC * 1000:
+            if age <= PENDING_EXPIRE_SEC * 1000:
+                continue
+            # 第 2 條 r16：判定「交易所上沒有」要帶 symbol 逐幣查，不能從全量表下結論
+            q, e = _live_row(sym, pd["side"])
+            if q is None:
+                continue                          # 查不到：這輪不判定
+            if q - base <= 1e-12:
                 STATE["pending"].pop(sym, None)
                 save_state()
                 _notify("送出的進場單判定未成交",
-                        f"{sym} 送單後 {PENDING_EXPIRE_SEC} 秒，交易所上仍沒有這一側的新部位，判定未成交，不再等候。")
-            continue
+                        f"{sym} 送單後 {PENDING_EXPIRE_SEC} 秒，逐幣確認交易所上仍沒有這一側的新部位，判定未成交，不再等候。")
+                continue
+            lp = {"positionAmt": str(q), "entryPrice": str(e)}
         try:
             qty = abs(float(lp.get("positionAmt") or 0))
             entry = float(lp.get("entryPrice") or 0)
@@ -1208,6 +1236,12 @@ def adopt_pending(live):
         qty = qty - base                         # r14：扣掉送單前就有的同側部位
         if qty <= 0 or entry <= 0:
             continue
+        merged_entry, estimated = entry, False
+        if base > 0 and pd.get("baseEntry"):
+            # 第 3 條 r16：交易所均價是合併過的；用基準均價反推這張單的成交價（估計值）
+            est = (merged_entry * (qty + base) - float(pd["baseEntry"]) * base) / qty
+            if est > 0:
+                entry, estimated = est, True
         side = pd["side"]
         sp = pd.get("stopPct")
         stop = (entry * (1 - sp / 100) if side == "LONG" else entry * (1 + sp / 100)) if sp else pd.get("stop")
@@ -1221,7 +1255,9 @@ def adopt_pending(live):
                "opened": pd.get("ts"), "note": (pd.get("note") or "") + "（對帳認領）",
                "base": base, "qty0": qty,
                "warnings": ["送單後未記帳，由對帳認領；只補掛停損，停利與移動停利未掛"]
-                           + ([f"送單前這一側已有 {base:g}，交易所均價 {entry:g} 是合併過的，不是這張單的成交價"]
+                           + ([f"送單前這一側已有 {base:g}，進場價 {entry:g} 是用基準均價反推的估計值"
+                               f"（交易所合併均價 {merged_entry:g}）"] if estimated else
+                              [f"送單前這一側已有 {base:g}，交易所均價 {entry:g} 是合併過的，不是這張單的成交價"]
                               if base > 0 else [])}
         st, r, ep = place_conditional({"symbol": sym, "side": close_side, "type": "STOP_MARKET",
                                        "stopPrice": stop_px, "workingType": "MARK_PRICE",
@@ -1442,13 +1478,20 @@ def live_positions(max_age=10):
             mine = STATE["positions"].get(p["symbol"])
             if mine and side != mine["side"]:
                 continue
-            out[p["symbol"]] = {
+            row = {
                 "mark": float(p.get("markPrice") or 0),
                 "pnl": float(p.get("unRealizedProfit") or 0),
                 "entry": float(p.get("entryPrice") or 0),
                 "qty": abs(amt),
                 "liq": float(p.get("liquidationPrice") or 0) or None,
             }
+            base = float((mine or {}).get("base") or 0)
+            if mine and base > 0:
+                # 第 3 條 r16：基準跟著部位走完生命週期——同側有別人的部位時，交易所的損益與數量是合併的
+                own = max(0.0, abs(amt) - base)
+                sgn = 1 if mine["side"] == "LONG" else -1
+                row.update(qty=own, entry=mine["entry"], pnl=(row["mark"] - mine["entry"]) * sgn * own)
+            out[p["symbol"]] = row
         except (TypeError, ValueError):
             continue
     _live_cache["ts"] = now
@@ -1617,9 +1660,14 @@ def open_algo_orders(symbol, include_legacy=False):
     第 1 條 r13：退回舊端點期間，兩個端點都可能有自己的單，要兩邊都查。
     Algo 查詢失敗只有在「目前確實走舊端點」時才能忽略。
     """
-    fb = algo_fallback_active()
     out, algo_ok = [], False
     st, d = _request("GET", "/fapi/v1/openAlgoOrders", {"symbol": symbol}, signed=True)
+    if st == 404 and not algo_fallback_active():
+        # 第 1 條 r16：只有掛單時的 404 才進入退回的話，服務重啟後旗標歸零，
+        # 守衛查 Algo 一直 404、每輪「查詢失敗、跳過」。查詢的 404 也要進入退回期。
+        _algo_supported[0] = False
+        _algo_retry_at[0] = time.time() + ALGO_FALLBACK_SEC
+    fb = algo_fallback_active()
     if st == 200 and isinstance(d, list):
         out, algo_ok = list(d), True
     elif st == 200 and isinstance(d, dict) and isinstance(d.get("orders"), list):
@@ -1659,6 +1707,101 @@ def has_stop_order(orders, pos):
 
 _missing_streak = {}          # symbol → 連續幾次確認停損不在
 _replace_fails = {}           # symbol → 補掛連續失敗幾次（告警節奏用）
+_guard_errors = {}            # symbol → 停損檢查程式出錯幾次（告警節奏用）
+
+
+def _guard_one(sym, pos, events):
+    """檢查單一部位的停損（guard_positions 的迴圈內容）。
+
+    抽成獨立函式，讓 guard_positions 能對每個部位各自接住例外：
+    以前某個部位丟例外，迴圈就中斷，排在後面的部位整輪都不檢查（第 8 條 r17）。
+    """
+    orders, ok = open_algo_orders(sym, include_legacy=any(o.get("via") == "legacy"
+                                                          for o in pos.get("orders") or []))
+    if not ok:
+        return                              # 原則 1
+    if has_stop_order(orders, pos):
+        _missing_streak[sym] = 0
+        n = _replace_fails.pop(sym, 0)
+        if n:                                 # 之前補掛失敗過，現在停損回來了（例如上次逾時但交易所端其實成功）
+            events.append({"symbol": sym, "action": "recovered", "stop": pos["stop"], "fails": n})
+            _notify("停損已恢復", f"{sym} 的停損 {pos['stop']:g} 又查得到了（已補上：先前補掛失敗 {n} 次）。")
+        return
+
+    n = _missing_streak.get(sym, 0) + 1
+    _missing_streak[sym] = n
+    if n < 3:                                 # 原則 2
+        return
+
+    close_side = "SELL" if pos["side"] == "LONG" else "BUY"
+    f = _filters.get(sym) or {}
+    tick = f.get("tick") or 0.0
+    stop_px = round_step(pos["stop"], tick) if tick else pos["stop"]
+
+    st, r, ep = place_conditional({
+        "symbol": sym, "side": close_side, "type": "STOP_MARKET",
+        "stopPrice": stop_px, "workingType": "MARK_PRICE", **_close_all(pos["side"]),
+    })
+    msg = str((r or {}).get("msg") or r)
+    code = r.get("code") if isinstance(r, dict) else None
+    if code == -2021 and not pos.get("pendingClose"):
+        # 第 8 條 r16：停損不見、補掛時價格已穿過停損——停損本來就該觸發了。只告警的話部位沒有停損、
+        # 價格又在錯的那一邊。直接走平倉流程（看結果，失敗就待平倉）；不看 guardClose 設定。
+        # 這條路徑送單時交易所上本來就沒有停損（正是不見了才要補），沒辦法先掛回去，只能盡快出場。
+        _missing_streak[sym] = 0
+        closed, cwhy = _market_close(sym, pos["side"], pos["qty"], pos.get("base") or 0)
+        if closed is True:
+            px = mark_price(sym) or pos["entry"]
+            _replace_fails.pop(sym, None)
+            record_close(pos, px, "停損不見且價格已穿過停損價，直接出場")
+            events.append({"symbol": sym, "action": "closed", "why": msg[:120]})
+            _notify("⚠ 停損不見且價格已穿過，已出場",
+                    f"{sym} 連續三輪查不到停損，補掛時價格已穿過停損價 {stop_px:g}（{msg[:80]}），已市價出場。")
+        elif closed != "gone":
+            _set_pending_close(pos, "停損不見且價格已穿過停損價", cwhy)
+            events.append({"symbol": sym, "action": "pending_close", "why": cwhy})
+        return
+    if st == 200:
+        _missing_streak[sym] = 0
+        prior = _replace_fails.pop(sym, 0)
+        pos["orders"] = [o for o in (pos.get("orders") or []) if _order_type(o) != "STOP_MARKET"]
+        pos["orders"].append({"type": "STOP_MARKET", "id": r.get("algoId") or r.get("orderId"),
+                              "px": stop_px, "via": ep})
+        save_state()
+        events.append({"symbol": sym, "action": "restored", "stop": stop_px, "fails": prior})
+        _notify("停損已補掛", f"{sym} 連續三輪確認停損不在，已重新掛回 {stop_px:g}。"
+                + (f"（已補上：先前補掛失敗 {prior} 次）" if prior else ""))
+        return
+    if "existing" in msg.lower() or "already" in msg.lower():
+        # 原則 3：補掛回報已存在 → 其實停損還在，是誤報。
+        # r10：這也是失敗狀態被清掉的地方，先前若告警過就要發恢復，計數同時歸零。
+        _missing_streak[sym] = 0
+        prior = _replace_fails.pop(sym, 0)
+        events.append({"symbol": sym, "action": "false_alarm", "why": msg[:120], "fails": prior})
+        if prior:
+            _notify("停損已恢復", f"{sym} 補掛回報「已存在」，停損其實在（已補上：先前補掛失敗 {prior} 次）。")
+        return
+
+    # 到這裡：連續三輪確認不在、補掛失敗、且失敗原因不是「已存在」
+    if CFG.get("guardClose") and not pos.get("pendingClose"):   # 原則 4；待平倉期間只讓重試路徑送單
+        closed, cwhy = _market_close(sym, pos["side"], pos["qty"], pos.get("base") or 0)
+        if closed is True:
+            px = mark_price(sym) or pos["entry"]
+            record_close(pos, px, "停損單遺失且無法補掛，強制平倉")
+            events.append({"symbol": sym, "action": "closed", "why": msg[:120]})
+            _notify("⚠ 停損遺失，已強制平倉", f"{sym} 連續三輪查不到停損、補掛也失敗，已依設定市價平倉。\n原因：{msg[:120]}")
+            return
+        msg = f"{msg[:80]}；強制平倉也被拒：{cwhy}"
+    n = _replace_fails.get(sym, 0) + 1
+    _replace_fails[sym] = n
+    events.append({"symbol": sym, "action": "alert", "why": msg[:120],
+                   "stop": stop_px, "attempt": n, "alert": alert_due(n)})
+    if alert_due(n):
+        _notify(f"⚠ 停損不在且補掛失敗（第 {n} 次）",
+                f"{sym}\n想要的停損 {stop_px:g}\n目前停損 無（交易所上找不到本部位的停損）\n"
+                f"第 {n} 次補掛失敗：{msg[:120]}\n"
+                f"每 {CFG.get('positionPoll', 20):g} 秒重試一次，補上時會再通知。"
+                + ("" if CFG.get("guardClose") else "若要讓系統自動平倉，在設定開啟 guardClose。"))
 
 
 def guard_positions():
@@ -1674,74 +1817,20 @@ def guard_positions():
         return []
     events = []
     for sym, pos in list(STATE["positions"].items()):
-        orders, ok = open_algo_orders(sym, include_legacy=any(o.get("via") == "legacy"
-                                                              for o in pos.get("orders") or []))
-        if not ok:
-            continue                              # 原則 1
-        if has_stop_order(orders, pos):
-            _missing_streak[sym] = 0
-            n = _replace_fails.pop(sym, 0)
-            if n:                                 # 之前補掛失敗過，現在停損回來了（例如上次逾時但交易所端其實成功）
-                events.append({"symbol": sym, "action": "recovered", "stop": pos["stop"], "fails": n})
-                _notify("停損已恢復", f"{sym} 的停損 {pos['stop']:g} 又查得到了（已補上：先前補掛失敗 {n} 次）。")
-            continue
-
-        n = _missing_streak.get(sym, 0) + 1
-        _missing_streak[sym] = n
-        if n < 3:                                 # 原則 2
-            continue
-
-        close_side = "SELL" if pos["side"] == "LONG" else "BUY"
-        f = _filters.get(sym) or {}
-        tick = f.get("tick") or 0.0
-        stop_px = round_step(pos["stop"], tick) if tick else pos["stop"]
-
-        st, r, ep = place_conditional({
-            "symbol": sym, "side": close_side, "type": "STOP_MARKET",
-            "stopPrice": stop_px, "workingType": "MARK_PRICE", **_close_all(pos["side"]),
-        })
-        msg = str((r or {}).get("msg") or r)
-        if st == 200:
-            _missing_streak[sym] = 0
-            prior = _replace_fails.pop(sym, 0)
-            pos["orders"] = [o for o in (pos.get("orders") or []) if _order_type(o) != "STOP_MARKET"]
-            pos["orders"].append({"type": "STOP_MARKET", "id": r.get("algoId") or r.get("orderId"),
-                                  "px": stop_px, "via": ep})
-            save_state()
-            events.append({"symbol": sym, "action": "restored", "stop": stop_px, "fails": prior})
-            _notify("停損已補掛", f"{sym} 連續三輪確認停損不在，已重新掛回 {stop_px:g}。"
-                    + (f"（已補上：先前補掛失敗 {prior} 次）" if prior else ""))
-            continue
-        if "existing" in msg.lower() or "already" in msg.lower():
-            # 原則 3：補掛回報已存在 → 其實停損還在，是誤報。
-            # r10：這也是失敗狀態被清掉的地方，先前若告警過就要發恢復，計數同時歸零。
-            _missing_streak[sym] = 0
-            prior = _replace_fails.pop(sym, 0)
-            events.append({"symbol": sym, "action": "false_alarm", "why": msg[:120], "fails": prior})
-            if prior:
-                _notify("停損已恢復", f"{sym} 補掛回報「已存在」，停損其實在（已補上：先前補掛失敗 {prior} 次）。")
-            continue
-
-        # 到這裡：連續三輪確認不在、補掛失敗、且失敗原因不是「已存在」
-        if CFG.get("guardClose") and not pos.get("pendingClose"):   # 原則 4；待平倉期間只讓重試路徑送單
-            closed, cwhy = _market_close(sym, pos["side"], pos["qty"], pos.get("base") or 0)
-            if closed is True:
-                px = mark_price(sym) or pos["entry"]
-                record_close(pos, px, "停損單遺失且無法補掛，強制平倉")
-                events.append({"symbol": sym, "action": "closed", "why": msg[:120]})
-                _notify("⚠ 停損遺失，已強制平倉", f"{sym} 連續三輪查不到停損、補掛也失敗，已依設定市價平倉。\n原因：{msg[:120]}")
-                continue
-            msg = f"{msg[:80]}；強制平倉也被拒：{cwhy}"
-        n = _replace_fails.get(sym, 0) + 1
-        _replace_fails[sym] = n
-        events.append({"symbol": sym, "action": "alert", "why": msg[:120],
-                       "stop": stop_px, "attempt": n, "alert": alert_due(n)})
-        if alert_due(n):
-            _notify(f"⚠ 停損不在且補掛失敗（第 {n} 次）",
-                    f"{sym}\n想要的停損 {stop_px:g}\n目前停損 無（交易所上找不到本部位的停損）\n"
-                    f"第 {n} 次補掛失敗：{msg[:120]}\n"
-                    f"每 {CFG.get('positionPoll', 20):g} 秒重試一次，補上時會再通知。"
-                    + ("" if CFG.get("guardClose") else "若要讓系統自動平倉，在設定開啟 guardClose。"))
+        try:
+            _guard_one(sym, pos, events)
+        except Exception as e:
+            # 一個部位出錯不能讓其他部位跳過檢查；錯誤本身要讓人看到（第 14 條：不能被 try 吞掉）
+            n = _guard_errors.get(sym, 0) + 1
+            _guard_errors[sym] = n
+            sys.stderr.write(f"  ! {sym} 停損檢查出錯（第 {n} 次）：{type(e).__name__}: {str(e)[:100]}\n")
+            if alert_due(n):
+                _notify(f"⚠ 停損檢查出錯（第 {n} 次）",
+                        f"{sym} 檢查停損時程式出錯：{type(e).__name__}: {str(e)[:100]}\n"
+                        f"這個部位的停損沒有被確認。其他部位照常檢查。每 {CFG.get('positionPoll', 20):g} 秒重試一次。")
+        else:
+            if _guard_errors.pop(sym, 0):
+                _notify("停損檢查恢復", f"{sym} 停損檢查恢復正常（已補上）。")
     return events
 
 

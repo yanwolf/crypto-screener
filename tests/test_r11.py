@@ -22,6 +22,8 @@ def case(tag, desc):
     def deco(fn):
         try:
             err = fn()
+        except Pre as e:
+            err = f"前提不成立：{e}"
         except Exception as e:                                  # 修改前的程式可能連介面都沒有
             err = f"{type(e).__name__}: {e}"
         RESULTS.append((tag, desc, err))
@@ -29,7 +31,7 @@ def case(tag, desc):
     return deco
 
 
-from tests.fake_exchange import FakeEx                      # noqa: E402
+from tests.fake_exchange import FakeEx, Pre, need, entry_sent  # noqa: E402
 
 
 def fresh(mode="oneway"):
@@ -54,7 +56,9 @@ def alerts():
 
 def open_long(ex, qty_hint=None):
     ex.mark["XUSDT"] = 100.0
+    n0 = len(ex.calls)
     r = T.open_position("X", "LONG", 100.0, None, stop_pct=5)
+    need(entry_sent(ex, n0), f"進場單沒有送出：{r.get('error')}")   # 前提（用法第 5 點 r17）
     return r
 
 
@@ -190,9 +194,9 @@ def _():
     if not hit:
         return f"第一次失敗沒有告警：{[x['title'] for x in a]}"
     t = hit[0]["text"]
-    for need in ("想要的停損", "目前停損", "busy"):
-        if need not in t:
-            return f"告警缺少「{need}」"
+    for field in ("想要的停損", "目前停損", "busy"):
+        if field not in t:
+            return f"告警缺少「{field}」"
 
 
 @case("8-1b", "殘留單第一次撤不掉就告警（手動平倉路徑也要）")
@@ -333,7 +337,9 @@ def _():
             raise RuntimeError("寫紀錄時爆了")
         return orig(params)
     T.place_conditional = boom
+    n0 = len(ex.calls)
     r = T.auto_open("X", "LONG", 100.0, None, stop_pct=5)
+    need(entry_sent(ex, n0), f"進場單沒有送出：{r.get('error')}")
     if not (r.get("ok") or r.get("filled")):
         return f"已成交卻回報失敗：{r.get('error')}"
     if "XUSDT" not in T.STATE["positions"]:
@@ -347,7 +353,9 @@ def _():
     ex = fresh()
     ex.mark["XUSDT"] = 100.0
     ex.entry_timeout = True
+    n0 = len(ex.calls)
     r = T.open_position("X", "LONG", 100.0, None, stop_pct=5)
+    need(entry_sent(ex, n0), f"進場單沒有送出：{r.get('error')}")
     if "XUSDT" not in (T.STATE.get("pending") or {}) and "XUSDT" not in T.STATE["positions"]:
         return f"回應逾時就清掉 pending，交易所上的部位沒人管：{r.get('error')}"
 
@@ -413,7 +421,9 @@ def _():
         return st, d
     T._request_raw = crash_after_fill
     ex.reject_market.add("XUSDT")
-    T.open_position("X", "LONG", 100.0, None, stop_pct=5)
+    n0 = len(ex.calls)
+    r = T.open_position("X", "LONG", 100.0, None, stop_pct=5)
+    need(entry_sent(ex, n0), f"進場單沒有送出：{r.get('error')}")
     if ex.pos.get(("XUSDT", "LONG"), [0])[0] > 0 and "XUSDT" not in T.STATE["positions"] \
             and "XUSDT" not in (T.STATE.get("pending") or {}):
         return "平倉單被拒，部位還在交易所，帳上與 pending 都沒有紀錄"
@@ -425,7 +435,9 @@ def _():
     ex.mark["XUSDT"] = 100.0
     ex.reject_algo = lambda params: (400, {"code": -1000, "msg": "busy"}) if params.get("type") == "STOP_MARKET" else None
     ex.reject_market.add("XUSDT")
-    T.open_position("X", "LONG", 100.0, None, stop_pct=5)
+    n0 = len(ex.calls)
+    r = T.open_position("X", "LONG", 100.0, None, stop_pct=5)
+    need(entry_sent(ex, n0), f"進場單沒有送出：{r.get('error')}")
     if ex.pos.get(("XUSDT", "LONG"), [0])[0] > 0 and "XUSDT" not in T.STATE["positions"]:
         return "停損掛不上且平倉被拒，部位還在交易所，帳上卻移除了"
 

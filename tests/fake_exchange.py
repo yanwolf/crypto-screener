@@ -3,6 +3,9 @@
 要跟真實幣安一致（BINANCE_LESSONS 用法第 5 點）：條件單送舊端點回 -4120、單向空單為負數、
 雙向回 LONG/SHORT 兩列、雙向超量平倉被拒。test_r11、test_r14 共用。
 """
+import os
+import time as _real_time
+
 import trader as T
 
 
@@ -65,6 +68,8 @@ class FakeEx:
         if path in ("/fapi/v1/leverage", "/fapi/v1/leverageBracket"):
             return 200, {}
         if path == "/fapi/v2/positionRisk":
+            if params.get("symbol") and os.environ.get("MUTATE_SYMBOL_EMPTY"):
+                return 200, []                                # 突變測試：逐幣查詢一律回空清單（基準查不到）
             return 200, self.rows(params.get("symbol"))
         if path == "/fapi/v1/openAlgoOrders":
             return 200, [dict(v, algoId=k) for k, v in self.algo.items()
@@ -117,3 +122,109 @@ class FakeEx:
                 return 200, {}
             return 400, {"code": -2011, "msg": "Unknown order sent."}
         return 200, {}
+
+
+class Clock:
+    """可控的時鐘：只改 time()，其他照真的。sleep 不真的睡。"""
+    def __init__(self):
+        self.now = 1_800_000_000.0
+
+    def time(self):
+        return self.now
+
+    def sleep(self, s):
+        self.now += s
+
+    def __getattr__(self, name):
+        return getattr(_real_time, name)
+
+
+class Ex(FakeEx):
+    """在 test_r11 的模擬交易所上補：Algo 端點 404、舊端點可接受條件單、查舊端點掛單、
+    reduceOnly 沒有部位時拒絕（-2022）、市價單回傳成交均價、全量部位表偶發空清單。"""
+
+    def __init__(self, mode="oneway"):
+        super().__init__(mode)
+        self.algo_404 = False
+        self.legacy_accept = False
+        self.legacy = {}
+        self.full_list_empty = 0
+        self.risk_fail_after_market = False
+
+    def __call__(self, method, path, params, signed, timeout):
+        params = dict(params or {})
+        if path.startswith("/fapi/v1/algoOrder") or path == "/fapi/v1/openAlgoOrders":
+            if self.algo_404:
+                self.calls.append((method, path, params))
+                return 404, {"error": "Not Found"}
+        if path == "/fapi/v1/openOrders":
+            self.calls.append((method, path, params))
+            return 200, [dict(v, orderId=k, type=v.get("type")) for k, v in self.legacy.items()
+                         if v.get("symbol") == params.get("symbol")]
+        if path == "/fapi/v1/order" and method == "POST" and params.get("type") != "MARKET":
+            self.calls.append((method, path, params))
+            if not self.legacy_accept:
+                return 400, {"code": -4120, "msg": "Order type not supported for this endpoint. Please use the Algo Order API endpoints instead."}
+            self.next_id += 1
+            self.legacy[self.next_id] = params
+            return 200, {"orderId": self.next_id}
+        if path == "/fapi/v1/order" and method == "DELETE":
+            self.calls.append((method, path, params))
+            i = int(params.get("orderId") or 0)
+            if i in self.legacy:
+                self.legacy.pop(i)
+                return 200, {}
+            return 400, {"code": -2011, "msg": "Unknown order sent."}
+        if path == "/fapi/v2/positionRisk":
+            if self.risk_fail_after_market and any(c[1] == "/fapi/v1/order" and c[2].get("type") == "MARKET"
+                                                   for c in self.calls):
+                self.calls.append((method, path, params))
+                return 500, {"msg": "Internal error"}
+            if not params.get("symbol") and self.full_list_empty > 0:
+                self.full_list_empty -= 1
+                self.calls.append((method, path, params))
+                return 200, []
+        if path == "/fapi/v1/order" and method == "POST" and params.get("type") == "MARKET":
+            reduce = bool(params.get("reduceOnly")) or (
+                "positionSide" in params and
+                ((params["positionSide"] == "LONG") == (params["side"] == "SELL")))
+            if reduce and self._mode_ok(params, None)[0]:
+                pside = params.get("positionSide") or ("LONG" if params["side"] == "SELL" else "SHORT")
+                if self.pos.get((params["symbol"], pside), [0])[0] <= 0:
+                    self.calls.append((method, path, params))
+                    return 400, {"code": -2022, "msg": "ReduceOnly Order is rejected."}
+            if not reduce:
+                sym = params["symbol"]
+                pside = params.get("positionSide") or ("LONG" if params["side"] == "BUY" else "SHORT")
+                q0, e0 = self.pos.get((sym, pside), [0, 0])
+                fill = self.mark.get(sym, 100.0)
+                st, d = super().__call__(method, path, params, signed, timeout)
+                qty = float(params["quantity"])
+                if st in (200, 0):
+                    self.pos[(sym, pside)] = [q0 + qty, (q0 * e0 + qty * fill) / (q0 + qty)]
+                if st == 200:
+                    d = dict(d, avgPrice=str(fill), executedQty=str(qty), status="FILLED")
+                return st, d
+        return super().__call__(method, path, params, signed, timeout)
+
+
+PROGRAM_ERRORS = ("NameError", "AttributeError", "KeyError", "TypeError", "UnboundLocalError", "Traceback")
+
+
+class Pre(Exception):
+    """前提不成立：測試根本沒走到要測的地方（用法第 5 點 r17）。"""
+
+
+def need(cond, msg):
+    if not cond:
+        raise Pre(msg)
+
+
+def entry_sent(ex, since=0):
+    """這段期間有沒有送出進場市價單（非 reduceOnly、非雙向平倉）。"""
+    for m, p, prm in ex.calls[since:]:
+        if p == "/fapi/v1/order" and prm.get("type") == "MARKET" and not prm.get("reduceOnly"):
+            ps = prm.get("positionSide")
+            if not ps or (ps == "LONG") == (prm.get("side") == "BUY"):
+                return True
+    return False

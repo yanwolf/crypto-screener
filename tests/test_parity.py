@@ -52,6 +52,8 @@ def exchange(sym, mark, qty_holder, side="LONG"):
         if p == "/fapi/v1/order" and params.get("type") == "MARKET":
             qty_holder[0] = float(params["quantity"])
             return 200, {"orderId": 1}
+        if p == "/fapi/v2/positionRisk" and (params or {}).get("symbol") and os.environ.get("MUTATE_SYMBOL_EMPTY"):
+            return 200, []                                        # 突變測試：逐幣查詢回空清單（基準查不到）
         if p == "/fapi/v2/positionRisk":
             q = qty_holder[0]
             hedge = bool(T._mode.get("hedge"))

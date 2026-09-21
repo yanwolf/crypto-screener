@@ -780,67 +780,81 @@ def hourly_prices(cid):
         return None
 
 
+def _step(name, fn):
+    """背景迴圈的一個步驟：各自接住例外，一步出錯不影響其他步驟（第 8 條 r17）。"""
+    try:
+        return fn()
+    except Exception as e:
+        sys.stderr.write(f"  ! 部位監看［{name}］失敗：{type(e).__name__}: {str(e)[:100]}\n")
+        _step_errors[name] = _step_errors.get(name, 0) + 1
+        n = _step_errors[name]
+        if trader and trader.alert_due(n):
+            push_all(f"⚠ 部位監看［{name}］出錯（第 {n} 次）",
+                     f"{type(e).__name__}: {str(e)[:150]}\n其他步驟（停損守衛等）照常執行。")
+        return None
+
+
+_step_errors = {}
+
+
+def position_round(every_s=20):
+    """背景迴圈的一輪。以前整輪包在同一個 try 裡：對帳或移損丟一次例外，
+    這一輪的停損守衛就不跑、告警也送不出去；持續性的錯誤會讓守衛永遠不跑。
+    現在每一步各自隔離，告警在最後一定送出。"""
+    if not trader:
+        return
+    trader.CFG["positionPoll"] = every_s
+    try:
+        if trader.STATE["positions"] or trader.STATE.get("pending"):
+            before = len(trader.STATE["trades"])
+            _step("對帳", trader.sync_positions)
+            for t in trader.STATE["trades"][before:]:
+                ti, tx = notify_trade_close(t)
+                push_all(ti, tx)
+            for a in list(trader.ADOPTED):
+                push_all("⚠ 認領未記帳的部位",
+                         f"{a['symbol']} 送單後程式沒記到帳，對帳時在交易所找到並接手。\n"
+                         f"數量 {a['qty']:g}　進場 {a['entry']:g}　停損 {a['stop']:g}"
+                         f"（{'已補掛' if a['stopOk'] else '補掛失敗，守衛會再試'}）\n"
+                         f"只補掛了停損，停利與移動停利沒有掛，請留意。")
+            trader.ADOPTED.clear()
+
+            # 主動管理：到 1R 把停損移到成本（失敗記下想要的停損、每輪重試，第 8 條）
+            for ev in _step("移損", trader.manage_positions) or []:
+                if ev.get("ok"):
+                    sys.stderr.write(f"  $ {ev['symbol']} 停損移至成本 {ev['new']:g}\n")
+                elif not ev.get("exited"):
+                    sys.stderr.write(f"  ! {ev['symbol']} 移損失敗（第 {ev.get('attempt')} 次）：{ev.get('why')}\n")
+
+            # 確認停損還在：每個部位每輪都跑，不受上面步驟影響
+            for ev in _step("停損守衛", trader.guard_positions) or []:
+                if ev["action"] == "alert":
+                    sys.stderr.write(f"  ! {ev['symbol']} 補掛停損失敗（第 {ev['attempt']} 次）：{ev.get('why')}\n")
+
+        # 平倉沒平掉的部位：每輪重試（第 8 條 r13）。待平倉期間只有這條路會送平倉單（r14）
+        if any(p.get("pendingClose") for p in trader.STATE["positions"].values()):
+            _step("待平倉重試", trader.retry_pending_closes)
+
+        # 平倉後撤不掉的條件單：每輪重試（第 13 條）
+        if trader.STATE.get("leftovers"):
+            _step("殘留單重試", trader.retry_leftovers)
+    finally:
+        # 統一送出：所有在 trader 裡產生的告警與恢復——前面任何一步出錯都一定送
+        for a in trader.drain_alerts():
+            push_all(a["title"], a["text"])
+
+
 def position_worker(every_s=20):
-    """獨立的部位監看執行緒。
+    """獨立的部位監看執行緒：每輪呼叫 position_round。
 
-    停損停利是掛在幣安上的，觸發不需要我們輪詢；
-    這裡只是盡快「發現」它成交了，好記錄績效與推播。
-    綁在 30 分鐘的行情監控上沒有意義——幣安的額度與 CoinGecko 無關，
-    每 20 秒一次也只用掉不到 1% 的權重。
-
-    告警不在這裡決定（BINANCE_LESSONS 第 8 條 r10）：移損、補掛、殘留單、部分出場、
-    平倉失敗的通知都在失敗發生的函式裡產生、放進 trader 的出口，這裡每輪統一送出。
-    這樣任何呼叫端（背景迴圈、反向訊號、網頁手動操作）觸發的失敗都不會漏發。
+    停損停利是掛在幣安上的，觸發不需要我們輪詢；這裡只是盡快「發現」它成交了，
+    好記錄績效與推播，並確認停損還在。每 20 秒一次只用掉不到 1% 的權重。
     """
-    if trader:
-        trader.CFG["positionPoll"] = every_s
     while True:
         try:
-            if trader and (trader.STATE["positions"] or trader.STATE.get("pending")):
-                before = len(trader.STATE["trades"])
-                trader.sync_positions()
-                for t in trader.STATE["trades"][before:]:
-                    ti, tx = notify_trade_close(t)
-                    push_all(ti, tx)
-                for a in trader.ADOPTED:
-                    push_all("⚠ 認領未記帳的部位",
-                             f"{a['symbol']} 送單後程式沒記到帳，對帳時在交易所找到並接手。\n"
-                             f"數量 {a['qty']:g}　進場 {a['entry']:g}　停損 {a['stop']:g}"
-                             f"（{'已補掛' if a['stopOk'] else '補掛失敗，守衛會再試'}）\n"
-                             f"只補掛了停損，停利與移動停利沒有掛，請留意。")
-                trader.ADOPTED.clear()
-
-                # 主動管理：到 1R 把停損移到成本（失敗記下想要的停損、每輪重試，第 8 條）
-                for ev in trader.manage_positions():
-                    if ev.get("ok"):
-                        sys.stderr.write(f"  $ {ev['symbol']} 停損移至成本 {ev['new']:g}\n")
-                    elif not ev.get("exited"):
-                        sys.stderr.write(f"  ! {ev['symbol']} 移損失敗（第 {ev.get('attempt')} 次）：{ev.get('why')}\n")
-
-                # 確認停損還在。預設只警告不平倉——一次誤判造成的平倉，比暫時裸倉幾十秒的損失更大。
-                for ev in trader.guard_positions():
-                    if ev["action"] == "alert":
-                        sys.stderr.write(f"  ! {ev['symbol']} 補掛停損失敗（第 {ev['attempt']} 次）：{ev.get('why')}\n")
-                    elif ev["action"] == "false_alarm":
-                        sys.stderr.write(f"  ~ {ev['symbol']} 停損檢查誤報（交易所回報已存在），不動作\n")
-
-            # 平倉沒平掉的部位：每輪重試（第 8 條 r13）。待平倉期間只有這條路會送平倉單（r14）
-            if trader and any(p.get("pendingClose") for p in trader.STATE["positions"].values()):
-                for ev in trader.retry_pending_closes():
-                    if ev["action"] == "retry":
-                        sys.stderr.write(f"  ! {ev['symbol']} 待平倉重試失敗（第 {ev['attempt']} 次）\n")
-
-            # 平倉後撤不掉的條件單：每輪重試（第 13 條）
-            if trader and trader.STATE.get("leftovers"):
-                trader.retry_leftovers()
-
-            # 統一送出：所有在 trader 裡產生的告警與恢復
-            if trader:
-                for a in trader.drain_alerts():
-                    push_all(a["title"], a["text"])
+            position_round(every_s)
         except Exception as e:
-            sys.stderr.write(f"  ! 部位監看失敗：{str(e)[:100]}\n")
-        # 沒有部位、送單、殘留單時放慢，不必空轉
+            sys.stderr.write(f"  ! 部位監看失敗：{type(e).__name__}: {str(e)[:100]}\n")
         busy = trader and (trader.STATE["positions"] or trader.STATE.get("pending") or trader.STATE.get("leftovers"))
         time.sleep(every_s if busy else 60)
 
