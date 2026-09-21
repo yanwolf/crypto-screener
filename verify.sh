@@ -62,7 +62,10 @@ python3 -m tests.test_r17
 echo "── 13. r18→r20 逐段檢查項目 ──"
 python3 -m tests.test_r20
 
-echo "── 14. 測試本身的檢查（用法第 5 點）──"
+echo "── 14. r21→r23 逐段檢查項目 ──"
+python3 -m tests.test_r23
+
+echo "── 15. 測試本身的檢查（用法第 5 點）──"
 python3 -m tests.check_tests          # 每個案例從 fresh() 開始（第 14 種）、否定句要有前提（r19）
 python3 -m tests.mutation_check       # 逐項突變比對：仍通過的必須在豁免清單（r18、r20）
 

@@ -19,6 +19,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import trader as T                                              # noqa: E402
 from tests.fake_exchange import Ex, Clock, PROGRAM_ERRORS, Pre, need, entry_sent  # noqa: E402
+import tests.fake_exchange as FX           # noqa: E402
 
 RESULTS = []
 
@@ -26,6 +27,7 @@ RESULTS = []
 
 def case(tag, desc):
     def deco(fn):
+        FX.CURRENT[0] = tag                                   # 突變命中紀錄用
         buf, old = io.StringIO(), sys.stderr
         sys.stderr = buf
         try:
@@ -278,7 +280,10 @@ def _():
     open_long(ex)
     ex.reject_market.add("XUSDT")
     ex.risk_fail_after_market = True
+    n0 = len(ex.calls)
     r = T.close_position("XUSDT")
+    need(any(c[2].get("type") == "MARKET" and c[2].get("reduceOnly") for c in ex.calls[n0:]), "平倉單沒有送出（前提）")
+    need(any(c[1] == "/fapi/v2/positionRisk" for c in ex.calls[n0:][1:]), "送單後沒有再查部位（前提：要走的是「再查也失敗」）")
     if r.get("ok") or "XUSDT" not in T.STATE["positions"]:
         return "查不到部位被當成已經沒了"
 

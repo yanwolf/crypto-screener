@@ -886,7 +886,7 @@ def open_position(symbol_base, side, entry_hint, stop, info=None, note="", stop_
         if pos_ is not None:
             pos_.setdefault("warnings", []).append(f"成交後的步驟出錯：{err}")
             save_state()
-            placed = [o["type"] for o in pos_.get("orders") or []] or "無"
+            placed = [o.get("type") for o in pos_.get("orders") or []] or "無"
             _notify("⚠ 已開倉，但後續步驟出錯", f"{sym} 市價單已成交並記帳，之後出錯：{err}\n"
                     f"掛上的單：{placed}。守衛會檢查停損並補掛。")
             return {"ok": True, **pos_, "warnings": pos_["warnings"]}
@@ -1145,6 +1145,30 @@ def retry_pending_closes():
 
 
 def close_position(symbol, reason="手動平倉"):
+    """手動平倉的外層保護（第 8 條 r23）：以「結帳」為界。
+
+    結帳之前出錯（送單、確認查詢丟例外）→ 部位留在帳上、記待平倉、每輪重試、推播；
+    結帳之後出錯 → 已經不可逆，只推播，回報已平倉。以前例外直接往外傳，網頁只看到連線中斷，
+    使用者要平倉的意圖也沒留下。
+    """
+    n0 = len(STATE["trades"])
+    try:
+        return _close_position_impl(symbol, reason)
+    except Exception as e:
+        err = f"{type(e).__name__}: {str(e)[:120]}"
+        booked = len(STATE["trades"]) > n0 and (STATE["trades"][-1] or {}).get("symbol") == symbol
+        if booked:
+            _pos_step_error("手動平倉收尾", symbol, e)
+            return {"ok": True, "symbol": symbol, "warning": f"已平倉，收尾時出錯：{err}"}
+        pos = STATE["positions"].get(symbol)
+        if pos is not None:
+            _set_pending_close(pos, reason, err)
+        _pos_step_error("手動平倉", symbol, e)
+        return {"ok": False, "symbol": symbol,
+                "error": f"平倉途中出錯：{err}" + ("（已記為待平倉，每輪重試）" if pos is not None else "")}
+
+
+def _close_position_impl(symbol, reason="手動平倉"):
     pos = STATE["positions"].get(symbol)
     if not pos:
         return {"ok": False, "error": "沒有這個部位"}
@@ -1325,75 +1349,110 @@ def record_close(pos, exit_px, reason):
     停損觸發 → 停利與移動停利還在；移動停利出場 → closePosition 停損還在。
     下次同一個幣再進場時，舊的 closePosition 停損會讓新停損被拒（第 8 條），
     進而觸發「沒有停損就不留倉」而立刻平倉；共用帳號時還可能動到別的專案的倉。
+
+    以「結帳」為界（第 8 條 r22、r23）：
+      1. 先算好平倉紀錄——只用 .get() 取值，缺欄位時損益記為未知，不能在這裡丟例外；
+      2. 結帳：寫紀錄、從帳上移除、存檔。這一步之後部位就不會再被結一次；
+      3. 結帳之後的每一步（撤剩下的條件單、收尾通知、每日統計）都不可逆或只是通知，各自 try，出錯只推播。
+    以前是「撤條件單 → 發收尾通知 → 算損益 → 結帳」：通知或損益一出錯，條件單已撤、部位卻還在帳上，
+    下一輪對帳又結一次、又出錯，這筆永遠結不了帳。
     """
-    leftover = None
-    if not CFG["dryRun"] and pos.get("orders"):
+    sym_ = pos.get("symbol")
+    now_ms = int(time.time() * 1000)
+    # ── 1. 平倉紀錄（純計算，不可能丟例外）──
+    try:
+        sgn = 1 if pos.get("side") == "LONG" else -1
+        parts = pos.get("partials") or []
+        qty0 = pos.get("qty0") or pos.get("qty") or 0
+        pnl = sum(float(p.get("pnl") or 0) for p in parts) + \
+            (float(exit_px) - float(pos.get("entry") or 0)) * sgn * float(pos.get("qty") or 0)
+        r_unit = float((pos.get("exits") or {}).get("R") or 0) * float(qty0)
+        pnl_r, rmult = round(pnl, 4), (round(pnl / r_unit, 2) if r_unit else None)
+    except Exception as e:
+        parts, qty0, pnl_r, rmult = pos.get("partials") or [], pos.get("qty"), None, None
+        _pos_step_error("結帳損益計算", sym_, e)
+    trade = {
+        "id": f"{sym_}-{now_ms}",
+        "excluded": False,
+        "version": pos.get("version") or "v1",
+        "symbol": sym_, "side": pos.get("side"), "qty": qty0,
+        "partials": parts,
+        "entry": pos.get("entry"), "exit": exit_px, "pnl": pnl_r,
+        "rMultiple": rmult,
+        "orders": pos.get("orders") or [],           # 保留訂單 id，事後查孤兒單用
+        "leftover": None,
+        "opened": pos.get("opened"), "closed": now_ms,
+        "reason": reason, "note": pos.get("note", ""),
+    }
+
+    # ── 2. 結帳（界線）──
+    STATE["trades"].append(trade)
+    STATE["positions"].pop(sym_, None)
+    save_state()
+
+    # ── 3. 界線之後：各自 try，出錯只推播 ──
+    def after(step, fn):
         try:
-            done, gone, failed = cancel_position_orders(pos["symbol"], pos)
-            leftover = {"cancelled": done, "alreadyGone": gone,
-                        "failed": [f_["text"] for f_ in failed]}
+            fn()
         except Exception as e:
-            leftover = {"failed": [str(e)[:80]]}
-            failed = [{"order": o, "why": str(e)[:80]} for o in pos["orders"] if o.get("id")]
+            _pos_step_error(step, sym_, e)
+
+    def _cancel_rest():
+        if CFG["dryRun"] or not pos.get("orders"):
+            return
+        try:
+            done, gone, failed = cancel_position_orders(sym_, pos)
+            trade["leftover"] = {"cancelled": done, "alreadyGone": gone,
+                                 "failed": [f_.get("text") for f_ in failed]}
+        except Exception as e:
+            trade["leftover"] = {"failed": [str(e)[:80]]}
+            failed = [{"order": o, "why": str(e)[:80]} for o in pos.get("orders") or [] if o.get("id")]
         # 撤不掉的放進待撤清單：部位已經平了，重試狀態沒地方放在部位上
         for f_ in failed if isinstance(failed, list) else []:
             if isinstance(f_, dict):
-                o, why = f_["order"], f_["why"]
-                lf = {"symbol": pos["symbol"], "id": o.get("id"), "via": o.get("via"),
+                o = f_.get("order") or {}
+                lf = {"symbol": sym_, "id": o.get("id"), "via": o.get("via"),
                       "type": _order_type(o), "px": o.get("px"), "attempts": 1,
-                      "lastErr": why, "since": int(time.time() * 1000)}
+                      "lastErr": f_.get("why"), "since": now_ms}
                 STATE.setdefault("leftovers", []).append(lf)
-                _leftover_failed(lf)
+                after("殘留單告警", lambda lf=lf: _leftover_failed(lf))
 
-    # r10：失敗狀態隨部位平倉消失的地方——先前告警過就發收尾，計數一併清掉，
-    # 否則同一個幣下次進場時會接著舊的次數數下去
-    sym_ = pos["symbol"]
-    if pos.get("wantStop") is not None and pos.get("beFails"):
-        _notify("移損失敗狀態結束：部位已平倉",
-                f"{sym_} 先前移損到成本失敗 {pos['beFails']} 次（想要 {pos['wantStop']:g}），"
-                f"部位已平倉（{reason}），不再重試。")
-    n_rf = _replace_fails.pop(sym_, 0)
-    _missing_streak.pop(sym_, None)
-    # 第 8 條 r19：以幣名為鍵的出錯次數也要跟著部位結束清掉，否則同幣下一筆會接著數
-    errs = {"停損檢查": _guard_errors.pop(sym_, 0)}
-    for k in [k for k in _pos_errors if k[1] == sym_]:
-        errs[k[0]] = _pos_errors.pop(k)
-    errs = {k: v for k, v in errs.items() if v}
-    if errs:
-        _notify("出錯狀態結束：部位已平倉",
-                f"{sym_} 部位已平倉（{reason}）。先前出錯：" + "、".join(f"{k} {v} 次" for k, v in errs.items()) + "，不再重試。")
-    if n_rf:
-        _notify("補掛失敗狀態結束：部位已平倉",
-                f"{sym_} 先前補掛停損失敗 {n_rf} 次，部位已平倉（{reason}），不再重試。")
-    sgn = 1 if pos["side"] == "LONG" else -1
-    # 損益 ＝ 各次部分出場 ＋ 剩下數量在最後出場價；R 以原始數量計
-    parts = pos.get("partials") or []
-    qty0 = pos.get("qty0") or pos["qty"]
-    pnl = sum(p["pnl"] for p in parts) + (exit_px - pos["entry"]) * sgn * pos["qty"]
-    r = pos["exits"]["R"] * qty0
-    STATE["trades"].append({
-        "id": f"{pos['symbol']}-{int(time.time() * 1000)}",
-        "excluded": False,
-        "version": pos.get("version") or "v1",
-        "symbol": pos["symbol"], "side": pos["side"], "qty": qty0,
-        "partials": parts,
-        "entry": pos["entry"], "exit": exit_px, "pnl": round(pnl, 4),
-        "rMultiple": round(pnl / r, 2) if r else None,
-        "orders": pos.get("orders") or [],           # 保留訂單 id，事後查孤兒單用
-        "leftover": leftover,
-        "opened": pos["opened"], "closed": int(time.time() * 1000),
-        "reason": reason, "note": pos.get("note", ""),
-    })
-    STATE["positions"].pop(pos["symbol"], None)
-    conflict_on_close(pos["symbol"], STATE["trades"][-1].get("rMultiple"))
-    AUTO["lastClose"][pos["symbol"]] = time.time()
-    AUTO.setdefault("lastCloseWin", {})[pos["symbol"]] = (STATE["trades"][-1].get("pnl") or 0) > 0
-    rm = STATE["trades"][-1].get("rMultiple")
-    if rm is not None:
-        auto_roll_day()
-        AUTO["closedR"] += rm
-        AUTO["closedUsd"] = AUTO.get("closedUsd", 0.0) + (STATE["trades"][-1].get("pnl") or 0.0)
-    save_state()
+    def _close_out_states():
+        # r10：失敗狀態隨部位平倉消失的地方——先前告警過就發收尾，計數一併清掉，
+        # 否則同一個幣下次進場時會接著舊的次數數下去
+        n_rf = _replace_fails.pop(sym_, 0)
+        _missing_streak.pop(sym_, None)
+        # 第 8 條 r19：以幣名為鍵的出錯次數也要跟著部位結束清掉
+        errs = {"停損檢查": _guard_errors.pop(sym_, 0)}
+        for k in [k for k in _pos_errors if k[1] == sym_]:
+            errs[k[0]] = _pos_errors.pop(k)
+        errs = {k: v for k, v in errs.items() if v}
+        if pos.get("wantStop") is not None and pos.get("beFails"):
+            want = pos.get("wantStop")
+            want_s = f"{want:g}" if isinstance(want, (int, float)) else str(want)
+            _notify("移損失敗狀態結束：部位已平倉",
+                    f"{sym_} 先前移損到成本失敗 {pos.get('beFails')} 次（想要 {want_s}），部位已平倉（{reason}），不再重試。")
+        if errs:
+            _notify("出錯狀態結束：部位已平倉",
+                    f"{sym_} 部位已平倉（{reason}）。先前出錯：" + "、".join(f"{k} {v} 次" for k, v in errs.items()) + "，不再重試。")
+        if n_rf:
+            _notify("補掛失敗狀態結束：部位已平倉",
+                    f"{sym_} 先前補掛停損失敗 {n_rf} 次，部位已平倉（{reason}），不再重試。")
+
+    def _stats():
+        conflict_on_close(sym_, rmult)
+        AUTO["lastClose"][sym_] = time.time()
+        AUTO.setdefault("lastCloseWin", {})[sym_] = (pnl_r or 0) > 0
+        if rmult is not None:
+            auto_roll_day()
+            AUTO["closedR"] += rmult
+            AUTO["closedUsd"] = AUTO.get("closedUsd", 0.0) + (pnl_r or 0.0)
+
+    after("撤剩餘條件單", _cancel_rest)
+    after("收尾通知", _close_out_states)
+    after("每日統計", _stats)
+    after("存檔", save_state)
+
 
 
 def _row_side(p):
@@ -1819,10 +1878,10 @@ def _guard_one(sym, pos, events):
 
     # 第 2 條 r19：補掛前確認部位（扣基準）。對帳出錯時守衛照樣會跑，部位可能其實已被平掉
     status, st, r, ep = place_stop(pos, stop_px)
-    if status == "unknown":
-        return                                    # 查不到：這輪不動，不算補掛失敗
-    if status == "gone":
-        return                                    # 自己的部位已經沒了：不補，交給對帳記平倉
+    if status in ("unknown", "gone"):
+        # unknown＝查不到：這輪不動，不算補掛失敗；gone＝自己的部位已經沒了：不補，交給對帳記平倉
+        events.append({"symbol": sym, "action": "skip", "why": status})
+        return
     msg = str((r or {}).get("msg") or r)
     code = r.get("code") if isinstance(r, dict) else None
     if code == -2021 and not pos.get("pendingClose"):
@@ -1980,7 +2039,8 @@ def move_to_breakeven(pos, mark, force=False, reason=None):
     # 查不到 → 這輪不動、不算失敗（下輪重試）；已經沒了 → 不動，交給對帳。
     own, s_ = _own_live(pos)
     if s_ != "ok":
-        return None
+        # 回傳略過的原因（unknown＝查不到、gone＝沒了），讓呼叫端與測試分得出兩者（測錯方式第 16 種）；不算失敗
+        return {"symbol": sym, "ok": False, "skipped": s_, "want": want}
 
     if not cancel_stop_orders(sym, pos):
         return _fail("撤不掉舊停損，這輪不動，下輪重試")

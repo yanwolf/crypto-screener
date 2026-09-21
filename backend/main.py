@@ -837,6 +837,8 @@ def position_round(every_s=20):
             for ev in _step("移損", trader.manage_positions) or []:
                 if ev.get("ok"):
                     sys.stderr.write(f"  $ {ev['symbol']} 停損移至成本 {ev['new']:g}\n")
+                elif ev.get("skipped"):
+                    pass                                # 查不到／部位已沒了：不算失敗，下輪再看
                 elif not ev.get("exited"):
                     sys.stderr.write(f"  ! {ev['symbol']} 移損失敗（第 {ev.get('attempt')} 次）：{ev.get('why')}\n")
 
@@ -874,24 +876,52 @@ def position_worker(every_s=20):
 
 
 
+_mon_errors = [0]
+
+
+def monitor_round():
+    """背景監控的一輪（會自動下單）。第 8 條 r23：背景執行緒裡的例外不會回到主迴圈，
+    以前只記在 MON["lastError"] 與錯誤區、不推播。現在出錯照節奏推播、恢復時通知。"""
+    try:
+        if MON["on"]:
+            mon_run_once()          # 額度用盡會自動降級為無金鑰，仍可續跑
+        if trader:
+            try:
+                trader.missed_evaluate(hourly_prices)
+            except Exception as e:
+                sys.stderr.write(f"  ~ 影子追蹤評估失敗：{e}\n")
+        MON["lastError"] = None
+        n = _mon_errors[0]
+        _mon_errors[0] = 0
+        if n:
+            push_all("背景監控恢復", f"已補上：先前出錯 {n} 次。")
+    except Exception as e:
+        MON["lastError"] = str(e)
+        _mon_errors[0] += 1
+        n = _mon_errors[0]
+        sys.stderr.write(f"  ! 背景監控失敗（第 {n} 次）：{type(e).__name__}: {e}\n")
+        if (trader.alert_due(n) if trader else n in (1, 5, 30)):
+            push_all(f"⚠ 背景監控出錯（第 {n} 次）",
+                     f"{type(e).__name__}: {str(e)[:150]}\n這一輪的訊號掃描與自動下單沒有跑完，下一輪會再試。")
+
+
 def monitor_worker(interval_min):
     time.sleep(8)
     while True:
-        try:
-            if MON["on"]:
-                mon_run_once()          # 額度用盡會自動降級為無金鑰，仍可續跑
-            if trader:
-                try:
-                    trader.missed_evaluate(hourly_prices)
-                except Exception as e:
-                    sys.stderr.write(f"  ~ 影子追蹤評估失敗：{e}\n")
-
-                MON["lastError"] = None
-        except Exception as e:
-            MON["lastError"] = str(e)
-            sys.stderr.write(f"  ! 背景監控失敗：{e}\n")
+        monitor_round()
         time.sleep(max(60, interval_min * 60))
 
+
+
+def trade_handle_safe(path, payload):
+    """網頁交易操作（手動開倉、平倉、撤孤兒單…）的外層：第 8 條 r23。
+    請求處理也是另一條執行緒，例外穿出去時網頁只看到連線中斷、沒有推播。"""
+    try:
+        return trade_handle(path, payload)
+    except Exception as e:
+        sys.stderr.write(f"  ! 網頁交易操作 {path} 出錯：{type(e).__name__}: {e}\n")
+        push_all("⚠ 網頁交易操作出錯", f"{path}\n{type(e).__name__}: {str(e)[:150]}")
+        return 500, {"ok": False, "error": f"{type(e).__name__}: {str(e)[:150]}"}
 
 
 def trade_handle(path, payload):
@@ -1548,7 +1578,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         if p.startswith("/api/trade/"):
             qs = urllib.parse.parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "")
             payload = {k: v[0] for k, v in qs.items()}
-            code, body = trade_handle(p, payload)
+            code, body = trade_handle_safe(p, payload)
             return self.send_json(code, json.dumps(body, ensure_ascii=False).encode())
 
         if p.startswith("/api/monitor/"):
@@ -1573,7 +1603,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             return self.send_json(code, json.dumps(body, ensure_ascii=False).encode())
 
         if self.path.startswith("/api/trade/"):
-            code, body = trade_handle(self.path.split("?")[0], payload)
+            code, body = trade_handle_safe(self.path.split("?")[0], payload)
             return self.send_json(code, json.dumps(body, ensure_ascii=False).encode())
 
         if self.path.startswith("/api/monitor/"):
@@ -1986,6 +2016,13 @@ def main():
                 sys.stderr.write("  ⚠ 正在對正式網下單，會動用真實資金\n")
 
             def _trader_warmup():
+                try:
+                    _trader_warmup_body()
+                except Exception as e:
+                    sys.stderr.write(f"  ! 交易暖機失敗：{type(e).__name__}: {e}\n")
+                    push_all("⚠ 交易暖機失敗", f"{type(e).__name__}: {str(e)[:150]}\n交易所規格或時鐘可能沒載入，請看自檢。")
+
+            def _trader_warmup_body():
                 off = trader.sync_time()
                 n = len(trader.load_filters())
                 eq, err = trader.account_equity()

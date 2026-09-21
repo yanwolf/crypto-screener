@@ -1,24 +1,25 @@
 """測試本身的靜態檢查（BINANCE_LESSONS 用法第 5 點）。
 
-1. 測錯方式第 14 種：每個案例的第一個動作要是 fresh()——從乾淨的模組狀態開始，
-   不讓前一個案例留在共用物件（trader 模組的 STATE、計數器）上的狀態帶進來。
-2. 否定句斷言要有前提（r19）：案例描述是否定句（「不能」「沒有」「不送」「仍在」…）時，
-   程式什麼都沒做也會成立，所以案例裡必須有 need(...) 前提斷言。
+1. 測錯方式第 14 種：每個案例的第一個動作要是 fresh()（重建乾淨的模組狀態）。
+2. 否定句斷言要有前提（r19）。**看斷言本身，不看描述**（第 15 種、r22）：
+   本專案的斷言寫法是 `if 條件: return "失敗訊息"`——條件成立就失敗。
+   「程式什麼都沒做時條件也不成立」的斷言就是否定句（例如 `if stops_sent(...)`：沒送才通過）。
+   一個案例裡**所有**失敗分支都是否定句時，程式什麼都沒做整個案例就會通過 → 必須有 need(...) 前提。
+   組合條件：`if A or B` 要求 A、B 都不成立，全部否定才算否定；`if A and B` 任一否定就算。
 
     python3 -m tests.check_tests
 """
 import ast
 import os
-import re
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-FILES = ["test_r11.py", "test_r14.py", "test_r17.py", "test_r20.py"]
-NEG = re.compile(r"不能|不可|沒有|沒送|不送|不撤|不掛|不補|不動|不算|不留|不發|仍在|不再|不是|不影響|照樣|照常")
+FILES = ["test_r11.py", "test_r14.py", "test_r17.py", "test_r20.py", "test_r23.py"]
+STATEY = ("STATE", "positions", "pending", "leftovers", ".pos", "ex.algo")
 
 
-def cases(path):
-    tree = ast.parse(open(path, encoding="utf-8").read())
+def cases(src):
+    tree = ast.parse(src)
     for fn in tree.body:
         if not isinstance(fn, ast.FunctionDef):
             continue
@@ -27,37 +28,105 @@ def cases(path):
                 yield d.args[0].value, d.args[1].value, fn
 
 
-def first_call_is_fresh(fn):
-    body = [s for s in fn.body if not (isinstance(s, ast.Expr) and isinstance(getattr(s, "value", None), ast.Constant))]
-    if not body:
-        return False
-    s = body[0]
-    call = s.value if isinstance(s, (ast.Assign, ast.Expr)) else None
-    return isinstance(call, ast.Call) and getattr(call.func, "id", "") == "fresh"
+def negative(cond, src):
+    """失敗條件 cond：程式什麼都沒做時是否「不成立」（＝這條斷言會空跑通過）。"""
+    if isinstance(cond, ast.BoolOp):
+        parts = [negative(v, src) for v in cond.values]
+        return all(parts) if isinstance(cond.op, ast.Or) else any(parts)
+    if isinstance(cond, ast.UnaryOp) and isinstance(cond.op, ast.Not):
+        return False                                  # if not X：要求 X 發生 → 正向
+    if isinstance(cond, (ast.Call, ast.Name, ast.Attribute, ast.Subscript)):
+        return True                                   # if X：要求 X 沒發生 → 否定
+    if isinstance(cond, ast.Compare) and len(cond.ops) == 1:
+        op, left, right = cond.ops[0], cond.left, cond.comparators[0]
+        rs = ast.get_source_segment(src, right) or ""
+        ls = ast.get_source_segment(src, left) or ""
+        if isinstance(op, ast.NotIn):
+            return any(k in rs for k in STATEY)       # 「還在帳上」之類：什麼都沒做也成立
+        if isinstance(op, ast.In):
+            return False
+        if isinstance(op, ast.IsNot):
+            return True
+        if isinstance(op, ast.Is):
+            return False
+        baseline = any(n in rs or n in ls for n in ("n0", "m0", "c0", "before", "stops_before"))
+        if isinstance(op, ast.NotEq) and baseline:
+            return True                               # if 數量 != 之前：要求沒變 → 否定
+        if isinstance(op, (ast.Gt, ast.GtE)) and isinstance(right, ast.Constant) and right.value in (0, 0.0) \
+                and not ls.startswith("abs("):
+            return True                               # if 找到的數量 > 0：要求沒找到 → 否定
+        return False                                  # 其他數值比對：要求特定值 → 正向
+    return False
+
+
+def fail_branches(fn):
+    """案例裡所有「if 條件: return 字串」的條件（含巢狀）。"""
+    out = []
+    for n in ast.walk(fn):
+        if isinstance(n, ast.If) and n.body and isinstance(n.body[0], ast.Return) and n.body[0].value is not None:
+            out.append(n.test)
+    return out
 
 
 def has_need(fn):
-    return any(isinstance(n, ast.Call) and getattr(n.func, "id", "") == "need"
-               for n in ast.walk(fn))
+    return any(isinstance(n, ast.Call) and getattr(n.func, "id", "") == "need" for n in ast.walk(fn))
+
+
+SELFTEST = [
+    # (人造的案例內容, 應不應該被報出) —— 固定資料，不拿當下的測試檔來驗（r23）
+    ("if stops_sent(ex, n0):\n        return 'x'", True),             # 否定句、沒前提
+    ("if not stops_sent(ex, n0):\n        return 'x'", False),        # 正向
+    ("if q > 0:\n        return 'x'", True),                          # 第 15 種：看似正向描述的否定句
+    ("if abs(q - 1) > 0:\n        return 'x'", False),                # 數值比對：正向
+    ("if a() or not b():\n        return 'x'", False),                # or 裡有正向 → 不空跑
+    ("if a() and not b():\n        return 'x'", True),                # and 裡有否定 → 可能空跑
+    ("if 'X' not in T.STATE['positions']:\n        return 'x'", True),
+    ("if 'busy' not in text:\n        return 'x'", False),
+    ("need(True, 'p')\n    if stops_sent(ex, n0):\n        return 'x'", False),  # 有前提
+    ("if len(market_calls(ex)) != n0:\n        return 'x'", True),
+    ("if len(booked) != 1:\n        return 'x'", False),
+]
+
+
+def selftest():
+    wrong = []
+    for body, want in SELFTEST:
+        src = f"@case('t', 'd')\ndef _():\n    ex = fresh()\n    {body}\n"
+        fn = next(c[2] for c in cases(src))
+        br = fail_branches(fn)
+        got = bool(br) and all(negative(x, src) for x in br) and not has_need(fn)
+        if got != want:
+            wrong.append(f"{body.splitlines()[-2 if 'need' in body else 0].strip()}：預期{'報' if want else '不報'}、實際{'報' if got else '不報'}")
+    return wrong
 
 
 def main():
-    bad = []
-    total = neg = 0
+    wrong = selftest()
+    if wrong:
+        for w in wrong:
+            print("✕ 檢查器自我驗證失敗：" + w)
+        return 1
+    print(f"✓ 檢查器自我驗證：{len(SELFTEST)} 組固定人造資料全部判對")
+    bad, total, neg = [], 0, 0
     for f in FILES:
-        for tag, desc, fn in cases(os.path.join(HERE, f)):
+        src = open(os.path.join(HERE, f), encoding="utf-8").read()
+        for tag, desc, fn in cases(src):
             total += 1
-            if not first_call_is_fresh(fn):
-                bad.append(f"{f} [{tag}] 第一個動作不是 fresh()（第 14 種：可能帶進前一個案例的狀態）")
-            if NEG.search(desc):
+            body = [s for s in fn.body if not (isinstance(s, ast.Expr) and isinstance(getattr(s, "value", None), ast.Constant))]
+            first = body[0] if body else None
+            call = first.value if isinstance(first, (ast.Assign, ast.Expr)) else None
+            if not (isinstance(call, ast.Call) and getattr(call.func, "id", "") == "fresh"):
+                bad.append(f"{f} [{tag}] 第一個動作不是 fresh()（第 14 種）")
+            br = fail_branches(fn)
+            if br and all(negative(c, src) for c in br):
                 neg += 1
                 if not has_need(fn):
-                    bad.append(f"{f} [{tag}] 否定句斷言沒有前提 need(...)：{desc[:40]}")
+                    bad.append(f"{f} [{tag}] 所有斷言都是否定句、沒有前提 need(...)：{desc[:36]}")
     for b in bad:
         print("✕ " + b)
-    print(f"{'✕' if bad else '✓'} 測試靜態檢查：{total} 個案例，其中否定句 {neg} 個；問題 {len(bad)} 項")
-    sys.exit(1 if bad else 0)
+    print(f"{'✕' if bad else '✓'} 測試靜態檢查：{total} 個案例，全否定句 {neg} 個；問題 {len(bad)} 項")
+    return 1 if bad else 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

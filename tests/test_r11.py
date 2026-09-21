@@ -20,6 +20,7 @@ RESULTS = []
 
 def case(tag, desc):
     def deco(fn):
+        FX.CURRENT[0] = tag                                   # 突變命中紀錄用
         try:
             err = fn()
         except Pre as e:
@@ -32,6 +33,7 @@ def case(tag, desc):
 
 
 from tests.fake_exchange import FakeEx, Pre, need, entry_sent  # noqa: E402
+import tests.fake_exchange as FX           # noqa: E402
 
 
 def fresh(mode="oneway"):

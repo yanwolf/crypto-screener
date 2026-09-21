@@ -15,6 +15,7 @@ sys.path.insert(0, os.path.join(ROOT, "backend"))
 sys.path.insert(0, ROOT)
 import trader as T                                              # noqa: E402
 from tests.fake_exchange import Ex17, Clock, PROGRAM_ERRORS, Pre, need  # noqa: E402
+import tests.fake_exchange as FX           # noqa: E402
 
 RESULTS = []
 
@@ -22,6 +23,7 @@ RESULTS = []
 def case(tag, desc, allow=()):
     """allow：這一項刻意注入、預期會出現在錯誤輸出的字串（其他程式錯誤照樣攔下）。"""
     def deco(fn):
+        FX.CURRENT[0] = tag                                   # 突變命中紀錄用
         buf, old = io.StringIO(), sys.stderr
         sys.stderr = buf
         try:

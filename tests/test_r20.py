@@ -17,12 +17,14 @@ sys.path.insert(0, os.path.join(ROOT, "backend"))
 sys.path.insert(0, ROOT)
 import trader as T                                              # noqa: E402
 from tests.fake_exchange import Ex17, Clock, PROGRAM_ERRORS, Pre, need, entry_sent  # noqa: E402
+import tests.fake_exchange as FX           # noqa: E402
 
 RESULTS = []
 
 
 def case(tag, desc, allow=()):
     def deco(fn):
+        FX.CURRENT[0] = tag                                   # 突變命中紀錄用
         buf, old = io.StringIO(), sys.stderr
         sys.stderr = buf
         try:
@@ -87,9 +89,12 @@ def _():
     drop_stop(ex)
     ex.pos[("XUSDT", "LONG")] = [0, 0]                        # 已被平掉，但帳上還在
     n0 = len(ex.calls)
+    evs = []
     for _ in range(4):
-        T.guard_positions()
+        evs += T.guard_positions()
     need(sum(1 for c in ex.calls[n0:] if c[1] == "/fapi/v1/openAlgoOrders") >= 4, "守衛沒有跑滿 4 輪")
+    # 第 16 種：「沒補」要是因為確認的結果是「沒了」，不是「查不到」
+    need(any(e.get("action") == "skip" and e.get("why") == "gone" for e in evs), f"確認的結果不是 gone：{evs}")
     if stops_sent(ex, n0):
         return "部位已被平掉，守衛仍補掛了停損（孤兒 reduce-only 單）"
     # 對照組
@@ -112,9 +117,10 @@ def _():
     T.drain_alerts()
     ex.symbol_empty = 1                                       # 第三輪要補掛時，確認查詢回空清單
     n0 = len(ex.calls)
-    T.guard_positions()
+    evs = T.guard_positions()
     need(any(c[1] == "/fapi/v2/positionRisk" and c[2].get("symbol") for c in ex.calls[n0:]),
          "守衛補掛前沒有查部位")
+    need(any(e.get("action") == "skip" and e.get("why") == "unknown" for e in evs), f"確認的結果不是 unknown：{evs}")
     if stops_sent(ex, n0):
         return "查不到部位仍補掛"
     if T._replace_fails.get("XUSDT"):
@@ -128,9 +134,10 @@ def _():
     p = T.STATE["positions"]["XUSDT"]
     ex.pos[("XUSDT", "LONG")] = [0, 0]
     n0 = len(ex.calls)
-    T.move_to_breakeven(p, 106.0)
+    ev = T.move_to_breakeven(p, 106.0)
     need(any(c[1] == "/fapi/v2/positionRisk" and c[2].get("symbol") for c in ex.calls[n0:]),
          "移損前沒有查部位")
+    need(ev and ev.get("skipped") == "gone", f"確認的結果不是 gone：{ev}")
     if stops_sent(ex, n0):
         return "部位已被平掉，移損仍掛了新停損（孤兒單）"
     if any(c[0] == "DELETE" for c in ex.calls[n0:]):
@@ -150,9 +157,10 @@ def _():
     p = T.STATE["positions"]["XUSDT"]
     ex.symbol_empty = 1
     n0 = len(ex.calls)
-    T.move_to_breakeven(p, 106.0)
+    ev = T.move_to_breakeven(p, 106.0)
     need(any(c[1] == "/fapi/v2/positionRisk" and c[2].get("symbol") for c in ex.calls[n0:]),
          "移損前沒有查部位")
+    need(ev and ev.get("skipped") == "unknown", f"確認的結果不是 unknown：{ev}")
     if any(c[0] == "DELETE" for c in ex.calls[n0:]) or stops_sent(ex, n0):
         return "查不到部位仍動了停損"
     if p.get("beFails"):

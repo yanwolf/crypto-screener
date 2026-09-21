@@ -3,10 +3,30 @@
 要跟真實幣安一致（BINANCE_LESSONS 用法第 5 點）：條件單送舊端點回 -4120、單向空單為負數、
 雙向回 LONG/SHORT 兩列、雙向超量平倉被拒。test_r11、test_r14 共用。
 """
+import atexit
+import json
 import os
 import time as _real_time
 
 import trader as T
+
+# 突變命中紀錄：每一項測試裡，被突變的查詢實際被呼叫幾次（0 次＝這項與突變無關，r23）
+CURRENT = ["?"]
+HITS = {}
+
+
+def _mutation_hit():
+    HITS[CURRENT[0]] = HITS.get(CURRENT[0], 0) + 1
+
+
+def _dump_hits():
+    path = os.environ.get("MUTATION_LOG")
+    if path:
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(HITS, fh, ensure_ascii=False)
+
+
+atexit.register(_dump_hits)
 
 
 class FakeEx:
@@ -69,6 +89,7 @@ class FakeEx:
             return 200, {}
         if path == "/fapi/v2/positionRisk":
             if params.get("symbol") and os.environ.get("MUTATE_SYMBOL_EMPTY"):
+                _mutation_hit()
                 return 200, []                                # 突變測試：逐幣查詢一律回空清單（基準查不到）
             return 200, self.rows(params.get("symbol"))
         if path == "/fapi/v1/openAlgoOrders":
@@ -176,8 +197,9 @@ class Ex(FakeEx):
                 return 200, {}
             return 400, {"code": -2011, "msg": "Unknown order sent."}
         if path == "/fapi/v2/positionRisk":
+            # 只在「平倉單」送出之後才失敗（以前連進場單也算，平倉前的確認就先失敗，r14 的 8-a 因此空跑）
             if self.risk_fail_after_market and any(c[1] == "/fapi/v1/order" and c[2].get("type") == "MARKET"
-                                                   for c in self.calls):
+                                                   and c[2].get("reduceOnly") for c in self.calls):
                 self.calls.append((method, path, params))
                 return 500, {"msg": "Internal error"}
             if not params.get("symbol") and self.full_list_empty > 0:
