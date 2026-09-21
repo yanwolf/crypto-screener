@@ -130,7 +130,9 @@ def ex8(m, path, params=None, signed=False, timeout=15):
 
 T._request = ex8
 e1 = T.move_to_breakeven(p, be + 0.5)
-check(e1 and e1.get("retry") and e1.get("first"), f"8 第一次失敗應回報 retry/first，實際 {e1}")
+check(e1 and e1.get("retry") and e1.get("attempt") == 1 and e1.get("alert"),
+      f"8 第一次失敗應回報 attempt=1 並告警，實際 {e1}")
+check(e1 and e1.get("want") and e1.get("current") == 95.0, "8 告警要帶想要的停損與目前停損")
 check(p.get("wantStop") and p["stop"] == 95.0, "8 失敗後應記下想要的停損、原停損不變")
 e2 = T.move_to_breakeven(p, be - 3.0)                       # 價格已回落到 1R 以下
 check(e2 and e2.get("ok") and e2.get("recovered") and e2.get("fails") == 1,
@@ -158,9 +160,102 @@ e4 = T.move_to_breakeven(p, p["exits"]["breakeven"] + 0.5)
 check(e4 and e4.get("retry") and not placed, "8 撤不掉舊停損時不該掛新的")
 check(any(o["id"] == 111 for o in p["orders"]), "8 撤舊失敗時舊 id 要留在帳上，平倉時一起撤")
 
+
+# ── r7 第 7 條：快取從沒偵測成功（None）且偵測失敗，仍要反轉這張單的假設重送 ──
+fresh()
+T._mode.update({"hedge": None, "ts": 0})
+sent = []
+
+
+def raw_nocache(m, p, params, signed, timeout):
+    sent.append(dict(params))
+    if p == "/fapi/v1/positionSide/dual":
+        return 500, {"msg": "timeout"}                      # 永遠偵測失敗
+    if p == "/fapi/v1/order":
+        return (200, {"orderId": 1}) if "positionSide" in params else (400, {"code": -4061, "msg": "mismatch"})
+    return 200, {}
+
+
+T._request_raw = raw_nocache
+st, _ = T._request("POST", "/fapi/v1/order", {"symbol": "XUSDT", "side": "BUY", "type": "MARKET",
+                                              "quantity": 1, **T._ps("LONG")}, signed=True)
+orders = [s for s in sent if "type" in s]
+check(st == 200 and len(orders) == 2 and "positionSide" not in orders[0] and orders[1].get("positionSide") == "LONG",
+      f"r7-7 快取為空、偵測失敗：應以第一張的假設反轉後重送成功，實際 HTTP {st}，送出 {[('positionSide' in o) for o in orders]}")
+
+# 反方向：當雙向送出、被 -1106 拒（其實是單向）
+fresh()
+T._mode.update({"hedge": True, "ts": time.time()})
+sent = []
+
+
+def raw_1106(m, p, params, signed, timeout):
+    sent.append(dict(params))
+    if p == "/fapi/v1/positionSide/dual":
+        return 500, {"msg": "timeout"}
+    if p == "/fapi/v1/order":
+        return (400, {"code": -4061, "msg": "mismatch"}) if "positionSide" in params else (200, {"orderId": 1})
+    return 200, {}
+
+
+T._request_raw = raw_1106
+st, _ = T._request("POST", "/fapi/v1/order", {"symbol": "XUSDT", "side": "SELL", "type": "MARKET",
+                                              "quantity": 1, **T._reduce("LONG")}, signed=True)
+orders = [s for s in sent if "type" in s]
+check(st == 200 and orders[-1].get("reduceOnly") == "true" and "positionSide" not in orders[-1],
+      "r7-7 當雙向送出被拒：重送應改成單向寫法（reduceOnly、不帶 positionSide）")
+
+# ── 告警節奏：第 1、5、30 次，之後每 120 次 ─────────────────────
+due = [n for n in range(1, 400) if T.alert_due(n)]
+check(due == [1, 5, 30, 150, 270, 390], f"告警節奏應為 1,5,30,150,270,390，實際 {due}")
+
+# ── 第 2 條：守衛補掛失敗依節奏告警、補上時通知 ─────────────────
+fresh()
+T.STATE["positions"] = {"XUSDT": pos("LONG", stop_id=111)}
+T.open_algo_orders = lambda sym: ([], True)                 # 停損不在
+T._request = lambda m, p, params=None, signed=False, timeout=15: (400, {"code": -1000, "msg": "busy"})
+alerts = []
+for _ in range(2 + 31):                                     # 前 2 輪只累計不補掛，之後 31 次補掛失敗
+    for ev in T.guard_positions():
+        if ev["action"] == "alert" and ev["alert"]:
+            alerts.append(ev["attempt"])
+check(alerts == [1, 5, 30], f"第 2 條補掛失敗告警應在第 1、5、30 次，實際 {alerts}")
+T._request = lambda m, p, params=None, signed=False, timeout=15: (200, {"algoId": 777})
+ev = T.guard_positions()
+check(ev and ev[0]["action"] == "restored" and ev[0]["fails"] == 31, f"補上時應回報先前失敗次數，實際 {ev}")
+
+# ── 第 13 條：殘留單撤不掉 → 待撤清單每輪重試 ─────────────────
+fresh()
+p_ = pos("LONG")
+T.STATE["positions"] = {"XUSDT": p_}
+T.STATE["leftovers"] = []
+T.mark_price = lambda s: 99.0
+T._request = lambda m, path, params=None, signed=False, timeout=15: (
+    (400, {"code": -1000, "msg": "busy"}) if m == "DELETE" else (200, {}))
+T.record_close(p_, 99.0, "交易所出場")
+check(len(T.STATE["leftovers"]) == 2 and all(l["attempts"] == 1 for l in T.STATE["leftovers"]),
+      f"平倉時撤不掉的兩張應進待撤清單（attempts=1），實際 {T.STATE['leftovers']}")
+alerted = []
+for _ in range(4):
+    for ev in T.retry_leftovers():
+        if ev["action"] == "alert" and ev["alert"]:
+            alerted.append(ev["attempts"])
+check(alerted == [5, 5], f"殘留單第 5 次應告警（兩張各一次），實際 {alerted}")
+T._request = lambda m, path, params=None, signed=False, timeout=15: (400, {"code": -2011, "msg": "Unknown order sent."})
+rec = [ev for ev in T.retry_leftovers() if ev["action"] == "recovered"]
+check(len(rec) == 2 and T.STATE["leftovers"] == [], "查無此單（已被觸發或撤掉）應視為完成並清出待撤清單")
+
+# r6：恢復時一律再發一次——即使第一次重試就成功（attempts 仍是 1，平倉通知已告警過）
+import re as _re
+_main = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "backend", "main.py")).read()
+_blk = _main[_main.index('if ev["action"] == "recovered":'):_main.index('elif ev.get("alert"):', _main.index('if ev["action"] == "recovered":'))]
+check("attempts\"] > 1" not in _blk and "push_all(\"殘留單已撤掉\"" in _blk,
+      "第 13 條：殘留單撤掉時要一律通知，不能只在失敗超過 1 次時才通知")
+
 if FAIL:
     print(f"✕ 第 7、8 條情境測試：{len(FAIL)} 項失敗")
     for f in FAIL:
         print("   " + f)
     sys.exit(1)
-print("✓ 第 7、8 條情境測試通過（對帳方向 3、模式反轉 1、守衛 id 6、移損重試 4）")
+print("✓ 第 2、7、8、13 條情境測試通過（對帳方向 3、模式反轉 3、守衛 id 6、移損重試 5、"
+      "告警節奏 1、補掛節奏 2、待撤清單 3）")

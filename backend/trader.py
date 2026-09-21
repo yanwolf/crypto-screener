@@ -85,6 +85,7 @@ _time_offset = [0]                 # 伺服器與幣安的時鐘差
 
 STATE = {
     "enabled": False,
+    "leftovers": [],               # 平倉後撤不掉的條件單，每輪重試（第 13 條）
     "pending": {},                 # symbol → 已送單、尚未記帳的部位（第 3 條）
     "positions": {},               # symbol → 部位紀錄
     "trades": [],                  # 已平倉紀錄
@@ -107,6 +108,16 @@ def _sign(params: dict) -> str:
     return q + "&signature=" + sig
 
 
+def alert_due(n):
+    """失敗第 n 次是否該告警（BINANCE_LESSONS 第 8 條，r6 三個專案統一的節奏）。
+
+    第 1、5、30 次各一次，之後每 120 次一次（150、270、390…）；恢復時由呼叫端另發一次。
+    次數不等於時間：本專案的重試迴圈持倉時每 POSITION_POLL（預設 20）秒一輪，
+    所以第 5 次約 1 分 20 秒、第 30 次約 10 分鐘、之後每 120 次約 40 分鐘。
+    """
+    return n in (1, 5, 30) or (n > 30 and (n - 30) % 120 == 0)
+
+
 MODE_MISMATCH = {-4061, -1106}   # -4061 positionSide 與帳戶模式不符；-1106 帶了不該帶的參數
 
 
@@ -121,15 +132,15 @@ def _request(method, path, params=None, signed=False, timeout=15, _retried=False
     st, d = _request_raw(method, path, params, signed, timeout)
     code = d.get("code") if isinstance(d, dict) else None
     if (not _retried and meta.get("_kind") and code in MODE_MISMATCH):
-        # 快取一定錯了：先作廢，重新偵測；偵測失敗就直接反轉（第 7 條）
-        was = _mode["hedge"]
+        # 被拒就證明這張單的假設錯了（第 7 條）：先作廢快取、重新偵測；
+        # 偵測也失敗時，反轉的是「這張單送出時的假設」——帶了 positionSide 就是當雙向送的。
+        # 不能反轉快取：快取可能從沒偵測成功過（None），也可能已被別的執行緒改過，
+        # 用它來反轉會用同一個錯誤假設再送一次。
+        assumed_hedge = "positionSide" in params
         _mode["ts"] = 0
         pm = position_mode()
-        if pm is not None:
-            _mode["hedge"], _mode["ts"] = (pm == "hedge"), time.time()
-        elif was is not None:
-            _mode["hedge"], _mode["ts"] = (not was), time.time()
-        hedge = bool(_mode["hedge"])
+        hedge = (pm == "hedge") if pm is not None else (not assumed_hedge)
+        _mode["hedge"], _mode["ts"] = hedge, time.time()
         for k in ("positionSide", "reduceOnly", "closePosition"):
             params.pop(k, None)
         params.update(_mode_keys(meta["_kind"], meta["_pos"], hedge))
@@ -493,7 +504,8 @@ def cancel_position_orders(symbol, pos, only_type=None):
         if code in (-2011, -2013) or "Unknown" in msg or "not exist" in msg.lower():
             gone += 1
         else:
-            failed.append(f"{_order_type(o)}#{o['id']}：{msg[:60]}")
+            failed.append({"order": o, "why": msg[:80],
+                           "text": f"{_order_type(o)}#{o['id']}：{msg[:60]}"})
     return done, gone, failed
 
 
@@ -930,6 +942,32 @@ def cancel_orphan(symbol, algo_id):
     return {"ok": False, "error": str((d or {}).get("msg") if isinstance(d, dict) else d)[:120]}
 
 
+def retry_leftovers():
+    """每輪重試待撤清單（第 13 條）。回傳事件，節奏同第 8 條。"""
+    events = []
+    if CFG["dryRun"] or not (CFG["key"] and CFG["secret"]):
+        return events
+    keep = []
+    for lf in STATE.get("leftovers") or []:
+        if lf.get("via") == "algo":
+            st, d = _request("DELETE", "/fapi/v1/algoOrder", {"symbol": lf["symbol"], "algoId": lf["id"]}, signed=True)
+        else:
+            st, d = _request("DELETE", "/fapi/v1/order", {"symbol": lf["symbol"], "orderId": lf["id"]}, signed=True)
+        code = d.get("code") if isinstance(d, dict) else None
+        msg = str((d or {}).get("msg") if isinstance(d, dict) else d)
+        if st == 200 or code in (-2011, -2013) or "Unknown" in msg or "not exist" in msg.lower():
+            events.append({"action": "recovered", **lf})
+            continue
+        lf["attempts"] += 1
+        lf["lastErr"] = msg[:80]
+        keep.append(lf)
+        events.append({"action": "alert", "alert": alert_due(lf["attempts"]), **lf})
+    if (STATE.get("leftovers") or []) != keep:
+        STATE["leftovers"] = keep
+        save_state()
+    return events
+
+
 def adopt_pending(live):
     # live：{(symbol, side): positionRisk 列}，只認領方向相符的部位
     """把「送了單但沒記到帳」的部位認領回來（BINANCE_LESSONS 第 3 條）。
@@ -999,9 +1037,19 @@ def record_close(pos, exit_px, reason):
     if not CFG["dryRun"] and pos.get("orders"):
         try:
             done, gone, failed = cancel_position_orders(pos["symbol"], pos)
-            leftover = {"cancelled": done, "alreadyGone": gone, "failed": failed}
+            leftover = {"cancelled": done, "alreadyGone": gone,
+                        "failed": [f_["text"] for f_ in failed]}
         except Exception as e:
             leftover = {"failed": [str(e)[:80]]}
+            failed = [{"order": o, "why": str(e)[:80]} for o in pos["orders"] if o.get("id")]
+        # 撤不掉的放進待撤清單：部位已經平了，重試狀態沒地方放在部位上
+        for f_ in failed if isinstance(failed, list) else []:
+            if isinstance(f_, dict):
+                o, why = f_["order"], f_["why"]
+                STATE.setdefault("leftovers", []).append({
+                    "symbol": pos["symbol"], "id": o.get("id"), "via": o.get("via"),
+                    "type": _order_type(o), "px": o.get("px"), "attempts": 1,
+                    "lastErr": why, "since": int(time.time() * 1000)})
     sgn = 1 if pos["side"] == "LONG" else -1
     pnl = (exit_px - pos["entry"]) * sgn * pos["qty"]
     r = pos["exits"]["R"] * pos["qty"]
@@ -1315,6 +1363,7 @@ def has_stop_order(orders, pos):
 
 
 _missing_streak = {}          # symbol → 連續幾次確認停損不在
+_replace_fails = {}           # symbol → 補掛連續失敗幾次（告警節奏用）
 
 
 def guard_positions():
@@ -1335,6 +1384,9 @@ def guard_positions():
             continue                              # 原則 1
         if has_stop_order(orders, pos):
             _missing_streak[sym] = 0
+            n = _replace_fails.pop(sym, 0)
+            if n:                                 # 之前補掛失敗過，現在停損回來了
+                events.append({"symbol": sym, "action": "recovered", "stop": pos["stop"], "fails": n})
             continue
 
         n = _missing_streak.get(sym, 0) + 1
@@ -1354,11 +1406,12 @@ def guard_positions():
         msg = str((r or {}).get("msg") or r)
         if st == 200:
             _missing_streak[sym] = 0
+            prior = _replace_fails.pop(sym, 0)
             pos["orders"] = [o for o in (pos.get("orders") or []) if _order_type(o) != "STOP_MARKET"]
             pos["orders"].append({"type": "STOP_MARKET", "id": r.get("algoId") or r.get("orderId"),
                                   "px": stop_px, "via": ep})
             save_state()
-            events.append({"symbol": sym, "action": "restored", "stop": stop_px})
+            events.append({"symbol": sym, "action": "restored", "stop": stop_px, "fails": prior})
             continue
         if "existing" in msg.lower() or "already" in msg.lower():
             _missing_streak[sym] = 0              # 原則 3
@@ -1375,8 +1428,10 @@ def guard_positions():
             record_close(pos, px, "停損單遺失且無法補掛，強制平倉")
             events.append({"symbol": sym, "action": "closed", "why": msg[:120]})
         else:
+            n = _replace_fails.get(sym, 0) + 1
+            _replace_fails[sym] = n
             events.append({"symbol": sym, "action": "alert", "why": msg[:120],
-                           "stop": stop_px})
+                           "stop": stop_px, "attempt": n, "alert": alert_due(n)})
     return events
 
 
@@ -1427,10 +1482,13 @@ def move_to_breakeven(pos, mark, force=False):
     fails = pos.get("beFails", 0)
 
     def _fail(why, **extra):
-        pos["beFails"] = fails + 1
+        n = fails + 1
+        pos["beFails"] = n
+        pos["beLastErr"] = why
         save_state()
-        return {"symbol": sym, "ok": False, "retry": True, "first": fails == 0,
-                "want": want, "why": why, **extra}
+        return {"symbol": sym, "ok": False, "retry": True, "attempt": n, "alert": alert_due(n),
+                "want": want, "current": None if extra.get("naked") else pos["stop"],
+                "why": why, **extra}
 
     if not cancel_stop_orders(sym, pos):
         return _fail("撤不掉舊停損，這輪不動，下輪重試")
@@ -1584,7 +1642,8 @@ def save_state():
         return
     try:
         with open(STATE_FILE, "w") as f:
-            json.dump({"state": {k: STATE.get(k) for k in ("enabled", "pending", "positions", "trades", "lastNet")},
+            json.dump({"state": {k: STATE.get(k) for k in ("enabled", "pending", "positions", "trades",
+                                                           "lastNet", "leftovers")},
                        "missed": MISSED, "conflicts": CONFLICTS,
                        "auto": AUTO,
                        # 金鑰與網路別刻意不存：金鑰只該在環境變數，
@@ -1621,6 +1680,7 @@ def load_state(path):
         STATE["trades"] = st.get("trades", [])
         STATE["lastNet"] = st.get("lastNet")
         STATE["pending"] = st.get("pending") or {}
+        STATE["leftovers"] = st.get("leftovers") or []
         for i, t in enumerate(STATE["trades"]):
             if not t.get("id"):
                 t["id"] = f"{t.get('symbol', 'X')}-{t.get('closed') or i}"

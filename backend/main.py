@@ -805,7 +805,7 @@ def position_worker(every_s=20):
                 for ev in trader.manage_positions():
                     sym_ = ev["symbol"]
                     if ev.get("ok"):
-                        extra = f"\n（先前失敗 {ev['fails']} 次，重試後成功）" if ev.get("recovered") else ""
+                        extra = f"\n（已補上：先前失敗 {ev['fails']} 次）" if ev.get("recovered") else ""
                         push_all("停損移至成本",
                                  f"{sym_} 已到 {trader.CFG['breakevenR']}R，"
                                  f"停損從 {ev['old']:g} 移到 {ev['new']:g}（現價 {ev['mark']:g}）。\n"
@@ -815,37 +815,59 @@ def position_worker(every_s=20):
                         push_all("移損時已跌回成本，直接出場",
                                  f"{sym_} 想把停損移到 {ev['want']:g}，但價格已穿過，改以市價出場（約略打平）。")
                     else:
-                        sys.stderr.write(f"  ! {sym_} 移損失敗：{ev.get('why')}\n")
-                        if ev.get("naked"):
-                            push_all("⚠ 停損暫時遺失", f"{sym_} 移損時新舊停損都掛不上，守衛會在下一輪補掛。\n{ev.get('why')}")
-                        elif ev.get("first"):
-                            push_all("移損到成本暫時失敗",
-                                     f"{sym_} 想把停損移到 {ev['want']:g}，這次沒成功：{ev.get('why')}\n"
-                                     f"原停損仍在。之後每輪自動重試，成功時會再通知一次。")
+                        sys.stderr.write(f"  ! {sym_} 移損失敗（第 {ev.get('attempt')} 次）：{ev.get('why')}\n")
+                        if ev.get("alert"):
+                            cur = f"{ev['current']:g}" if ev.get("current") is not None else "無（新舊都掛不上，守衛補掛中）"
+                            push_all(("⚠ 停損暫時遺失" if ev.get("naked") else "移損到成本仍未成功")
+                                     + f"（第 {ev['attempt']} 次）",
+                                     f"{sym_}\n想要的停損 {ev['want']:g}\n目前停損 {cur}\n"
+                                     f"第 {ev['attempt']} 次失敗：{ev.get('why')}\n"
+                                     f"每 {every_s:g} 秒重試一次，成功時會再通知。")
 
                 # 確認停損還在。預設只警告不平倉——
                 # 一次誤判造成的平倉，比暫時裸倉幾十秒的損失更大。
                 for ev in trader.guard_positions():
                     a = ev["action"]
                     if a == "restored":
+                        extra = f"（先前補掛失敗 {ev['fails']} 次）" if ev.get("fails") else ""
                         push_all("停損已補掛",
-                                 f"{ev['symbol']} 連續三輪確認停損不在，已重新掛回 {ev['stop']:g}。")
+                                 f"{ev['symbol']} 連續三輪確認停損不在，已重新掛回 {ev['stop']:g}。{extra}")
+                    elif a == "recovered":
+                        push_all("停損已恢復",
+                                 f"{ev['symbol']} 的停損 {ev['stop']:g} 又查得到了（先前補掛失敗 {ev['fails']} 次）。")
                     elif a == "false_alarm":
                         sys.stderr.write(f"  ~ {ev['symbol']} 停損檢查誤報（交易所回報已存在），不動作\n")
                     elif a == "alert":
-                        push_all("⚠ 需要你處理",
-                                 f"{ev['symbol']} 連續三輪查不到停損單，補掛也失敗。\n"
-                                 f"原因：{ev.get('why')}\n"
-                                 f"請到幣安確認。若要讓系統自動平倉，在設定開啟 guardClose。")
+                        sys.stderr.write(f"  ! {ev['symbol']} 補掛停損失敗（第 {ev['attempt']} 次）：{ev.get('why')}\n")
+                        if ev.get("alert"):
+                            push_all(f"⚠ 停損不在且補掛失敗（第 {ev['attempt']} 次）",
+                                     f"{ev['symbol']}\n想要的停損 {ev['stop']:g}\n目前停損 無（交易所上找不到本部位的停損）\n"
+                                     f"第 {ev['attempt']} 次補掛失敗：{ev.get('why')}\n"
+                                     f"每 {every_s:g} 秒重試一次，補上時會再通知。"
+                                     f"若要讓系統自動平倉，在設定開啟 guardClose。")
                     elif a == "closed":
                         push_all("強制平倉",
                                  f"{ev['symbol']} 停損單遺失且無法補掛，依設定已平倉。\n原因：{ev.get('why')}")
             else:
                 idle += 1
+
+            # 平倉後撤不掉的條件單：每輪重試，節奏同移損（第 13 條）
+            if trader and trader.STATE.get("leftovers"):
+                for ev in trader.retry_leftovers():
+                    tag = f"{ev['symbol']} {ev['type']} #{ev['id']}" + (f" @ {ev['px']:g}" if ev.get("px") else "")
+                    if ev["action"] == "recovered":
+                        # 第 1 次失敗已在平倉通知裡告警過，所以撤掉時一律回報（r6：恢復時再發一次）
+                        push_all("殘留單已撤掉", f"{tag}\n（先前撤單失敗 {ev['attempts']} 次）")
+                    elif ev.get("alert"):
+                        push_all(f"⚠ 殘留單仍撤不掉（第 {ev['attempts']} 次）",
+                                 f"{tag}\n部位已平倉，這張單沒有對應部位。\n"
+                                 f"第 {ev['attempts']} 次撤單失敗：{ev.get('lastErr')}\n"
+                                 f"下次同幣進場時它可能讓新停損被拒。每 {every_s:g} 秒重試一次，撤掉時會再通知。")
         except Exception as e:
             sys.stderr.write(f"  ! 部位監看失敗：{str(e)[:100]}\n")
-        # 沒有部位時放慢，不必空轉
-        time.sleep(every_s if (trader and trader.STATE["positions"]) else 60)
+        # 沒有部位、送單、殘留單時放慢，不必空轉
+        busy = trader and (trader.STATE["positions"] or trader.STATE.get("pending") or trader.STATE.get("leftovers"))
+        time.sleep(every_s if busy else 60)
 
 
 def monitor_worker(interval_min):
