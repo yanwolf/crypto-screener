@@ -15,7 +15,7 @@ import time
 
 import trader as T
 
-VERSION = "2026-09-21r8"        # 與 BINANCE_LESSONS.md 最上面的版本一致
+VERSION = "2026-09-21r12"        # 與 BINANCE_LESSONS.md 最上面的版本一致
 
 
 def _msg(d):

@@ -245,12 +245,21 @@ T._request = lambda m, path, params=None, signed=False, timeout=15: (400, {"code
 rec = [ev for ev in T.retry_leftovers() if ev["action"] == "recovered"]
 check(len(rec) == 2 and T.STATE["leftovers"] == [], "查無此單（已被觸發或撤掉）應視為完成並清出待撤清單")
 
-# r6：恢復時一律再發一次——即使第一次重試就成功（attempts 仍是 1，平倉通知已告警過）
-import re as _re
-_main = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "backend", "main.py")).read()
-_blk = _main[_main.index('if ev["action"] == "recovered":'):_main.index('elif ev.get("alert"):', _main.index('if ev["action"] == "recovered":'))]
-check("attempts\"] > 1" not in _blk and "push_all(\"殘留單已撤掉\"" in _blk,
-      "第 13 條：殘留單撤掉時要一律通知，不能只在失敗超過 1 次時才通知")
+# r6：恢復時一律再發一次——即使第一次重試就成功（失敗次數仍是 1，平倉當下已告警過）
+fresh()
+p1 = pos("LONG")
+T.STATE["positions"] = {"XUSDT": p1}
+T.STATE["leftovers"] = []
+T._request = lambda m, path, params=None, signed=False, timeout=15: (
+    (400, {"code": -1000, "msg": "busy"}) if m == "DELETE" else (200, {}))
+T.record_close(p1, 99.0, "交易所出場")
+first = [a for a in T.drain_alerts() if "殘留單" in a["title"]]
+check(first and "第 1 次" in first[0]["title"], f"第 13 條：平倉當下撤不掉應立即告警第 1 次，實際 {[a['title'] for a in first]}")
+T._request = lambda m, path, params=None, signed=False, timeout=15: (200, {})
+T.retry_leftovers()
+rec = [a for a in T.drain_alerts() if "已撤掉" in a["title"]]
+check(len(rec) == 2 and all("失敗 1 次" in a["text"] for a in rec),
+      f"第 13 條：第一次重試就撤掉也要發恢復，實際 {[a['title'] for a in rec]}")
 
 if FAIL:
     print(f"✕ 第 7、8 條情境測試：{len(FAIL)} 項失敗")

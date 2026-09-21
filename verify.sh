@@ -43,5 +43,8 @@ python3 -m tests.test_parity
 echo "── 9. 踩坑情境（BINANCE_LESSONS 第 2、7、8、13 條）──"
 python3 -m tests.test_lessons
 
+echo "── 10. r8→r11 逐段檢查項目 ──"
+python3 -m tests.test_r11
+
 echo
 echo "全部通過"

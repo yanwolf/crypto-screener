@@ -36,7 +36,9 @@ def fresh(hedge=False):
     T._algo_supported[0] = None
 
 
-def exchange(sym, mark, qty_holder):
+def exchange(sym, mark, qty_holder, side="LONG"):
+    """side：這一輪開倉方向。單向模式下空單要回負數、雙向模式下要回對應的 positionSide，
+    跟真實幣安一致（以前一律回正數的 BOTH，程式改成依方向比對後才發現）。"""
     sent = []
 
     def fake(m, p, params=None, signed=False, timeout=15):
@@ -52,7 +54,10 @@ def exchange(sym, mark, qty_holder):
             return 200, {"orderId": 1}
         if p == "/fapi/v2/positionRisk":
             q = qty_holder[0]
-            return 200, [{"symbol": sym, "positionAmt": str(q), "entryPrice": str(mark), "positionSide": "BOTH",
+            hedge = bool(T._mode.get("hedge"))
+            amt = q if side == "LONG" else -q
+            return 200, [{"symbol": sym, "positionAmt": str(amt), "entryPrice": str(mark),
+                          "positionSide": side if hedge else "BOTH",
                           "markPrice": str(mark), "unRealizedProfit": "0"}]
         if p == "/fapi/v1/algoOrder":
             return 200, {"algoId": len(sent)}
@@ -79,7 +84,7 @@ for case in range(60):
     sym = "XUSDT"
     T._filters[sym] = {"status": "TRADING", "tick": tick, "step": step, "minQty": step, "minNotional": 5}
     q = [0.0]
-    T._request_raw, sent = exchange(sym, mark, q)
+    T._request_raw, sent = exchange(sym, mark, q, side)
     r = T.open_position("X", side, mark, None, stop_pct=sp)
     if not r.get("ok"):
         if "低於最小下單量" in (r.get("error") or ""):

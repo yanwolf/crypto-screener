@@ -19,6 +19,7 @@ import json
 import math
 import os
 import threading
+import sys
 import time
 import urllib.error
 import urllib.parse
@@ -64,6 +65,7 @@ CFG = {
     "trailR": 0.5,                 # 移動停利回撤，以 R 為單位；不同波動的幣才會一致
     "breakevenR": 1.0,             # 到幾 R 把停損移到成本；0 = 關閉
     "guardClose": False,           # 停損補不回來時是否強制平倉。預設只警告
+    "positionPoll": 20,            # 重試迴圈間隔秒數，由 main 依 POSITION_POLL 設定（告警文字用）
     "conflictTighten": False,      # 反向訊號通過閘門時，把持有部位的停損拉到成本
     "useTier": True,               # 風險基準用本金階梯而非實際餘額
     "usablePct": 75,               # 保證金總額上限＝階梯本金 × 此比例
@@ -118,6 +120,22 @@ def alert_due(n):
     return n in (1, 5, 30) or (n > 30 and (n - 30) % 120 == 0)
 
 
+_outbox = []                   # [{"title", "text"}]，由 main 的背景迴圈送 Telegram
+
+
+def _notify(title, text):
+    """在失敗（或恢復）發生的函式裡直接產生通知（BINANCE_LESSONS 第 8 條 r10）。
+    不再交給呼叫端決定要不要發：呼叫端有好幾個，漏掉一個就會少一則告警。"""
+    _outbox.append({"title": title, "text": text, "ts": int(time.time() * 1000)})
+    del _outbox[:-200]
+
+
+def drain_alerts():
+    out = list(_outbox)
+    _outbox.clear()
+    return out
+
+
 MODE_MISMATCH = {-4061, -1106}   # -4061 positionSide 與帳戶模式不符；-1106 帶了不該帶的參數
 
 
@@ -137,14 +155,21 @@ def _request(method, path, params=None, signed=False, timeout=15, _retried=False
         # 不能反轉快取：快取可能從沒偵測成功過（None），也可能已被別的執行緒改過，
         # 用它來反轉會用同一個錯誤假設再送一次。
         assumed_hedge = "positionSide" in params
-        _mode["ts"] = 0
+        _mode["ts"] = 0                                    # 作廢；下一張單會重新偵測
         pm = position_mode()
         hedge = (pm == "hedge") if pm is not None else (not assumed_hedge)
-        _mode["hedge"], _mode["ts"] = hedge, time.time()
         for k in ("positionSide", "reduceOnly", "closePosition"):
             params.pop(k, None)
         params.update(_mode_keys(meta["_kind"], meta["_pos"], hedge))
-        return _request(method, path, params, signed, timeout, _retried=True)
+        # r10：快取在重送「之後」才寫。重送成功 → 寫成成功的假設；
+        # 重送也因模式被拒 → 清掉，不留一個沒驗證過的值給下一張單（也給另一條執行緒）用。
+        st2, d2 = _request(method, path, params, signed, timeout, _retried=True)
+        code2 = d2.get("code") if isinstance(d2, dict) else None
+        if st2 == 200:
+            _mode["hedge"], _mode["ts"] = hedge, time.time()
+        elif code2 in MODE_MISMATCH:
+            _mode["hedge"], _mode["ts"] = None, 0
+        return st2, d2
     return st, d
 
 
@@ -466,12 +491,13 @@ def place_conditional(params: dict):
         if st == 200:
             _algo_supported[0] = True
             return st, d, "algo"
-        code = d.get("code") if isinstance(d, dict) else None
-        # -1121 之類的參數錯不代表端點不存在，只有 404 或未知端點才退回
-        if st == 404 or code in (-1000, -1013) or "Unknown" in str(d):
-            _algo_supported[0] = False
-        else:
+        # 只有 404（端點不存在）才退回舊端點（第 1 條）。
+        # 以前 -1000（幣安的「未知錯誤」，多半是暫時性的）與 -1013（價格／數量過濾器，參數錯）
+        # 也會退回，而且把 _algo_supported 永久設成 False——一次偶發錯誤之後，
+        # 這個程序的所有條件單都改走舊端點、全部 -4120，直到重啟。
+        if st != 404:
             return st, d, "algo"
+        _algo_supported[0] = False
 
     legacy = dict(params)
     st, d = _request("POST", "/fapi/v1/order", legacy, signed=True)
@@ -549,7 +575,10 @@ def wait_position(symbol, want_qty, tries=12, gap=0.5, side="LONG"):
     for i in range(tries):
         st, d = _request("GET", "/fapi/v2/positionRisk", {"symbol": symbol}, signed=True)
         if st == 200 and isinstance(d, list):
-            for p in _my_side_rows(d, symbol, side):
+            for p in d:
+                # 幣＋方向（第 7 條）：單向模式要看正負號，別的專案同幣反向的部位不算
+                if p.get("symbol") != symbol or _row_side(p) != side:
+                    continue
                 try:
                     amt = abs(float(p.get("positionAmt") or 0))
                     ep = float(p.get("entryPrice") or 0)
@@ -685,114 +714,153 @@ def open_position(symbol_base, side, entry_hint, stop, info=None, note="", stop_
         "newOrderRespType": "RESULT", **_ps(side),
     }, signed=True)
     if st != 200:
+        if st == 0 or st >= 500:
+            # 逾時或伺服器錯誤：單可能已經成交（第 8 條 r11）。保留 pending，
+            # 下一輪對帳若在交易所找到部位就認領並補掛停損；2 分鐘沒找到才丟掉。
+            return {"ok": False, "uncertain": True,
+                    "error": f"進場回應異常（{entry_res.get('error') or entry_res.get('msg') or st}），"
+                             f"可能已成交，對帳會確認並接手"}
         STATE["pending"].pop(sym, None)
         save_state()
         return {"ok": False, "error": f"進場失敗：{entry_res.get('msg') or entry_res}"}
 
-    # 等部位真的出現在帳戶上再掛條件單。
-    # 幣安的成交與部位更新之間有延遲，太早掛 closePosition=true 的單會被拒，
-    # 錯誤訊息是「TIF GTE can only be used with open positions」。
-    actual_qty, actual_entry = wait_position(sym, qty, side=side)
-    if actual_qty <= 0:
-        # pending 留著：之後部位若出現，對帳會認領並補掛停損
-        return {"ok": False, "error": "進場單已送出，但 6 秒內查不到部位；已記為待認領，下一輪對帳會自動接手"}
-    qty = actual_qty
-    if actual_entry:
-        px = actual_entry            # 用實際成交均價重算出場位階
-        exits = plan_exits(px, stop, side)
+    # ── 市價單已成交，之後的步驟都包起來（BINANCE_LESSONS 第 8 條 r11）──
+    # 送單成功就是「已成交」。後續任何一步（查部位、算位階、記帳、掛條件單）丟例外，
+    # 都不能把整筆改寫成「下單失敗」：帳上若已記了部位就回報成功並附警告；
+    # 還沒記帳就保留 pending，下一輪對帳認領並補掛停損。今日開倉數也要算進去（auto_open 看 filled）。
+    try:
 
-    tick = (info or {}).get("tick") or 0.01
-    stop_px = round_step(stop, tick)
-    # 出場位階必須用「實際掛出去的停損價」算：用未取整的停損算，R 與各級目標
-    # 會跟真正的停損差一個跳動點，績效的 R 倍數也跟著偏（tests/test_parity.py 抓到的）
-    exits = plan_exits(px, stop_px, side)
-    sub, errs = [], []
+        # 等部位真的出現在帳戶上再掛條件單。
+        # 幣安的成交與部位更新之間有延遲，太早掛 closePosition=true 的單會被拒，
+        # 錯誤訊息是「TIF GTE can only be used with open positions」。
+        actual_qty, actual_entry = wait_position(sym, qty, side=side)
+        if actual_qty <= 0:
+            # pending 留著：之後部位若出現，對帳會認領並補掛停損
+            return {"ok": False, "error": "進場單已送出，但 6 秒內查不到部位；已記為待認領，下一輪對帳會自動接手"}
+        qty = actual_qty
+        if actual_entry:
+            px = actual_entry            # 用實際成交均價重算出場位階
+            exits = plan_exits(px, stop, side)
 
-    # 掛停損前用「當下」的標記價再檢查一次。
-    # 訊號產生到實際下單之間可能隔了幾分鐘，波動大的幣可能已經跌破預定停損；
-    # 這時掛單會被拒（Order would immediately trigger），
-    # 而且更重要的是——這筆的前提已經不成立，不該留倉。
-    live = mark_price(sym) or px
-    buf = 0.002                      # 0.2% 緩衝，避免掛在剛好觸發的邊緣
-    breached = (stop_px >= live * (1 - buf)) if side == "LONG" else (stop_px <= live * (1 + buf))
-    if breached:
-        _request("POST", "/fapi/v1/order", {
-            "symbol": sym, "side": close_side, "type": "MARKET",
-            "quantity": qty, **_reduce(side),
-        }, signed=True)
+        tick = (info or {}).get("tick") or 0.01
+        stop_px = round_step(stop, tick)
+        # 出場位階必須用「實際掛出去的停損價」算：用未取整的停損算，R 與各級目標
+        # 會跟真正的停損差一個跳動點，績效的 R 倍數也跟著偏（tests/test_parity.py 抓到的）
+        exits = plan_exits(px, stop_px, side)
+        sub, errs = [], []
+
+        # 掛停損前用「當下」的標記價再檢查一次。
+        # 訊號產生到實際下單之間可能隔了幾分鐘，波動大的幣可能已經跌破預定停損；
+        # 這時掛單會被拒（Order would immediately trigger），
+        # 而且更重要的是——這筆的前提已經不成立，不該留倉。
+        live = mark_price(sym) or px
+        buf = 0.002                      # 0.2% 緩衝，避免掛在剛好觸發的邊緣
+        breached = (stop_px >= live * (1 - buf)) if side == "LONG" else (stop_px <= live * (1 + buf))
+        if breached:
+            closed, cwhy = _market_close(sym, side, qty)
+            if not closed:
+                # 平不掉：直接記帳交給守衛（它會試著補掛停損、依節奏告警），不讓部位變成沒人管
+                STATE["positions"][sym] = {
+                    "version": strategy_label(params), "leverage": lev_used or CFG["leverage"],
+                    "params": params, "minScore": AUTO.get("minScore"), "symbol": sym, "side": side,
+                    "qty": qty, "qty0": qty, "entry": px, "stop": stop_px, "exits": exits, "sizing": detail,
+                    "orders": [], "opened": int(time.time() * 1000), "note": note,
+                    "warnings": [f"進場瞬間已穿過停損，市價平倉被拒：{cwhy}"]}
+                STATE["pending"].pop(sym, None)
+                save_state()
+                _notify("⚠ 進場後平倉失敗，部位仍在", f"{sym} 下單瞬間已穿過預定停損 {stop_px:g}，市價平倉被拒：{cwhy}\n"
+                                                  f"已記入帳上，守衛會嘗試補掛停損。")
+                return {"ok": False, "filled": True, "error": f"進場瞬間穿過停損，平倉被拒：{cwhy}"}
+            STATE["pending"].pop(sym, None)
+            save_state()
+            return {"ok": False, "error": (
+                f"下單瞬間價格已越過預定停損（現價 {live:g}，停損 {stop_px:g}），"
+                f"進場前提不成立，已立即平倉不留倉位")}
+
+        # 成交確認後立刻記帳，再掛條件單（第 3 條的順序：pending → 記帳 → 掛停損）。
+        # sub 與 pos["orders"] 是同一個串列，後面掛上的單會直接出現在帳上。
+        pos = {
+            "version": strategy_label(params),
+            "leverage": lev_used or CFG["leverage"],
+            "params": params, "minScore": AUTO.get("minScore"),
+            "symbol": sym, "side": side, "qty": qty, "qty0": qty, "entry": px,
+            "stop": stop_px, "exits": exits, "sizing": detail,
+            "orders": sub, "opened": int(time.time() * 1000),
+            "note": note, "warnings": errs,
+        }
+        STATE["positions"][sym] = pos
         STATE["pending"].pop(sym, None)
         save_state()
-        return {"ok": False, "error": (
-            f"下單瞬間價格已越過預定停損（現價 {live:g}，停損 {stop_px:g}），"
-            f"進場前提不成立，已立即平倉不留倉位")}
 
-    # 成交確認後立刻記帳，再掛條件單（第 3 條的順序：pending → 記帳 → 掛停損）。
-    # sub 與 pos["orders"] 是同一個串列，後面掛上的單會直接出現在帳上。
-    pos = {
-        "version": strategy_label(params),
-        "leverage": lev_used or CFG["leverage"],
-        "params": params, "minScore": AUTO.get("minScore"),
-        "symbol": sym, "side": side, "qty": qty, "entry": px,
-        "stop": stop_px, "exits": exits, "sizing": detail,
-        "orders": sub, "opened": int(time.time() * 1000),
-        "note": note, "warnings": errs,
-    }
-    STATE["positions"][sym] = pos
-    STATE["pending"].pop(sym, None)
-    save_state()
+        # 停損：closePosition 確保無論部位多大都全平
+        st2, r2, ep2 = place_conditional({
+            "symbol": sym, "side": close_side, "type": "STOP_MARKET",
+            "stopPrice": stop_px, "workingType": "MARK_PRICE", **_close_all(side),
+        })
+        if st2 != 200:
+            errs.append(f"停損掛單失敗：{r2.get('msg') or r2}")
+            # 沒有停損就不留倉
+            closed, cwhy = _market_close(sym, side, qty)
+            if not closed:
+                pos["warnings"].append(f"停損掛不上，市價平倉也被拒：{cwhy}")
+                save_state()
+                _notify("⚠ 停損掛不上且平倉失敗", f"{sym} 停損掛不上：{'；'.join(errs)}\n市價平倉也被拒：{cwhy}\n"
+                                                f"部位保留在帳上，守衛會繼續補掛停損。")
+                return {"ok": False, "filled": True, "error": "；".join(errs) + f"　平倉也被拒：{cwhy}"}
+            STATE["positions"].pop(sym, None)     # 沒掛上停損就平掉，不列入績效（跟以前一致）
+            save_state()
+            return {"ok": False, "error": "；".join(errs) + "　已立即平倉，避免無停損部位"}
+        sub.append({"type": "STOP_MARKET", "id": r2.get("algoId") or r2.get("orderId"),
+                    "px": stop_px, "via": ep2})
 
-    # 停損：closePosition 確保無論部位多大都全平
-    st2, r2, ep2 = place_conditional({
-        "symbol": sym, "side": close_side, "type": "STOP_MARKET",
-        "stopPrice": stop_px, "workingType": "MARK_PRICE", **_close_all(side),
-    })
-    if st2 != 200:
-        errs.append(f"停損掛單失敗：{r2.get('msg') or r2}")
-        # 沒有停損就不留倉
-        _request("POST", "/fapi/v1/order", {
-            "symbol": sym, "side": close_side, "type": "MARKET",
-            "quantity": qty, **_reduce(side),
-        }, signed=True)
-        STATE["positions"].pop(sym, None)     # 沒掛上停損就平掉，不列入績效（跟以前一致）
+        # 第一目標：出一半，讓剩下的部位零成本奔跑
+        step = (info or {}).get("step") or 0.001
+        tp_qty = round_step(qty * CFG["tp1Portion"], step)
+        if tp_qty > 0:
+            st3, r3, ep3 = place_conditional({
+                "symbol": sym, "side": close_side, "type": "TAKE_PROFIT_MARKET",
+                "stopPrice": round_step(exits["tp1"], tick), "quantity": tp_qty,
+                "workingType": "MARK_PRICE", **_reduce(side),
+            })
+            if st3 == 200:
+                sub.append({"type": "TAKE_PROFIT_MARKET", "id": r3.get("algoId") or r3.get("orderId"),
+                            "px": round_step(exits["tp1"], tick), "qty": tp_qty, "via": ep3})
+            else:
+                errs.append(f"停利掛單失敗：{r3.get('msg') or r3}")
+
+        # 移動停利：到 2R 才啟動，讓趨勢單有機會走遠
+        trail_qty = round_step(qty - tp_qty, step)
+        if trail_qty > 0:
+            st4, r4, ep4 = place_conditional({
+                "symbol": sym, "side": close_side, "type": "TRAILING_STOP_MARKET",
+                "quantity": trail_qty, "callbackRate": exits["trailCallback"],
+                "activationPrice": round_step(exits["trailActivate"], tick),
+                "workingType": "MARK_PRICE", **_reduce(side),
+            })
+            if st4 == 200:
+                sub.append({"type": "TRAILING_STOP_MARKET", "id": r4.get("algoId") or r4.get("orderId"),
+                            "activate": round_step(exits["trailActivate"], tick), "via": ep4})
+            else:
+                errs.append(f"移動停利掛單失敗：{r4.get('msg') or r4}")
+
+        if lev_note:
+            errs.append(lev_note)
         save_state()
-        return {"ok": False, "error": "；".join(errs) + "　已立即平倉，避免無停損部位"}
-    sub.append({"type": "STOP_MARKET", "id": r2.get("algoId") or r2.get("orderId"),
-                "px": stop_px, "via": ep2})
-
-    # 第一目標：出一半，讓剩下的部位零成本奔跑
-    step = (info or {}).get("step") or 0.001
-    tp_qty = round_step(qty * CFG["tp1Portion"], step)
-    if tp_qty > 0:
-        st3, r3, ep3 = place_conditional({
-            "symbol": sym, "side": close_side, "type": "TAKE_PROFIT_MARKET",
-            "stopPrice": round_step(exits["tp1"], tick), "quantity": tp_qty,
-            "workingType": "MARK_PRICE", **_reduce(side),
-        })
-        if st3 == 200:
-            sub.append({"type": "TAKE_PROFIT_MARKET", "id": r3.get("algoId") or r3.get("orderId"),
-                        "px": round_step(exits["tp1"], tick), "qty": tp_qty, "via": ep3})
-        else:
-            errs.append(f"停利掛單失敗：{r3.get('msg') or r3}")
-
-    # 移動停利：到 2R 才啟動，讓趨勢單有機會走遠
-    trail_qty = round_step(qty - tp_qty, step)
-    if trail_qty > 0:
-        st4, r4, ep4 = place_conditional({
-            "symbol": sym, "side": close_side, "type": "TRAILING_STOP_MARKET",
-            "quantity": trail_qty, "callbackRate": exits["trailCallback"],
-            "activationPrice": round_step(exits["trailActivate"], tick),
-            "workingType": "MARK_PRICE", **_reduce(side),
-        })
-        if st4 == 200:
-            sub.append({"type": "TRAILING_STOP_MARKET", "id": r4.get("algoId") or r4.get("orderId"),
-                        "activate": round_step(exits["trailActivate"], tick), "via": ep4})
-        else:
-            errs.append(f"移動停利掛單失敗：{r4.get('msg') or r4}")
-
-    if lev_note:
-        errs.append(lev_note)
-    save_state()
-    return {"ok": True, **pos}
+        return {"ok": True, **pos}
+    except Exception as e:
+        err = f"{type(e).__name__}: {str(e)[:120]}"
+        sys.stderr.write(f"  ! {sym} 已成交，後續步驟例外：{err}\n")
+        pos_ = STATE["positions"].get(sym)
+        if pos_ is not None:
+            pos_.setdefault("warnings", []).append(f"成交後的步驟出錯：{err}")
+            save_state()
+            placed = [o["type"] for o in pos_.get("orders") or []] or "無"
+            _notify("⚠ 已開倉，但後續步驟出錯", f"{sym} 市價單已成交並記帳，之後出錯：{err}\n"
+                    f"掛上的單：{placed}。守衛會檢查停損並補掛。")
+            return {"ok": True, **pos_, "warnings": pos_["warnings"]}
+        _notify("⚠ 已送出進場單，但記帳前出錯", f"{sym} 市價單已送出，記帳前出錯：{err}\n"
+                "已保留待認領紀錄，下一輪對帳會在交易所找到部位並補掛停損。")
+        return {"ok": False, "filled": True, "error": f"已成交，記帳前出錯：{err}（對帳會接手）"}
 
 
 
@@ -817,8 +885,6 @@ AUTO = {
     "lastClose": {},           # symbol → 最後平倉時間
     "blocked": None,           # 當日被停用的原因
 }
-
-
 def _today():
     return time.strftime("%Y-%m-%d", time.gmtime())
 
@@ -896,7 +962,7 @@ def auto_open(symbol_base, side, entry, stop, note="", on_event=None, stop_pct=N
         return {"ok": False, "skipped": True, "error": why}
 
     r = open_position(symbol_base, side, entry, stop, note=note, stop_pct=stop_pct)
-    if r.get("ok"):
+    if r.get("ok") or r.get("filled"):
         AUTO["opened"] += 1
         save_state()
         if on_event:
@@ -904,16 +970,58 @@ def auto_open(symbol_base, side, entry, stop, note="", on_event=None, stop_pct=N
     return r
 
 
+def _live_qty(symbol, side):
+    """交易所上這個幣、這個方向的數量；查不到回 None（查不到不等於沒有，第 2 條）。"""
+    st, d = _request("GET", "/fapi/v2/positionRisk", {"symbol": symbol}, signed=True)
+    if st != 200 or not isinstance(d, list):
+        return None
+    for p in d:
+        if p.get("symbol") == symbol and _row_side(p) == side:
+            return abs(float(p.get("positionAmt") or 0))
+    return 0.0
+
+
+def _market_close(symbol, side, qty):
+    """市價平倉，回傳 (是否確認已平, 說明)。
+
+    送單結果一定要看（BINANCE_LESSONS 第 8 條 r11 的反面）：以前平倉單送出後不看回應就記帳，
+    被拒時帳上記成已平倉、還把停損一起撤掉，真實部位留在交易所而且沒有保護。
+    送單失敗時再查一次部位：已經沒有了（例如同時被停損觸發）才算平了。
+    數量用錯被拒（出一半後帳上數量沒更新、雙向模式下不能超量）就改用交易所上的實際數量重送一次。
+    """
+    close_side = "SELL" if side == "LONG" else "BUY"
+    st, d = _request("POST", "/fapi/v1/order", {
+        "symbol": symbol, "side": close_side, "type": "MARKET",
+        "quantity": qty, **_reduce(side),
+    }, signed=True)
+    if st == 200:
+        return True, None
+    why = str((d or {}).get("msg") if isinstance(d, dict) else d)[:100]
+    live = _live_qty(symbol, side)
+    if live == 0:
+        return True, f"平倉單回應 {why}，但交易所上已無部位"
+    if live and abs(live - qty) > 1e-12:
+        st, d = _request("POST", "/fapi/v1/order", {
+            "symbol": symbol, "side": close_side, "type": "MARKET",
+            "quantity": live, **_reduce(side),
+        }, signed=True)
+        if st == 200:
+            return True, f"帳上數量 {qty:g} 與交易所 {live:g} 不符，改用實際數量平倉"
+        why = str((d or {}).get("msg") if isinstance(d, dict) else d)[:100]
+    return False, why
+
+
 def close_position(symbol, reason="手動平倉"):
     pos = STATE["positions"].get(symbol)
     if not pos:
         return {"ok": False, "error": "沒有這個部位"}
-    close_side = "SELL" if pos["side"] == "LONG" else "BUY"
     if not CFG["dryRun"]:
-        _request("POST", "/fapi/v1/order", {
-            "symbol": symbol, "side": close_side, "type": "MARKET",
-            "quantity": pos["qty"], **_reduce(pos["side"]),
-        }, signed=True)
+        closed, why = _market_close(symbol, pos["side"], pos["qty"])
+        if not closed:
+            # 沒平掉就不記帳、不撤停損：部位還在交易所，停損得繼續保護它
+            _notify("⚠ 平倉失敗，部位仍在", f"{symbol} {reason}時市價單被拒：{why}\n"
+                                         f"帳上保留部位，停損與停利沒動。請到幣安確認或稍後再試。")
+            return {"ok": False, "symbol": symbol, "error": f"平倉失敗：{why}"}
     px = mark_price(symbol) or pos["entry"]
     record_close(pos, px, reason)
     return {"ok": True, "symbol": symbol, "exit": px}
@@ -942,6 +1050,18 @@ def cancel_orphan(symbol, algo_id):
     return {"ok": False, "error": str((d or {}).get("msg") if isinstance(d, dict) else d)[:120]}
 
 
+def _leftover_failed(lf):
+    """殘留單撤不掉：計數＋依節奏告警（第 13 條、第 8 條 r10）。
+    平倉當下的第 1 次失敗也走這裡，不再依賴平倉通知順便帶一句——
+    手動平倉、守衛強平、移損穿價出場都不經過那則平倉通知。"""
+    n = lf["attempts"]
+    if alert_due(n):
+        _notify(f"⚠ 殘留單撤不掉（第 {n} 次）",
+                f"{lf['symbol']} {lf['type']} #{lf['id']}" + (f" @ {lf['px']:g}" if lf.get("px") else "")
+                + f"\n部位已平倉，這張單沒有對應部位。\n第 {n} 次撤單失敗：{lf.get('lastErr')}\n"
+                  f"下次同幣進場時它可能讓新停損被拒。每 {CFG.get('positionPoll', 20):g} 秒重試一次，撤掉時會再通知。")
+
+
 def retry_leftovers():
     """每輪重試待撤清單（第 13 條）。回傳事件，節奏同第 8 條。"""
     events = []
@@ -957,11 +1077,14 @@ def retry_leftovers():
         msg = str((d or {}).get("msg") if isinstance(d, dict) else d)
         if st == 200 or code in (-2011, -2013) or "Unknown" in msg or "not exist" in msg.lower():
             events.append({"action": "recovered", **lf})
+            # 第 1 次失敗一定告警過（平倉當下），所以撤掉時一律發恢復
+            _notify("殘留單已撤掉", f"{lf['symbol']} {lf['type']} #{lf['id']}\n（已補上：先前撤單失敗 {lf['attempts']} 次）")
             continue
         lf["attempts"] += 1
         lf["lastErr"] = msg[:80]
         keep.append(lf)
         events.append({"action": "alert", "alert": alert_due(lf["attempts"]), **lf})
+        _leftover_failed(lf)
     if (STATE.get("leftovers") or []) != keep:
         STATE["leftovers"] = keep
         save_state()
@@ -1046,18 +1169,36 @@ def record_close(pos, exit_px, reason):
         for f_ in failed if isinstance(failed, list) else []:
             if isinstance(f_, dict):
                 o, why = f_["order"], f_["why"]
-                STATE.setdefault("leftovers", []).append({
-                    "symbol": pos["symbol"], "id": o.get("id"), "via": o.get("via"),
-                    "type": _order_type(o), "px": o.get("px"), "attempts": 1,
-                    "lastErr": why, "since": int(time.time() * 1000)})
+                lf = {"symbol": pos["symbol"], "id": o.get("id"), "via": o.get("via"),
+                      "type": _order_type(o), "px": o.get("px"), "attempts": 1,
+                      "lastErr": why, "since": int(time.time() * 1000)}
+                STATE.setdefault("leftovers", []).append(lf)
+                _leftover_failed(lf)
+
+    # r10：失敗狀態隨部位平倉消失的地方——先前告警過就發收尾，計數一併清掉，
+    # 否則同一個幣下次進場時會接著舊的次數數下去
+    sym_ = pos["symbol"]
+    if pos.get("wantStop") is not None and pos.get("beFails"):
+        _notify("移損失敗狀態結束：部位已平倉",
+                f"{sym_} 先前移損到成本失敗 {pos['beFails']} 次（想要 {pos['wantStop']:g}），"
+                f"部位已平倉（{reason}），不再重試。")
+    n_rf = _replace_fails.pop(sym_, 0)
+    _missing_streak.pop(sym_, None)
+    if n_rf:
+        _notify("補掛失敗狀態結束：部位已平倉",
+                f"{sym_} 先前補掛停損失敗 {n_rf} 次，部位已平倉（{reason}），不再重試。")
     sgn = 1 if pos["side"] == "LONG" else -1
-    pnl = (exit_px - pos["entry"]) * sgn * pos["qty"]
-    r = pos["exits"]["R"] * pos["qty"]
+    # 損益 ＝ 各次部分出場 ＋ 剩下數量在最後出場價；R 以原始數量計
+    parts = pos.get("partials") or []
+    qty0 = pos.get("qty0") or pos["qty"]
+    pnl = sum(p["pnl"] for p in parts) + (exit_px - pos["entry"]) * sgn * pos["qty"]
+    r = pos["exits"]["R"] * qty0
     STATE["trades"].append({
         "id": f"{pos['symbol']}-{int(time.time() * 1000)}",
         "excluded": False,
         "version": pos.get("version") or "v1",
-        "symbol": pos["symbol"], "side": pos["side"], "qty": pos["qty"],
+        "symbol": pos["symbol"], "side": pos["side"], "qty": qty0,
+        "partials": parts,
         "entry": pos["entry"], "exit": exit_px, "pnl": round(pnl, 4),
         "rMultiple": round(pnl / r, 2) if r else None,
         "orders": pos.get("orders") or [],           # 保留訂單 id，事後查孤兒單用
@@ -1117,6 +1258,38 @@ def sync_positions():
     live = {sym: by_side[(sym, pos["side"])] for sym, pos in STATE["positions"].items()
             if (sym, pos["side"]) in by_side}
     adopt_pending(by_side)
+
+    # 部分出場：交易所數量比帳上少 → 停利單（2R 出一半）成交了。
+    # 已成交的動作要先通知（第 8 條 r10），也要馬上更新帳上數量：
+    # 否則平倉時用全部數量 × 最後出場價算損益，而且雙向模式下手動平倉會因超量被拒。
+    for sym, row in live.items():
+        pos = STATE["positions"][sym]
+        try:
+            q_live = abs(float(row.get("positionAmt") or 0))
+        except (TypeError, ValueError):
+            continue
+        step = (_filters.get(sym) or {}).get("step") or 0
+        if q_live <= 0 or pos["qty"] - q_live <= max(step * 0.5, 1e-12):
+            continue
+        reduced = pos["qty"] - q_live
+        tp = next((o for o in pos.get("orders") or [] if _order_type(o) == "TAKE_PROFIT_MARKET"), None)
+        if tp and tp.get("qty") and abs(float(tp["qty"]) - reduced) <= max(step, 1e-12) and tp.get("px"):
+            px, how = float(tp["px"]), "第一目標停利"
+            pos["orders"] = [o for o in pos["orders"] if o is not tp]       # 已觸發，不再追蹤
+        else:
+            px, how = (mark_price(sym) or pos["entry"]), "部分減碼（價格以標記價估計）"
+        sgn = 1 if pos["side"] == "LONG" else -1
+        part_pnl = (px - pos["entry"]) * sgn * reduced
+        pos.setdefault("qty0", pos["qty"])
+        pos.setdefault("partials", []).append({"qty": reduced, "px": px, "pnl": round(part_pnl, 4),
+                                               "ts": int(time.time() * 1000), "how": how})
+        pos["qty"] = q_live
+        save_state()
+        r_unit = (pos.get("exits") or {}).get("R") or 0
+        _notify(f"部分出場：{how}",
+                f"{sym} {'做多' if sgn > 0 else '做空'}　出場 {reduced:g} @ {px:g}"
+                f"（{part_pnl:+.2f} U" + (f"，{part_pnl / (r_unit * pos['qty0']):+.2f}R" if r_unit else "") + "）\n"
+                f"剩餘 {q_live:g}，移動停利與停損繼續保護。")
 
     closed = []
     for sym in list(STATE["positions"].keys()):
@@ -1385,8 +1558,9 @@ def guard_positions():
         if has_stop_order(orders, pos):
             _missing_streak[sym] = 0
             n = _replace_fails.pop(sym, 0)
-            if n:                                 # 之前補掛失敗過，現在停損回來了
+            if n:                                 # 之前補掛失敗過，現在停損回來了（例如上次逾時但交易所端其實成功）
                 events.append({"symbol": sym, "action": "recovered", "stop": pos["stop"], "fails": n})
+                _notify("停損已恢復", f"{sym} 的停損 {pos['stop']:g} 又查得到了（已補上：先前補掛失敗 {n} 次）。")
             continue
 
         n = _missing_streak.get(sym, 0) + 1
@@ -1412,26 +1586,39 @@ def guard_positions():
                                   "px": stop_px, "via": ep})
             save_state()
             events.append({"symbol": sym, "action": "restored", "stop": stop_px, "fails": prior})
+            _notify("停損已補掛", f"{sym} 連續三輪確認停損不在，已重新掛回 {stop_px:g}。"
+                    + (f"（已補上：先前補掛失敗 {prior} 次）" if prior else ""))
             continue
         if "existing" in msg.lower() or "already" in msg.lower():
-            _missing_streak[sym] = 0              # 原則 3
-            events.append({"symbol": sym, "action": "false_alarm", "why": msg[:120]})
+            # 原則 3：補掛回報已存在 → 其實停損還在，是誤報。
+            # r10：這也是失敗狀態被清掉的地方，先前若告警過就要發恢復，計數同時歸零。
+            _missing_streak[sym] = 0
+            prior = _replace_fails.pop(sym, 0)
+            events.append({"symbol": sym, "action": "false_alarm", "why": msg[:120], "fails": prior})
+            if prior:
+                _notify("停損已恢復", f"{sym} 補掛回報「已存在」，停損其實在（已補上：先前補掛失敗 {prior} 次）。")
             continue
 
         # 到這裡：連續三輪確認不在、補掛失敗、且失敗原因不是「已存在」
         if CFG.get("guardClose"):                 # 原則 4
-            _request("POST", "/fapi/v1/order", {
-                "symbol": sym, "side": close_side, "type": "MARKET",
-                "quantity": pos["qty"], **_reduce(pos["side"]),
-            }, signed=True)
-            px = mark_price(sym) or pos["entry"]
-            record_close(pos, px, "停損單遺失且無法補掛，強制平倉")
-            events.append({"symbol": sym, "action": "closed", "why": msg[:120]})
-        else:
-            n = _replace_fails.get(sym, 0) + 1
-            _replace_fails[sym] = n
-            events.append({"symbol": sym, "action": "alert", "why": msg[:120],
-                           "stop": stop_px, "attempt": n, "alert": alert_due(n)})
+            closed, cwhy = _market_close(sym, pos["side"], pos["qty"])
+            if closed:
+                px = mark_price(sym) or pos["entry"]
+                record_close(pos, px, "停損單遺失且無法補掛，強制平倉")
+                events.append({"symbol": sym, "action": "closed", "why": msg[:120]})
+                _notify("⚠ 停損遺失，已強制平倉", f"{sym} 連續三輪查不到停損、補掛也失敗，已依設定市價平倉。\n原因：{msg[:120]}")
+                continue
+            msg = f"{msg[:80]}；強制平倉也被拒：{cwhy}"
+        n = _replace_fails.get(sym, 0) + 1
+        _replace_fails[sym] = n
+        events.append({"symbol": sym, "action": "alert", "why": msg[:120],
+                       "stop": stop_px, "attempt": n, "alert": alert_due(n)})
+        if alert_due(n):
+            _notify(f"⚠ 停損不在且補掛失敗（第 {n} 次）",
+                    f"{sym}\n想要的停損 {stop_px:g}\n目前停損 無（交易所上找不到本部位的停損）\n"
+                    f"第 {n} 次補掛失敗：{msg[:120]}\n"
+                    f"每 {CFG.get('positionPoll', 20):g} 秒重試一次，補上時會再通知。"
+                    + ("" if CFG.get("guardClose") else "若要讓系統自動平倉，在設定開啟 guardClose。"))
     return events
 
 
@@ -1443,7 +1630,7 @@ def cancel_stop_orders(symbol, pos):
     return not failed
 
 
-def move_to_breakeven(pos, mark, force=False):
+def move_to_breakeven(pos, mark, force=False, reason=None):
     """到達設定的 R 倍數後，把停損移到成本價（BINANCE_LESSONS 第 8 條）。
 
     移動停利要到 2R 才啟動，1R 到 2R 之間的回落無法保護；這一步補上那個缺口。
@@ -1482,13 +1669,19 @@ def move_to_breakeven(pos, mark, force=False):
     fails = pos.get("beFails", 0)
 
     def _fail(why, **extra):
+        # r10：計數與告警都在這裡——不管是背景迴圈還是反向訊號路徑呼叫，第 1 次失敗都會告警
         n = fails + 1
         pos["beFails"] = n
         pos["beLastErr"] = why
         save_state()
+        cur = None if extra.get("naked") else pos["stop"]
+        if alert_due(n):
+            _notify(("⚠ 停損暫時遺失" if extra.get("naked") else "移損到成本仍未成功") + f"（第 {n} 次）",
+                    f"{sym}\n想要的停損 {want:g}\n目前停損 "
+                    + (f"{cur:g}" if cur is not None else "無（新舊都掛不上，守衛補掛中）")
+                    + f"\n第 {n} 次失敗：{why}\n每 {CFG.get('positionPoll', 20):g} 秒重試一次，成功時會再通知。")
         return {"symbol": sym, "ok": False, "retry": True, "attempt": n, "alert": alert_due(n),
-                "want": want, "current": None if extra.get("naked") else pos["stop"],
-                "why": why, **extra}
+                "want": want, "current": cur, "why": why, **extra}
 
     if not cancel_stop_orders(sym, pos):
         return _fail("撤不掉舊停損，這輪不動，下輪重試")
@@ -1506,6 +1699,10 @@ def move_to_breakeven(pos, mark, force=False):
         pos["orders"].append({"type": "STOP_MARKET", "id": r.get("algoId") or r.get("orderId"),
                               "px": want, "via": ep})
         save_state()
+        _notify("停損移至成本" if not reason else f"{reason} → 停損移至成本",
+                f"{sym} " + (f"{reason}，" if reason else f"已到 {CFG.get('breakevenR', 1):g}R，")
+                + f"停損從 {old:g} 移到 {want:g}（現價 {mark:g}）。\n這筆最差就是打平。"
+                + (f"\n（已補上：先前失敗 {fails} 次）" if fails else ""))
         return {"symbol": sym, "ok": True, "old": old, "new": want, "mark": mark,
                 "recovered": fails > 0, "fails": fails}
 
@@ -1513,13 +1710,15 @@ def move_to_breakeven(pos, mark, force=False):
     why = str((r or {}).get("msg") if isinstance(r, dict) else r)[:100]
     if code == -2021:
         # 價格已穿過想要的停損：舊停損已撤，直接市價出場
-        _request("POST", "/fapi/v1/order", {
-            "symbol": sym, "side": close_side, "type": "MARKET",
-            "quantity": pos["qty"], **_reduce(pos["side"]),
-        }, signed=True)
-        px = mark_price(sym) or want
-        record_close(pos, px, "移損到成本時價格已穿過成本，直接出場")
-        return {"symbol": sym, "ok": False, "exited": True, "want": want, "why": why}
+        closed, cwhy = _market_close(sym, pos["side"], pos["qty"])
+        if closed:
+            px = mark_price(sym) or want
+            record_close(pos, px, "移損到成本時價格已穿過成本，直接出場")
+            _notify("移損時已跌回成本，直接出場",
+                    f"{sym} 想把停損移到 {want:g}，但價格已穿過，改以市價出場（約略打平）。")
+            return {"symbol": sym, "ok": False, "exited": True, "want": want, "why": why}
+        why = f"{why}；市價出場也被拒：{cwhy}"
+        # 出場失敗：舊停損已撤，下面照一般失敗處理，把舊停損掛回去
 
     # 其他失敗：把舊停損掛回去，絕不留裸倉
     st2, r2, ep2 = place_conditional({
