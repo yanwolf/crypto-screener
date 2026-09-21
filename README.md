@@ -19,7 +19,7 @@ frontend/   Vite + React，建置輸出單一 index.html
     App.jsx      狀態擁有者，分頁透過狀態袋 s 取用
   scripts/   smoke.js（jsdom 掛載並走訪全部分頁）、xval.js（交叉驗證）
 scripts/    check_fields.py、check_locals.py、xval.py
-tests/      test_parity.py（出場位階一致性，BINANCE_LESSONS 第 11 條）
+tests/      test_parity.py（出場位階一致性，第 11 條）、test_lessons.py（第 7、8 條情境）
 BINANCE_LESSONS.md  三個幣安專案共用的踩坑清單，版本日期必須一致
 Dockerfile  多階段：node 建前端 → python:slim 只帶建好的 HTML
 verify.sh   打包前完整驗證

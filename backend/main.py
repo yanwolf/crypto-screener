@@ -801,17 +801,27 @@ def position_worker(every_s=20):
                 trader.ADOPTED.clear()
 
                 # 主動管理：到 1R 把停損移到成本
+                # 失敗會記下想要的停損價、每輪重試；告警只在開始失敗與恢復時各推一次（第 8 條）
                 for ev in trader.manage_positions():
+                    sym_ = ev["symbol"]
                     if ev.get("ok"):
+                        extra = f"\n（先前失敗 {ev['fails']} 次，重試後成功）" if ev.get("recovered") else ""
                         push_all("停損移至成本",
-                                 f"{ev['symbol']} 已到 {trader.CFG['breakevenR']}R，"
+                                 f"{sym_} 已到 {trader.CFG['breakevenR']}R，"
                                  f"停損從 {ev['old']:g} 移到 {ev['new']:g}（現價 {ev['mark']:g}）。\n"
-                                 f"這筆最差就是打平。")
-                        sys.stderr.write(f"  $ {ev['symbol']} 停損移至成本 {ev['new']:g}\n")
+                                 f"這筆最差就是打平。" + extra)
+                        sys.stderr.write(f"  $ {sym_} 停損移至成本 {ev['new']:g}\n")
+                    elif ev.get("exited"):
+                        push_all("移損時已跌回成本，直接出場",
+                                 f"{sym_} 想把停損移到 {ev['want']:g}，但價格已穿過，改以市價出場（約略打平）。")
                     else:
-                        sys.stderr.write(f"  ! {ev['symbol']} 移損失敗：{ev.get('why')}\n")
+                        sys.stderr.write(f"  ! {sym_} 移損失敗：{ev.get('why')}\n")
                         if ev.get("naked"):
-                            push_all("⚠ 停損暫時遺失", f"{ev['symbol']} 移損時新舊停損都掛不上，守衛會在下一輪補掛。\n{ev.get('why')}")
+                            push_all("⚠ 停損暫時遺失", f"{sym_} 移損時新舊停損都掛不上，守衛會在下一輪補掛。\n{ev.get('why')}")
+                        elif ev.get("first"):
+                            push_all("移損到成本暫時失敗",
+                                     f"{sym_} 想把停損移到 {ev['want']:g}，這次沒成功：{ev.get('why')}\n"
+                                     f"原停損仍在。之後每輪自動重試，成功時會再通知一次。")
 
                 # 確認停損還在。預設只警告不平倉——
                 # 一次誤判造成的平倉，比暫時裸倉幾十秒的損失更大。

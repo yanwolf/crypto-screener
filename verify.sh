@@ -40,5 +40,8 @@ python3 scripts/xval.py
 echo "── 8. 出場規則一致性（BINANCE_LESSONS 第 11 條）──"
 python3 -m tests.test_parity
 
+echo "── 9. 踩坑情境（BINANCE_LESSONS 第 7、8 條）──"
+python3 -m tests.test_lessons
+
 echo
 echo "全部通過"

@@ -144,7 +144,7 @@ T._filters["WUSDT"] = {"tick": 0.001, "step": 0.1, "minQty": 0.1, "minNotional":
 T.STATE["pending"] = {"WUSDT": {"side": "LONG", "qty": 10, "stop": None, "stopPct": 5, "note": "",
                                 "params": {k: T.CFG.get(k) for k in T.PARAM_KEYS}, "ts": 1}}
 T._request = lambda m, p, params=None, signed=False, timeout=15: (200, {"algoId": 5})
-T.adopt_pending({"WUSDT": {"positionAmt": "10", "entryPrice": "9.02"}})
+T.adopt_pending({("WUSDT", "LONG"): {"positionAmt": "10", "entryPrice": "9.02"}})
 p = T.STATE["positions"].get("WUSDT")
 check(p is not None, "對帳沒有認領 pending 部位")
 if p:
