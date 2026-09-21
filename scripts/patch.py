@@ -1,8 +1,15 @@
-"""安全取代：找不到就報錯，不靜靜略過（BINANCE_LESSONS 第 14 條的延伸）。
+"""安全取代（BINANCE_LESSONS 第 14 條）。
 
-整段改寫時，若比對字串的縮排或內容跟檔案不符，str.replace 會什麼都不做、也不報錯，
-改寫就這樣「看似成功、實際沒生效」。一律用這個函式：每一處都必須恰好命中指定次數。
+sub()：單處取代，找不到或命中次數不對就中止。
+apply()：一批修改（可跨多個檔、同一個檔多處依序套用）先在記憶體裡全部比對，
+         任何一處對不上就中止、**一個檔都不寫**（r26）——不會有「改了一半」要去確認的狀態。
+         版本號也放進同一批，避免「清單中止、版本號照改」的不一致。
+
+    python3 scripts/patch.py        # 自我驗證
 """
+import os
+import sys
+import tempfile
 
 
 def sub(text, old, new, count=1, label=""):
@@ -10,3 +17,44 @@ def sub(text, old, new, count=1, label=""):
     if n != count:
         raise SystemExit(f"✕ 取代失敗{f'［{label}］' if label else ''}：預期命中 {count} 次，實際 {n} 次\n---\n{old[:300]}")
     return text.replace(old, new)
+
+
+def apply(edits):
+    """edits：[(路徑, 原文, 新文, 次數, 標籤), ...]。全部比對通過才寫入；回傳改了哪些檔。"""
+    buf, order = {}, []
+    for path, old, new, count, label in edits:
+        if path not in buf:
+            buf[path] = open(path, encoding="utf-8").read()
+            order.append(path)
+        n = buf[path].count(old)
+        if n != count:
+            raise SystemExit(f"✕ apply 中止（一個檔都沒寫）［{label}］{path}：預期命中 {count} 次，實際 {n} 次\n---\n{old[:300]}")
+        buf[path] = buf[path].replace(old, new)
+    for path in order:
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(buf[path])
+    return order
+
+
+def selftest():
+    d = tempfile.mkdtemp()
+    a, b = os.path.join(d, "a.txt"), os.path.join(d, "b.txt")
+    open(a, "w", encoding="utf-8").write("甲乙丙")
+    open(b, "w", encoding="utf-8").write("丁戊己")
+    try:
+        apply([(a, "乙", "X", 1, "第一處"), (b, "不存在", "Y", 1, "第二處比對不到")])
+        return "第二處比對不到卻沒有中止"
+    except SystemExit:
+        pass
+    if open(a, encoding="utf-8").read() != "甲乙丙":
+        return "中止了，但第一個檔已經被改了"
+    apply([(a, "乙", "X", 1, "一"), (a, "X丙", "XY", 1, "同檔第二處依序套用"), (b, "戊", "Z", 1, "二")])
+    if open(a, encoding="utf-8").read() != "甲XY" or open(b, encoding="utf-8").read() != "丁Z己":
+        return "全部命中時沒有正確寫入"
+    return None
+
+
+if __name__ == "__main__":
+    err = selftest()
+    print("✕ patch 自我驗證：" + err if err else "✓ patch 自我驗證：比對不到時一個檔都不寫、同檔多處依序套用")
+    sys.exit(1 if err else 0)

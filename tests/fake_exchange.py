@@ -6,6 +6,7 @@
 import atexit
 import json
 import os
+import sys
 import time as _real_time
 
 import trader as T
@@ -43,6 +44,7 @@ class FakeEx:
         self.entry_timeout = False     # 進場市價單成交了，但回應逾時（狀態 0）
         self.reject_algo = None        # callable(params) → (st, body) 或 None
         self.calls = []
+        self.inject_log = []
         self.cache_seen_on_resend = []
 
     def _mode_ok(self, params, reduce_kind):
@@ -76,6 +78,27 @@ class FakeEx:
         return out
 
     def __call__(self, method, path, params, signed, timeout):
+        """外部請求的唯一入口。r25：命中次數算「被突變的查詢被呼叫」，不是「突變分支被執行」——
+        情境自己注入的回空清單會先回，走不到突變分支，以前因此被誤判成「無關」。"""
+        if (path == "/fapi/v2/positionRisk" and (params or {}).get("symbol")
+                and os.environ.get("MUTATE_SYMBOL_EMPTY")):
+            _mutation_hit()
+        return self._handle(method, path, params, signed, timeout)
+
+    def _inject(self, kind, path, params):
+        """注入觸發時記下當下已送出哪些單（第 18 種：斷言注入是在被測那一步觸發）。"""
+        sent = [c[2] for c in self.calls if c[1] in ("/fapi/v1/order", "/fapi/v1/algoOrder") and c[0] == "POST"]
+        rec = {"kind": kind, "at": len(self.calls),
+               "entries": sum(1 for p in sent if p.get("type") == "MARKET" and not p.get("reduceOnly")),
+               "closes": sum(1 for p in sent if p.get("type") == "MARKET" and p.get("reduceOnly")),
+               "stops": sum(1 for p in sent if p.get("type") == "STOP_MARKET"),
+               "deletes": sum(1 for c in self.calls if c[0] == "DELETE")}
+        self.inject_log.append(rec)
+        if os.environ.get("INJECT_LOG"):
+            print(f"    · 注入 {kind} 於第 {rec['at']} 個請求（已送進場 {rec['entries']}、平倉 {rec['closes']}、"
+                  f"停損 {rec['stops']}、撤單 {rec['deletes']}）［{CURRENT[0]}］", file=sys.__stdout__)
+
+    def _handle(self, method, path, params, signed, timeout):
         params = dict(params or {})
         self.calls.append((method, path, params))
         if path == "/fapi/v1/positionSide/dual":
@@ -89,8 +112,7 @@ class FakeEx:
             return 200, {}
         if path == "/fapi/v2/positionRisk":
             if params.get("symbol") and os.environ.get("MUTATE_SYMBOL_EMPTY"):
-                _mutation_hit()
-                return 200, []                                # 突變測試：逐幣查詢一律回空清單（基準查不到）
+                return 200, []                                # 突變測試：逐幣查詢一律回空清單（計數在 __call__）
             return 200, self.rows(params.get("symbol"))
         if path == "/fapi/v1/openAlgoOrders":
             return 200, [dict(v, algoId=k) for k, v in self.algo.items()
@@ -172,7 +194,7 @@ class Ex(FakeEx):
         self.full_list_empty = 0
         self.risk_fail_after_market = False
 
-    def __call__(self, method, path, params, signed, timeout):
+    def _handle(self, method, path, params, signed, timeout):
         params = dict(params or {})
         if path.startswith("/fapi/v1/algoOrder") or path == "/fapi/v1/openAlgoOrders":
             if self.algo_404:
@@ -220,14 +242,14 @@ class Ex(FakeEx):
                 pside = params.get("positionSide") or ("LONG" if params["side"] == "BUY" else "SHORT")
                 q0, e0 = self.pos.get((sym, pside), [0, 0])
                 fill = self.mark.get(sym, 100.0)
-                st, d = super().__call__(method, path, params, signed, timeout)
+                st, d = super()._handle(method, path, params, signed, timeout)
                 qty = float(params["quantity"])
                 if st in (200, 0):
                     self.pos[(sym, pside)] = [q0 + qty, (q0 * e0 + qty * fill) / (q0 + qty)]
                 if st == 200:
                     d = dict(d, avgPrice=str(fill), executedQty=str(qty), status="FILLED")
                 return st, d
-        return super().__call__(method, path, params, signed, timeout)
+        return super()._handle(method, path, params, signed, timeout)
 
 
 PROGRAM_ERRORS = ("NameError", "AttributeError", "KeyError", "TypeError", "UnboundLocalError", "Traceback")
@@ -261,22 +283,25 @@ class Ex17(Ex):
         self.symbol_empty_after_market = False   # 平倉市價單送出之後，帶 symbol 的查詢才開始回空清單
         self.full_missing = False         # 全量 positionRisk 永遠缺漏所有幣（模擬全量表異常）
 
-    def __call__(self, method, path, params, signed, timeout):
+    def _handle(self, method, path, params, signed, timeout):
         params = dict(params or {})
         if path == "/fapi/v2/positionRisk":
             if params.get("symbol") and self.symbol_empty_after_market and any(
                     c[1] == "/fapi/v1/order" and c[2].get("type") == "MARKET" and c[2].get("reduceOnly")
                     for c in self.calls):
                 self.calls.append((method, path, params))
+                self._inject("逐幣回空（平倉單送出後）", path, params)
                 return 200, []
             if params.get("symbol") and self.symbol_empty > 0:
                 self.symbol_empty -= 1
                 self.calls.append((method, path, params))
+                self._inject("逐幣回空", path, params)
                 return 200, []
             if not params.get("symbol") and self.full_missing:
                 self.calls.append((method, path, params))
+                self._inject("全量回空", path, params)
                 return 200, []
-        return super().__call__(method, path, params, signed, timeout)
+        return super()._handle(method, path, params, signed, timeout)
 
 
 def realistic(fn, positions=None):
@@ -303,3 +328,16 @@ def realistic(fn, positions=None):
             return 200, rows
         return fn(m, path, params, signed, timeout)
     return wrapped
+
+
+def injected_at_step(ex, since):
+    """第 18 種：計數式注入（「接下來第 N 次查詢回空」）要打在被測那一步的第一次逐幣查詢上。
+    since＝被測那一步開始前的請求數。回傳 (是否正好打中, 說明)。"""
+    first = next((i for i, c in enumerate(ex.calls[since:], since)
+                  if c[1] == "/fapi/v2/positionRisk" and c[2].get("symbol")), None)
+    recs = [r for r in ex.inject_log if r["at"] > since]
+    if first is None:
+        return False, "被測那一步沒有逐幣查詢"
+    if not recs:
+        return False, "注入沒有觸發"
+    return recs[0]["at"] == first + 1, f"注入在第 {recs[0]['at']} 個請求、這一步第一次逐幣查詢在第 {first + 1} 個"

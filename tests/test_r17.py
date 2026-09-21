@@ -5,7 +5,6 @@
 
     python3 -m tests.test_r17
 """
-import io
 import os
 import sys
 import importlib
@@ -14,33 +13,13 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "backend"))
 sys.path.insert(0, ROOT)
 import trader as T                                              # noqa: E402
-from tests.fake_exchange import Ex17, Clock, PROGRAM_ERRORS, Pre, need  # noqa: E402
-import tests.fake_exchange as FX           # noqa: E402
+from tests.fake_exchange import Ex17, Clock, need, injected_at_step  # noqa: E402
 
 RESULTS = []
+from tests.harness import make_case                          # noqa: E402
 
 
-def case(tag, desc, allow=()):
-    """allow：這一項刻意注入、預期會出現在錯誤輸出的字串（其他程式錯誤照樣攔下）。"""
-    def deco(fn):
-        FX.CURRENT[0] = tag                                   # 突變命中紀錄用
-        buf, old = io.StringIO(), sys.stderr
-        sys.stderr = buf
-        try:
-            err = fn()
-        except Pre as e:
-            err = f"前提不成立：{e}"
-        except Exception as e:
-            err = f"{type(e).__name__}: {e}"
-        finally:
-            sys.stderr = old
-        logged = [l for l in buf.getvalue().splitlines() if any(k in l for k in PROGRAM_ERRORS)
-                  and not any(a in l for a in allow)]
-        if not err and logged:
-            err = f"程式錯誤被吞掉（第 14 條）：{logged[0][:120]}"
-        RESULTS.append((tag, desc, err))
-        return fn
-    return deco
+case = make_case(RESULTS)                                    # 共用框架（tests/harness.py）
 
 
 
@@ -121,6 +100,8 @@ def _():
     ex.symbol_empty = 1                                       # 只有平倉前那一次回空清單
     n0 = len(ex.calls)
     r = T.close_position("XUSDT")
+    ok_, why_ = injected_at_step(ex, n0)
+    need(ok_, f"注入沒有打在平倉前的確認上（第 18 種）：{why_}")
     need(any(c[1] == "/fapi/v2/positionRisk" and c[2].get("symbol") for c in ex.calls[n0:]), "沒有做逐幣查詢")
     if "gone" in str(r) or "已經沒有自己的部位" in str(r.get("error", "")):
         return "逐幣查詢回空清單被當成「這一側已不在」"
@@ -151,6 +132,8 @@ def _():
     ex.symbol_empty = 1
     n0 = len(ex.calls)
     r = T.cancel_orphan("XUSDT", "5001")
+    ok_, why_ = injected_at_step(ex, n0)
+    need(ok_, f"注入沒有打在撤單前的查詢上（第 18 種）：{why_}")
     need(any(c[1] == "/fapi/v2/positionRisk" for c in ex.calls[n0:]), "沒有查部位")
     if r.get("ok") or any(c[0] == "DELETE" for c in ex.calls[n0:]):
         return "查部位回空清單被當成「沒有部位」就撤了"
@@ -170,6 +153,8 @@ def _():
     ex.symbol_empty = 1
     n0 = len(ex.calls)
     r = T.open_position("X", "LONG", 100.0, None, stop_pct=5)
+    ok_, why_ = injected_at_step(ex, n0)
+    need(ok_, f"注入沒有打在送單前的基準查詢上（第 18 種）：{why_}")
     need(any(c[1] == "/fapi/v2/positionRisk" and c[2].get("symbol") for c in ex.calls[n0:]), "沒有查基準")
     if markets(ex, n0, reduce=False):
         return "基準查不到仍送出進場單"

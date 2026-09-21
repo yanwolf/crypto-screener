@@ -18,7 +18,7 @@ import sys
 import tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SUITES = ["test_r11", "test_r14", "test_r17", "test_r20", "test_r23"]
+SUITES = ["test_r11", "test_r14", "test_r17", "test_r20", "test_r23", "test_r26"]
 # (測試檔, 項目) → (類別, 引用的項目, 理由)。目前沒有需要人工豁免的項目：
 # 突變下仍通過的全部是命中 0 次（自動判定無關）。
 EXEMPT = {}
@@ -111,9 +111,16 @@ def main():
         return 1
     print(f"✓ 突變檢查器自我驗證：{len(SELFTEST)} 組固定人造資料全部判對")
     normal, mutated, hits = {}, {}, {}
+    import ast
     for s in SUITES:
         n, _ = run(s, False)
         m, h = run(s, True)
+        tree = ast.parse(open(os.path.join(ROOT, "tests", f"{s}.py"), encoding="utf-8").read())
+        want = sum(1 for fn in tree.body if isinstance(fn, ast.FunctionDef)
+                   and any(isinstance(d, ast.Call) and getattr(d.func, "id", "") == "case" for d in fn.decorator_list))
+        if not (len(n) == len(m) == want > 0):
+            print(f"✕ 前提不成立：{s} 有 {want} 個案例，解析到正常 {len(n)}、突變 {len(m)} 項（第 19 種）")
+            return 1
         normal.update(n)
         mutated.update(m)
         hits.update(h)

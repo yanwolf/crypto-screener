@@ -675,7 +675,7 @@ export default function TradePage({ s }) {
                             {t.side === "LONG" ? "多" : "空"}
                           </span>
                           <span style={{ color: win ? UP : DOWN }}>
-                            {win ? "+" : ""}{(t.pnl ?? 0).toFixed(2)} U
+                            {t.pnl == null ? "損益未知" : `${win ? "+" : ""}${t.pnl.toFixed(2)} U`}
                           </span>
                           {t.rMultiple != null && (
                             <span style={{ color: win ? UP : DOWN }}>{t.rMultiple > 0 ? "+" : ""}{Number(t.rMultiple).toFixed(2)}R</span>

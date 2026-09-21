@@ -10,7 +10,6 @@
 
     python3 -m tests.test_r14
 """
-import io
 import os
 import sys
 import importlib
@@ -18,32 +17,14 @@ import importlib
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "backend"))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import trader as T                                              # noqa: E402
-from tests.fake_exchange import Ex, Clock, PROGRAM_ERRORS, Pre, need, entry_sent  # noqa: E402
-import tests.fake_exchange as FX           # noqa: E402
+from tests.fake_exchange import Ex, Clock, need, entry_sent  # noqa: E402
 
 RESULTS = []
+from tests.harness import make_case                          # noqa: E402
 
 
 
-def case(tag, desc):
-    def deco(fn):
-        FX.CURRENT[0] = tag                                   # 突變命中紀錄用
-        buf, old = io.StringIO(), sys.stderr
-        sys.stderr = buf
-        try:
-            err = fn()
-        except Pre as e:
-            err = f"前提不成立：{e}"
-        except Exception as e:
-            err = f"{type(e).__name__}: {e}"
-        finally:
-            sys.stderr = old
-        logged = [l for l in buf.getvalue().splitlines() if any(k in l for k in PROGRAM_ERRORS)]
-        if not err and logged:
-            err = f"程式錯誤被吞掉（第 14 條）：{logged[0][:120]}"
-        RESULTS.append((tag, desc, err))
-        return fn
-    return deco
+case = make_case(RESULTS)                                    # 共用框架（tests/harness.py）
 
 
 

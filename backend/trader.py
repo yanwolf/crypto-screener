@@ -1857,19 +1857,19 @@ def _guard_one(sym, pos, events):
     orders, ok = open_algo_orders(sym, include_legacy=any(o.get("via") == "legacy"
                                                           for o in pos.get("orders") or []))
     if not ok:
-        return                              # 原則 1
+        return "query_failed"               # 原則 1：查詢失敗 ≠ 停損不在
     if has_stop_order(orders, pos):
         _missing_streak[sym] = 0
         n = _replace_fails.pop(sym, 0)
         if n:                                 # 之前補掛失敗過，現在停損回來了（例如上次逾時但交易所端其實成功）
             events.append({"symbol": sym, "action": "recovered", "stop": pos["stop"], "fails": n})
             _notify("停損已恢復", f"{sym} 的停損 {pos['stop']:g} 又查得到了（已補上：先前補掛失敗 {n} 次）。")
-        return
+        return "present"
 
     n = _missing_streak.get(sym, 0) + 1
     _missing_streak[sym] = n
     if n < 3:                                 # 原則 2
-        return
+        return "counting"
 
     close_side = "SELL" if pos["side"] == "LONG" else "BUY"
     f = _filters.get(sym) or {}
@@ -1881,7 +1881,7 @@ def _guard_one(sym, pos, events):
     if status in ("unknown", "gone"):
         # unknown＝查不到：這輪不動，不算補掛失敗；gone＝自己的部位已經沒了：不補，交給對帳記平倉
         events.append({"symbol": sym, "action": "skip", "why": status})
-        return
+        return status
     msg = str((r or {}).get("msg") or r)
     code = r.get("code") if isinstance(r, dict) else None
     if code == -2021 and not pos.get("pendingClose"):
@@ -1900,7 +1900,7 @@ def _guard_one(sym, pos, events):
         elif closed != "gone":
             _set_pending_close(pos, "停損不見且價格已穿過停損價", cwhy)
             events.append({"symbol": sym, "action": "pending_close", "why": cwhy})
-        return
+        return "exited" if closed is True else ("gone" if closed == "gone" else "pending_close")
     if st == 200:
         _missing_streak[sym] = 0
         prior = _replace_fails.pop(sym, 0)
@@ -1911,7 +1911,7 @@ def _guard_one(sym, pos, events):
         events.append({"symbol": sym, "action": "restored", "stop": stop_px, "fails": prior})
         _notify("停損已補掛", f"{sym} 連續三輪確認停損不在，已重新掛回 {stop_px:g}。"
                 + (f"（已補上：先前補掛失敗 {prior} 次）" if prior else ""))
-        return
+        return "replaced"
     if "existing" in msg.lower() or "already" in msg.lower():
         # 原則 3：補掛回報已存在 → 其實停損還在，是誤報。
         # r10：這也是失敗狀態被清掉的地方，先前若告警過就要發恢復，計數同時歸零。
@@ -1920,7 +1920,7 @@ def _guard_one(sym, pos, events):
         events.append({"symbol": sym, "action": "false_alarm", "why": msg[:120], "fails": prior})
         if prior:
             _notify("停損已恢復", f"{sym} 補掛回報「已存在」，停損其實在（已補上：先前補掛失敗 {prior} 次）。")
-        return
+        return "false_alarm"
 
     # 到這裡：連續三輪確認不在、補掛失敗、且失敗原因不是「已存在」
     if CFG.get("guardClose") and not pos.get("pendingClose"):   # 原則 4；待平倉期間只讓重試路徑送單
@@ -1930,7 +1930,7 @@ def _guard_one(sym, pos, events):
             record_close(pos, px, "停損單遺失且無法補掛，強制平倉")
             events.append({"symbol": sym, "action": "closed", "why": msg[:120]})
             _notify("⚠ 停損遺失，已強制平倉", f"{sym} 連續三輪查不到停損、補掛也失敗，已依設定市價平倉。\n原因：{msg[:120]}")
-            return
+            return "force_closed"
         msg = f"{msg[:80]}；強制平倉也被拒：{cwhy}"
     n = _replace_fails.get(sym, 0) + 1
     _replace_fails[sym] = n
@@ -1942,6 +1942,7 @@ def _guard_one(sym, pos, events):
                 f"第 {n} 次補掛失敗：{msg[:120]}\n"
                 f"每 {CFG.get('positionPoll', 20):g} 秒重試一次，補上時會再通知。"
                 + ("" if CFG.get("guardClose") else "若要讓系統自動平倉，在設定開啟 guardClose。"))
+    return "replace_failed"                   # 最後一句也要是 return，不能掉出函式（第 2 條 r26）
 
 
 def guard_positions():
@@ -1996,7 +1997,9 @@ def move_to_breakeven(pos, mark, force=False, reason=None):
     回傳事件：ok / retry（first 表示第一次失敗）/ exited / naked。
     """
     if pos.get("beMoved") or pos.get("pendingClose"):
-        return None                               # 待平倉期間只讓「每輪重試」那條路動它（第 8 條 r14）
+        # 待平倉期間只讓「每輪重試」那條路動它（第 8 條 r14）
+        return {"symbol": pos.get("symbol"), "ok": False,
+                "skipped": "pending_close" if pos.get("pendingClose") else "done"}
     sgn = 1 if pos["side"] == "LONG" else -1
     sym = pos["symbol"]
     want = pos.get("wantStop")
@@ -2004,9 +2007,9 @@ def move_to_breakeven(pos, mark, force=False, reason=None):
         if not force:
             be = (pos.get("exits") or {}).get("breakeven")
             if be is None or (mark - be) * sgn < 0:
-                return None               # 還沒到
+                return {"symbol": sym, "ok": False, "skipped": "not_due"}      # 還沒到
         elif (mark - pos["entry"]) * sgn <= 0:
-            return None                   # 強制移損也要在成本之上才有意義
+            return {"symbol": sym, "ok": False, "skipped": "not_due"}          # 強制移損也要在成本之上才有意義
         f = _filters.get(sym) or {}
         tick = f.get("tick") or 0.0
         # 成本價加一點點手續費緩衝，避免剛好打平還倒貼手續費
@@ -2118,10 +2121,12 @@ def manage_positions():
 
 def _stats(t):
     """一組交易的核心統計。performance() 與分版本統計共用。"""
+    unknown = [x for x in t if x.get("pnl") is None]          # 損益未知不算勝負（r26）
+    t = [x for x in t if x.get("pnl") is not None]
     if not t:
-        return {"count": 0}
-    wins = [x for x in t if (x["pnl"] or 0) > 0]
-    losses = [x for x in t if (x["pnl"] or 0) <= 0]
+        return {"count": 0, "unknown": len(unknown)}
+    wins = [x for x in t if x["pnl"] > 0]
+    losses = [x for x in t if x["pnl"] <= 0]
     win_r = [x["rMultiple"] for x in wins if x.get("rMultiple") is not None]
     loss_r = [x["rMultiple"] for x in losses if x.get("rMultiple") is not None]
     rs = [x["rMultiple"] for x in t if x.get("rMultiple") is not None]
@@ -2153,10 +2158,13 @@ def performance():
     算進去會汙染對策略本身的評估。"""
     t = [x for x in STATE["trades"] if not x.get("excluded")]
     excluded_n = len(STATE["trades"]) - len(t)
+    # 損益未知（結帳時資料缺欄位，r24）的不算勝也不算負，另外計數；以前被 `or 0` 算成虧損、勝率被拉低
+    unknown = [x for x in t if x.get("pnl") is None]
+    t = [x for x in t if x.get("pnl") is not None]
     if not t:
-        return {"count": 0, "excluded": excluded_n}
-    wins = [x for x in t if (x["pnl"] or 0) > 0]
-    losses = [x for x in t if (x["pnl"] or 0) <= 0]
+        return {"count": 0, "excluded": excluded_n, "unknown": len(unknown)}
+    wins = [x for x in t if x["pnl"] > 0]
+    losses = [x for x in t if x["pnl"] <= 0]
     rs = [x["rMultiple"] for x in t if x.get("rMultiple") is not None]
     win_r = [x["rMultiple"] for x in wins if x.get("rMultiple") is not None]
     loss_r = [x["rMultiple"] for x in losses if x.get("rMultiple") is not None]
@@ -2171,7 +2179,7 @@ def performance():
     avg_l = sum(loss_r) / len(loss_r) if loss_r else 0.0
     wr = len(wins) / len(t)
     return {
-        "count": len(t), "excluded": excluded_n,
+        "count": len(t), "excluded": excluded_n, "unknown": len(unknown),
         "wins": len(wins), "losses": len(losses),
         "winRate": round(wr * 100, 1),
         "pnl": round(sum(x["pnl"] or 0 for x in t), 2),

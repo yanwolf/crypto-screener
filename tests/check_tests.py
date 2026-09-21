@@ -14,7 +14,7 @@ import os
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-FILES = ["test_r11.py", "test_r14.py", "test_r17.py", "test_r20.py", "test_r23.py"]
+FILES = ["test_r11.py", "test_r14.py", "test_r17.py", "test_r20.py", "test_r23.py", "test_r26.py"]
 STATEY = ("STATE", "positions", "pending", "leftovers", ".pos", "ex.algo")
 
 
@@ -110,7 +110,10 @@ def main():
     bad, total, neg = [], 0, 0
     for f in FILES:
         src = open(os.path.join(HERE, f), encoding="utf-8").read()
-        for tag, desc, fn in cases(src):
+        found = list(cases(src))
+        if len(found) < 5:
+            bad.append(f"{f} 只掃到 {len(found)} 個案例（前提：掃描真的找到了案例，第 19 種）")
+        for tag, desc, fn in found:
             total += 1
             body = [s for s in fn.body if not (isinstance(s, ast.Expr) and isinstance(getattr(s, "value", None), ast.Constant))]
             first = body[0] if body else None

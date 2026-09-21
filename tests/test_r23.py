@@ -4,7 +4,6 @@
 
     python3 -m tests.test_r23
 """
-import io
 import os
 import sys
 import importlib
@@ -13,32 +12,13 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "backend"))
 sys.path.insert(0, ROOT)
 import trader as T                                              # noqa: E402
-from tests.fake_exchange import Ex17, Clock, PROGRAM_ERRORS, Pre, need, entry_sent  # noqa: E402
-import tests.fake_exchange as FX           # noqa: E402
+from tests.fake_exchange import Ex17, Clock, need, entry_sent, injected_at_step  # noqa: E402
 
 RESULTS = []
+from tests.harness import make_case                          # noqa: E402
 
 
-def case(tag, desc, allow=()):
-    def deco(fn):
-        FX.CURRENT[0] = tag                                   # 突變命中紀錄用
-        buf, old = io.StringIO(), sys.stderr
-        sys.stderr = buf
-        try:
-            err = fn()
-        except Pre as e:
-            err = f"前提不成立：{e}"
-        except Exception as e:
-            err = f"{type(e).__name__}: {e}"
-        finally:
-            sys.stderr = old
-        logged = [l for l in buf.getvalue().splitlines() if any(k in l for k in PROGRAM_ERRORS)
-                  and not any(a in l for a in allow)]
-        if not err and logged:
-            err = f"程式錯誤被吞掉（第 14 條）：{logged[0][:120]}"
-        RESULTS.append((tag, desc, err))
-        return fn
-    return deco
+case = make_case(RESULTS)                                    # 共用框架（tests/harness.py）
 
 
 def fresh(mode="oneway"):
@@ -270,7 +250,10 @@ def _():
     open_long(ex2)
     p2 = T.STATE["positions"]["XUSDT"]
     ex2.symbol_empty = 1
+    m0 = len(ex2.calls)
     ev2 = T.move_to_breakeven(p2, 106.0)
+    ok_, why_ = injected_at_step(ex2, m0)
+    need(ok_, f"注入沒有打在移損前的確認上（第 18 種）：{why_}")
     if not (ev2 and ev2.get("skipped") == "unknown"):
         return f"查不到時沒有回報 unknown：{ev2}"
 

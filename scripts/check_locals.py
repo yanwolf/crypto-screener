@@ -59,6 +59,15 @@ def check_fn(fn, path, module_names):
         if first is not None and line < first and line not in skip_lines:
             bad.append(f"{os.path.basename(path)}:{line} 函式 {fn.name}() 使用 {name}，但它到第 {first} 行才被賦值")
 
+# 第 19 種：檢查本身也要有前提——先對已知有錯的人造函式跑一次，必須抓到（否則「沒報錯」可能只是沒在檢查）
+_canary = ast.parse("def canary():\n    print(zz_used_first)\n    zz_used_first = 1\n").body[0]
+check_fn(_canary, "canary.py", set())
+if not any("zz_used_first" in b for b in bad):
+    print("✕ 區域變數檢查的自我驗證失敗：已知有錯的人造函式沒被抓到")
+    sys.exit(1)
+bad.clear()
+checked = [0]
+
 for f in ("backend/main.py", "backend/trader.py", "backend/engine.py"):
     path = os.path.join(ROOT, f)
     tree = ast.parse(open(path).read())
@@ -76,10 +85,14 @@ for f in ("backend/main.py", "backend/trader.py", "backend/engine.py"):
     for n in ast.walk(tree):
         if isinstance(n, ast.FunctionDef):
             check_fn(n, path, module_names)
+            checked[0] += 1
 
 if bad:
     print("✕ 區域變數使用早於賦值：")
     for b in bad:
         print("   " + b)
     sys.exit(1)
-print("✓ 區域變數順序檢查通過")
+if checked[0] < 100:
+    print(f"✕ 前提不成立：只掃到 {checked[0]} 個函式（路徑錯了？）")
+    sys.exit(1)
+print(f"✓ 區域變數順序檢查通過（掃了 {checked[0]} 個函式，自我驗證的已知錯誤有抓到）")

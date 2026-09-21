@@ -16,24 +16,13 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 import trader as T                                              # noqa: E402
 
 RESULTS = []
+from tests.harness import make_case                          # noqa: E402
 
 
-def case(tag, desc):
-    def deco(fn):
-        FX.CURRENT[0] = tag                                   # 突變命中紀錄用
-        try:
-            err = fn()
-        except Pre as e:
-            err = f"前提不成立：{e}"
-        except Exception as e:                                  # 修改前的程式可能連介面都沒有
-            err = f"{type(e).__name__}: {e}"
-        RESULTS.append((tag, desc, err))
-        return fn
-    return deco
+case = make_case(RESULTS)                                    # 共用框架（tests/harness.py）
 
 
-from tests.fake_exchange import FakeEx, Pre, need, entry_sent  # noqa: E402
-import tests.fake_exchange as FX           # noqa: E402
+from tests.fake_exchange import FakeEx, need, entry_sent  # noqa: E402
 
 
 def fresh(mode="oneway"):

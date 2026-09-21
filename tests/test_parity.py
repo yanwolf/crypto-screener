@@ -128,7 +128,8 @@ for side in ("LONG", "SHORT"):
     T._request = realistic(lambda m, p, params=None, signed=False, timeout=15: (200, {"algoId": 10}),
                            positions={"YUSDT": pos})         # 移損前會先確認部位（第 2 條 r20）
     be = pos["exits"]["breakeven"]
-    check(T.move_to_breakeven(dict(pos), be - sgn * 0.02) is None, f"{side} 未到 breakeven 就移損")
+    nd = T.move_to_breakeven(dict(pos), be - sgn * 0.02)
+    check(nd and nd.get("skipped") == "not_due", f"{side} 未到 breakeven 應回報 not_due，實際 {nd}")
     ev = T.move_to_breakeven(dict(pos), be + sgn * 0.02)
     check(ev and ev.get("ok"), f"{side} 到 breakeven 沒有移損")
     check(ev and (ev["new"] - entry) * sgn >= 0 and abs(ev["new"] - entry) < entry * 0.005,

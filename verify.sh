@@ -30,13 +30,21 @@ sleep 10 || true
 
 echo "── 5. 區域變數順序／未定義名稱（BINANCE_LESSONS 第 14 條）──"
 python3 scripts/check_locals.py
-if python3 -m pyflakes --version >/dev/null 2>&1; then
-  und=$(python3 -m pyflakes backend/ tests/ scripts/ 2>&1 | grep "undefined name" || true)
-  if [ -n "$und" ]; then echo "  ✕ 有未定義名稱，不能部署："; echo "$und"; exit 1; fi
-  echo "✓ pyflakes：沒有未定義名稱"
-else
-  echo "  ⚠ 沒裝 pyflakes，略過未定義名稱檢查（pip install pyflakes）"
+# 第 19 種：沒裝 pyflakes 時輸出是空的、「沒有未定義名稱」就空跑成立。一律要求裝好，並先掃一個已知有錯的檔。
+if ! python3 -m pyflakes --version >/dev/null 2>&1; then
+  echo "  ✕ 沒裝 pyflakes，無法檢查未定義名稱（pip install pyflakes）"; exit 1
 fi
+canary=$(mktemp --suffix=.py); printf 'def f():\n    return zz_undefined_canary\n' > "$canary"
+if ! python3 -m pyflakes "$canary" 2>&1 | grep -q "undefined name 'zz_undefined_canary'"; then
+  echo "  ✕ pyflakes 對已知有錯的檔沒有報錯，工具沒有正常運作"; rm -f "$canary"; exit 1
+fi
+rm -f "$canary"
+nfiles=$(find backend tests scripts -name '*.py' | wc -l)
+if [ "$nfiles" -lt 20 ]; then echo "  ✕ 只找到 $nfiles 個 .py 檔（路徑錯了？）"; exit 1; fi
+und=$(python3 -m pyflakes backend/ tests/ scripts/ 2>&1 | grep "undefined name" || true)
+if [ -n "$und" ]; then echo "  ✕ 有未定義名稱，不能部署："; echo "$und"; exit 1; fi
+echo "✓ pyflakes：掃了 $nfiles 個檔，沒有未定義名稱（已知有錯的檔有被抓到）"
+python3 scripts/check_returns.py
 
 echo "── 6. 欄位對應 ──"
 python3 scripts/check_fields.py
@@ -65,7 +73,11 @@ python3 -m tests.test_r20
 echo "── 14. r21→r23 逐段檢查項目 ──"
 python3 -m tests.test_r23
 
-echo "── 15. 測試本身的檢查（用法第 5 點）──"
+echo "── 15. r24→r26 逐段檢查項目 ──"
+python3 -m tests.test_r26
+
+echo "── 16. 測試本身與工具的檢查（用法第 5 點、第 14 條）──"
+python3 scripts/patch.py              # apply 比對不到時一個檔都不寫（r26）
 python3 -m tests.check_tests          # 每個案例從 fresh() 開始（第 14 種）、否定句要有前提（r19）
 python3 -m tests.mutation_check       # 逐項突變比對：仍通過的必須在豁免清單（r18、r20）
 

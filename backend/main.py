@@ -464,30 +464,40 @@ def notify_trade_open(r):
 
 def notify_trade_close(t):
     """平倉通知。R 倍數是重點，金額只是附帶。"""
-    win = (t.get("pnl") or 0) > 0
-    rm = t.get("rMultiple")
-    head = "獲利平倉" if win else "虧損平倉"
-    mark = "＋" if win else "－"
+    # 第 8 條 r26：每個欄位都可能是 None（結帳時資料缺欄位會把損益記為未知，r24）。
+    # 一律用 .get() 取、數字先確認型別再格式化——通知組不出來，使用者就收不到平倉通知
+    pnl, rm = t.get("pnl"), t.get("rMultiple")
+    num = (int, float)
+    if isinstance(pnl, num):
+        win = pnl > 0
+        head, mark = ("獲利平倉", "＋") if win else ("虧損平倉", "－")
+        pnl_s = f"{mark}{fmt_money(abs(pnl))} U"
+    else:
+        head, pnl_s = "平倉（損益未知）", "未知（結帳時資料不完整，請到幣安核對）"
+    side = t.get("side")
     lines = [
-        f"{'▲' if t['side'] == 'LONG' else '▼'} {t['symbol']}　{t['side'] == 'LONG' and '做多' or '做空'}",
-        f"進場　{fmt_money(t['entry'])}",
-        f"出場　{fmt_money(t['exit'])}",
-        f"損益　{mark}{fmt_money(abs(t.get('pnl') or 0))} U"
-        + (f"　{rm:+.2f}R" if rm is not None else ""),
-        f"原因　{t.get('reason', '—')}",
+        f"{'▲' if side == 'LONG' else '▼'} {t.get('symbol') or '?'}　{'做多' if side == 'LONG' else '做空' if side == 'SHORT' else '方向未知'}",
+        f"進場　{fmt_money(t.get('entry') if isinstance(t.get('entry'), num) else None)}",
+        f"出場　{fmt_money(t.get('exit') if isinstance(t.get('exit'), num) else None)}",
+        f"損益　{pnl_s}" + (f"　{rm:+.2f}R" if isinstance(rm, num) else ""),
+        f"原因　{t.get('reason') or '—'}",
     ]
-    held = (t.get("closed", 0) - t.get("opened", 0)) / 60000.0
+    op, cl = t.get("opened"), t.get("closed")
+    held = (cl - op) / 60000.0 if isinstance(op, num) and isinstance(cl, num) else 0
     if held > 0:
         lines.append(f"持有　{int(held // 60)} 小時 {int(held % 60)} 分")
     for p_ in t.get("partials") or []:
-        lines.append(f"其中　{p_['qty']:g} 先在 {fmt_money(p_['px'])} 出場（{p_['how']}，{p_['pnl']:+.2f} U）")
+        q_, px_, pp_ = p_.get("qty"), p_.get("px"), p_.get("pnl")
+        lines.append(f"其中　{q_ if q_ is not None else '?'} 先在 {fmt_money(px_ if isinstance(px_, num) else None)} 出場"
+                     f"（{p_.get('how') or '部分出場'}，{f'{pp_:+.2f}' if isinstance(pp_, num) else '?'} U）")
 
     if trader:
         p = trader.performance()
         if p.get("count"):
             lines.append("")
-            lines.append(f"累計 {p['count']} 筆　勝率 {p['winRate']}%　"
-                         f"賺賠比 {p.get('payoff') or '—'}　期望值 {p['expectancyR']}R")
+            lines.append(f"累計 {p['count']} 筆　勝率 {p.get('winRate')}%　"
+                         f"賺賠比 {p.get('payoff') or '—'}　期望值 {p.get('expectancyR')}R"
+                         + (f"　（另有 {p['unknown']} 筆損益未知，未計入）" if p.get("unknown") else ""))
             a = trader.AUTO
             lines.append(f"今日 {a['opened']} 筆　已實現 {a['closedR']:+.2f}R（{a.get('closedUsd', 0.0):+.0f} U）")
             b, _ = trader.account_balance(max_age=0)
@@ -860,6 +870,28 @@ def position_round(every_s=20):
             push_all(a["title"], a["text"])
 
 
+_tick_errors = [0]
+
+
+def position_tick(every_s=20):
+    """position_round 的外層（第 8 條 r25、r26）：各步驟已各自 try，但 position_round 本身出錯
+    （例如某筆部位資料不是字典）以前只寫錯誤區、不推播。現在照節奏推播、恢復時通知；執行緒不會因此結束。"""
+    try:
+        position_round(every_s)
+    except Exception as e:
+        _tick_errors[0] += 1
+        n = _tick_errors[0]
+        sys.stderr.write(f"  ! 部位監看失敗（第 {n} 次）：{type(e).__name__}: {str(e)[:100]}\n")
+        if (trader.alert_due(n) if trader else n in (1, 5, 30)):
+            push_all(f"⚠ 部位監看整輪出錯（第 {n} 次）",
+                     f"{type(e).__name__}: {str(e)[:150]}\n這一輪的對帳、守衛、待平倉重試可能都沒跑，下一輪會再試。")
+        return
+    n = _tick_errors[0]
+    _tick_errors[0] = 0
+    if n:
+        push_all("部位監看恢復", f"已補上：先前整輪出錯 {n} 次。")
+
+
 def position_worker(every_s=20):
     """獨立的部位監看執行緒：每輪呼叫 position_round。
 
@@ -867,11 +899,11 @@ def position_worker(every_s=20):
     好記錄績效與推播，並確認停損還在。每 20 秒一次只用掉不到 1% 的權重。
     """
     while True:
+        position_tick(every_s)
         try:
-            position_round(every_s)
-        except Exception as e:
-            sys.stderr.write(f"  ! 部位監看失敗：{type(e).__name__}: {str(e)[:100]}\n")
-        busy = trader and (trader.STATE["positions"] or trader.STATE.get("pending") or trader.STATE.get("leftovers"))
+            busy = trader and (trader.STATE["positions"] or trader.STATE.get("pending") or trader.STATE.get("leftovers"))
+        except Exception:
+            busy = True
         time.sleep(every_s if busy else 60)
 
 
