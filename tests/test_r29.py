@@ -10,7 +10,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "backend"))
 sys.path.insert(0, ROOT)
 import trader as T                                              # noqa: E402
-from tests.fake_exchange import Ex17, Clock, need, entry_sent   # noqa: E402
+from tests.fake_exchange import Ex17, Clock, need, entry_sent, titled  # noqa: E402
 
 RESULTS = []
 from tests.harness import make_case                             # noqa: E402
@@ -107,7 +107,7 @@ def _():
     t = T.STATE["trades"][-1]
     if t.get("pnl") is not None or t.get("exit") is not None:
         return f"查不到成交價，卻記了出場價 {t.get('exit')}、損益 {t.get('pnl')}（假的已知）"
-    if any("出錯" in a["title"] for a in T.drain_alerts()):
+    if any(a["title"].startswith("⚠ ") and "出錯" in a["title"] for a in T.drain_alerts()):
         return "查不到成交價是正常的「未知」，不該當成程式出錯告警"
 
 
@@ -202,7 +202,7 @@ def _():
     ex.trigger("XUSDT", "LONG", r["qty"], 95.3)
     M.position_round(20)
     need(ran, "平倉通知的格式化函式根本沒執行（第 20 種）")
-    if not any("平倉" in t for t, _ in pushed):
+    if len(titled(pushed, "虧損平倉")) != 1:
         return f"通知沒有送出：{[t for t, _ in pushed]}"
 
 

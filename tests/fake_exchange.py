@@ -14,6 +14,7 @@ import trader as T
 # 突變命中紀錄：每一項測試裡，被突變的查詢實際被呼叫幾次（0 次＝這項與突變無關，r23）
 CURRENT = ["?"]
 HITS = {}
+TRACE = []                          # TRACE_FILLS=1 時記錄每次成交明細查詢（第 22 種）
 
 
 def _mutation_hit():
@@ -25,6 +26,11 @@ def _dump_hits():
     if path:
         with open(path, "w", encoding="utf-8") as fh:
             json.dump(HITS, fh, ensure_ascii=False)
+    tp = os.environ.get("TRACE_FILLS_LOG")
+    if tp and TRACE:
+        with open(tp, "a", encoding="utf-8") as fh:
+            for r in TRACE:
+                fh.write(json.dumps(r, ensure_ascii=False) + "\n")
 
 
 atexit.register(_dump_hits)
@@ -48,6 +54,7 @@ class FakeEx:
         self.fills = []                  # 成交明細（userTrades）
         self.slip = 0.001                # 市價單滑價
         self.trades_fail = False         # 成交明細查詢失敗
+        self.same_ms = False             # 所有成交落在同一毫秒
         self.cache_seen_on_resend = []
 
     def _mode_ok(self, params, reduce_kind):
@@ -88,16 +95,23 @@ class FakeEx:
             _mutation_hit()
         return self._handle(method, path, params, signed, timeout)
 
-    def _fill(self, sym, side, pside, qty, px):
-        self.fills.append({"symbol": sym, "side": side, "positionSide": pside if self.mode == "hedge" else "BOTH",
-                           "qty": str(qty), "price": str(px), "time": int(T.time.time() * 1000) + len(self.fills),
-                           "orderId": len(self.fills) + 1})
+    def _fill(self, sym, side, pside, qty, px, realized=0.0):
+        """記一筆成交。r31：不用退化值——遞增的成交 id、非零手續費、平倉那筆的 realizedPnl（打平出場時剛好是 0）。
+        same_ms：讓所有成交落在同一毫秒，測「界線用時間」會漏掉同一毫秒的另一筆。"""
+        n = len(self.fills)
+        self.fills.append({"id": 5000 + n, "symbol": sym, "side": side,
+                           "positionSide": pside if self.mode == "hedge" else "BOTH",
+                           "qty": str(qty), "price": str(px),
+                           "time": int(T.time.time() * 1000) + (0 if self.same_ms else n),
+                           "commission": str(round(qty * px * 0.0004, 8)), "realizedPnl": str(round(realized, 8)),
+                           "orderId": n + 1})
 
     def trigger(self, sym, pside, qty, px):
         """模擬交易所端的停損／停利觸發：減部位、記一筆成交（價格＝實際成交價）。"""
         q, e = self.pos.get((sym, pside), [0, 0])
         self.pos[(sym, pside)] = [max(0.0, q - qty), e]
-        self._fill(sym, "SELL" if pside == "LONG" else "BUY", pside, qty, px)
+        sgn = 1 if pside == "LONG" else -1
+        self._fill(sym, "SELL" if pside == "LONG" else "BUY", pside, qty, px, realized=(px - e) * sgn * qty)
 
     def _inject(self, kind, path, params):
         """注入觸發時記下當下已送出哪些單（第 18 種：斷言注入是在被測那一步觸發）。"""
@@ -129,10 +143,20 @@ class FakeEx:
                 return 200, []                                # 突變測試：逐幣查詢一律回空清單（計數在 __call__）
             return 200, self.rows(params.get("symbol"))
         if path == "/fapi/v1/userTrades":
+            if os.environ.get("TRACE_FILLS"):
+                # 第 22 種的找法：記下每項測試查成交明細的結果，列出所有走進這條路的測試
+                TRACE.append({"case": CURRENT[0], "fail": self.trades_fail,
+                              "rows": sum(1 for f in self.fills if f["symbol"] == params.get("symbol")),
+                              "sides": sorted({f["side"] for f in self.fills if f["symbol"] == params.get("symbol")})})
             if self.trades_fail:
                 return 500, {"msg": "Internal error"}
-            since = int(params.get("startTime") or 0)
-            return 200, [dict(f) for f in self.fills if f["symbol"] == params.get("symbol") and f["time"] >= since]
+            rows = [dict(f) for f in self.fills if f["symbol"] == params.get("symbol")]
+            if params.get("fromId") is not None:
+                rows = [f for f in rows if f["id"] >= int(params["fromId"])]
+            else:
+                since = params.get("startTime")
+                rows = [f for f in rows if since is None or f["time"] >= int(since)]
+            return 200, rows
         if path == "/fapi/v1/openAlgoOrders":
             return 200, [dict(v, algoId=k) for k, v in self.algo.items()
                          if not params.get("symbol") or v.get("symbol") == params.get("symbol")]
@@ -159,9 +183,10 @@ class FakeEx:
                 if self.mode == "hedge" and qty > q + 1e-9:
                     return 400, {"code": -4118, "msg": "ReduceOnly Order Failed."}
                 self.pos[(sym, pside)] = [max(0.0, q - qty), e]
-                self._fill(sym, side, pside, qty, fill)
+                self._fill(sym, side, pside, qty, fill, realized=(fill - e) * (1 if pside == "LONG" else -1) * qty)
             else:
-                self.pos[(sym, pside)] = [q + qty, fill]    # 部位均價＝實際成交價（跟成交紀錄一致）
+                # 部位均價＝加權均價（r31：不能只記最後一筆；跟成交紀錄一致）
+                self.pos[(sym, pside)] = [q + qty, (q * e + qty * fill) / (q + qty)]
                 self._fill(sym, side, pside, qty, fill)
                 if self.entry_timeout:
                     return 0, {"error": "timed out"}
@@ -364,3 +389,14 @@ def injected_at_step(ex, since):
     if not recs:
         return False, "注入沒有觸發"
     return recs[0]["at"] == first + 1, f"注入在第 {recs[0]['at']} 個請求、這一步第一次逐幣查詢在第 {first + 1} 個"
+
+
+def titled(alerts, title):
+    """第 21 種（r31）：指定是哪一則——標題完全相等的那幾則，不在全部輸出裡找字。
+    alerts：trader 出口的 {"title","text"}，或推播的 (title, text)。"""
+    out = []
+    for a in alerts:
+        t, x = (a.get("title"), a.get("text")) if isinstance(a, dict) else (a[0], a[1])
+        if t == title:
+            out.append({"title": t, "text": x or ""})
+    return out

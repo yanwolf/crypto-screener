@@ -17,7 +17,7 @@ import importlib
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "backend"))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import trader as T                                              # noqa: E402
-from tests.fake_exchange import Ex, Clock, need, entry_sent  # noqa: E402
+from tests.fake_exchange import Ex, Clock, need, entry_sent, titled  # noqa: E402
 
 RESULTS = []
 from tests.harness import make_case                          # noqa: E402
@@ -149,7 +149,8 @@ def _():
     a = alerts()
     if "XUSDT" in T.STATE["pending"]:
         return "190 秒仍未判定"
-    if not any("XUSDT" in x["text"] and "未成交" in x["title"] + x["text"] for x in a):
+    nf = titled(a, "送出的進場單判定未成交")
+    if len(nf) != 1 or "XUSDT" not in nf[0]["text"]:
         return f"判定未成交時沒有通知：{[x['title'] for x in a]}"
 
 
@@ -215,8 +216,8 @@ def _():
     p = T.STATE["positions"].get("XUSDT")
     if not p or abs(p["qty"] - 1.0) > 1e-9:
         return f"認領數量應為 3.0 − 基準 2.0 ＝ 1.0，實際 {p and p['qty']}"
-    a = alerts() + [{"title": "", "text": " ".join(p.get("warnings") or [])}]
-    if not any("合併" in x["text"] for x in a):
+    alerts()
+    if not any("合併" in w for w in p.get("warnings") or []):          # 指定看這個部位自己的警告（第 21 種）
         return "有基準部位時沒講明均價是合併過的"
 
 
@@ -288,7 +289,7 @@ def _():
     need(any(c[2].get("type") == "MARKET" and c[2].get("reduceOnly") for c in ex.calls[n0:]), "平倉單沒有送出（前提）")
     if not r.get("ok") or "XUSDT" in T.STATE["positions"]:
         return "成交了卻沒記成已平倉"
-    if any("失敗" in x["title"] for x in a):
+    if any(x["title"].startswith("⚠ 平倉失敗") for x in a):
         return f"成交了卻告警平倉失敗：{[x['title'] for x in a]}"
 
 
@@ -306,15 +307,16 @@ def _():
     for _ in range(5):
         T.retry_pending_closes()
         titles += [x["title"] for x in alerts()]
-    fails = [t for t in titles if "平倉" in t and "第" in t]
-    if not any("第 1 次" in t for t in fails) or not any("第 5 次" in t for t in fails):
+    fails = [t for t in titles if t.startswith("⚠ 平倉失敗，部位仍在（第 ")]
+    if "⚠ 平倉失敗，部位仍在（第 1 次）" not in fails or "⚠ 平倉失敗，部位仍在（第 5 次）" not in fails:
         return f"待平倉告警沒照節奏（第 1、5 次）：{titles}"
     ex.reject_market.discard("XUSDT")
     T.retry_pending_closes()
     a = alerts()
     if "XUSDT" in T.STATE["positions"]:
         return "交易所接受後仍沒結帳"
-    if not any("已補上" in x["text"] or "已平倉" in x["title"] for x in a):
+    done = titled(a, "已平倉")
+    if len(done) != 1 or "已補上" not in done[0]["text"]:
         return f"平掉時沒發恢復：{[x['title'] for x in a]}"
 
 

@@ -15,7 +15,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "backend"))
 sys.path.insert(0, ROOT)
 import trader as T                                              # noqa: E402
-from tests.fake_exchange import Ex17, Clock, need, entry_sent, injected_at_step  # noqa: E402
+from tests.fake_exchange import Ex17, Clock, need, entry_sent, injected_at_step, titled  # noqa: E402
 
 RESULTS = []
 from tests.harness import make_case                          # noqa: E402
@@ -214,7 +214,8 @@ def _():
     need(any(c[1] == "/fapi/v2/positionRisk" for c in ex.calls[n0:]), "移損沒有跑")
     if not stops_sent(ex, n0):
         return "一個部位丟例外，排在後面的部位沒有移損"
-    if not any("BADUSDT" in a["text"] for a in T.drain_alerts()):
+    me = titled(T.drain_alerts(), "⚠ 移損出錯（第 1 次）")
+    if len(me) != 1 or "BADUSDT" not in me[0]["text"]:
         return "出錯的部位沒有告警（第 14 條）"
 
 
@@ -254,7 +255,8 @@ def _():
     need("XUSDT" not in T.STATE["positions"], "部位沒有結束（前提）")
     if T._guard_errors.get("XUSDT"):
         return "部位結束後守衛出錯次數還留著，同幣下一筆會接著數"
-    if not any("XUSDT" in a["text"] and "結束" in a["title"] for a in T.drain_alerts()):
+    end = titled(T.drain_alerts(), "出錯狀態結束：部位已平倉")
+    if len(end) != 1 or "XUSDT" not in end[0]["text"]:
         return "出錯狀態隨部位結束消失，沒有收尾通知"
 
 
@@ -281,7 +283,7 @@ def _():
     M.position_round(20)
     if M._step_errors.get("移損"):
         return f"步驟恢復後出錯次數沒歸零（{M._step_errors.get('移損')}）"
-    if not any("移損" in t and ("恢復" in t or "已補上" in x) for t, x in pushed):
+    if len(titled(pushed, "部位監看［移損］恢復")) != 1:
         return f"步驟恢復時沒有通知：{[t for t, _ in pushed]}"
 
 

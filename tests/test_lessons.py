@@ -272,11 +272,12 @@ T.STATE["leftovers"] = []
 T._request = lambda m, path, params=None, signed=False, timeout=15: (
     (400, {"code": -1000, "msg": "busy"}) if m == "DELETE" else (200, {}))
 T.record_close(p1, 99.0, "交易所出場")
-first = [a for a in T.drain_alerts() if "殘留單" in a["title"]]
-check(first and "第 1 次" in first[0]["title"], f"第 13 條：平倉當下撤不掉應立即告警第 1 次，實際 {[a['title'] for a in first]}")
+from tests.fake_exchange import titled                       # noqa: E402
+first = titled(T.drain_alerts(), "⚠ 殘留單撤不掉（第 1 次）")
+check(len(first) == 2, f"第 13 條：平倉當下兩張撤不掉應各告警第 1 次，實際 {len(first)} 則")
 T._request = lambda m, path, params=None, signed=False, timeout=15: (200, {})
 T.retry_leftovers()
-rec = [a for a in T.drain_alerts() if "已撤掉" in a["title"]]
+rec = titled(T.drain_alerts(), "殘留單已撤掉")
 check(len(rec) == 2 and all("失敗 1 次" in a["text"] for a in rec),
       f"第 13 條：第一次重試就撤掉也要發恢復，實際 {[a['title'] for a in rec]}")
 

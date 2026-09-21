@@ -1045,16 +1045,24 @@ _last_close_fill = {}          # symbol → 我們自己平倉單的實際成交
 
 
 def _close_fills(sym, pos, qty_needed=None):
-    """成交明細裡，這個部位開倉之後、平倉方向的成交：回傳 (數量, 均價, 最晚一筆的時間)；查不到回 (None, None, None)。
+    """成交明細裡，這個部位開倉之後、平倉方向的成交：回傳 (數量, 均價, 最後一筆的成交 id)；查不到回 (None, None, None)。
+    平倉成交用方向判斷（多單的平倉是 SELL），不看 realizedPnl——打平出場那筆的 realizedPnl 剛好是 0（r31）。
 
     第 8 條 r28：出場價與部分出場價只用實際成交價。有基準部位（同側有別人的倉）時，
     成交明細分不出哪幾筆是自己的，回 (None, None)——記未知，不猜。"""
     if float(pos.get("base") or 0) > 0:
         return None, None, None
-    since = pos.get("fillsSince") if isinstance(pos.get("fillsSince"), (int, float)) else pos.get("opened")
-    if not isinstance(since, (int, float)):
-        return None, None, None
-    st, d = _request("GET", "/fapi/v1/userTrades", {"symbol": sym, "startTime": int(since), "limit": 100}, signed=True)
+    # 界線（r31）：採用過成交之後用「最後採用那筆的成交 id＋1」（fromId）；同一毫秒內可能有好幾筆成交，用時間會漏掉或重算。
+    # 還沒採用過任何成交時，從開倉時間起算（開倉那筆是開倉方向，下面會被方向篩掉）。
+    from_id = pos.get("fillsFromId")
+    if isinstance(from_id, int):
+        q_params = {"symbol": sym, "fromId": from_id, "limit": 100}
+    else:
+        since = pos.get("fillsSince") if isinstance(pos.get("fillsSince"), (int, float)) else pos.get("opened")
+        if not isinstance(since, (int, float)):
+            return None, None, None
+        q_params = {"symbol": sym, "startTime": int(since), "limit": 100}
+    st, d = _request("GET", "/fapi/v1/userTrades", q_params, signed=True)
     if st != 200 or not isinstance(d, list):
         return None, None, None
     close_side = "SELL" if pos.get("side") == "LONG" else "BUY"
@@ -1066,8 +1074,9 @@ def _close_fills(sym, pos, qty_needed=None):
     if qty_needed is not None and q < float(qty_needed) * 0.99:
         return None, None, None                  # 湊不滿：有成交沒查到，不拿部分當全部
     px = sum(float(x.get("qty") or 0) * float(x.get("price") or 0) for x in rows) / q
-    last_t = max(int(x.get("time") or 0) for x in rows)
-    return q, px, last_t
+    ids = [x.get("id") for x in rows if isinstance(x.get("id"), int)]
+    last_id = max(ids) if ids else None
+    return q, px, last_id
 
 
 def _exit_price(sym, pos):
@@ -1325,7 +1334,9 @@ def adopt_pending(live):
     now = int(time.time() * 1000)
     for sym, pd in list((STATE.get("pending") or {}).items()):
         ts = pd.get("ts")
-        age = now - (ts if isinstance(ts, (int, float)) else now)
+        # 時間戳缺值時當成已經很久（逾時），走逐幣確認後認領或判定未成交；
+        # 以前當成 0 歲，永遠不會到期——這個幣永遠不能再下單、還佔一個持倉名額（r31 pump-dump-hunter 的同類問題）
+        age = now - ts if isinstance(ts, (int, float)) else (PENDING_EXPIRE_SEC + 1) * 1000
         if age < 30000 or sym in STATE["positions"]:
             if sym in STATE["positions"]:
                 STATE["pending"].pop(sym, None)
@@ -1595,7 +1606,7 @@ def sync_positions():
             else:
                 how = "部分減碼"
             # 第 8 條 r28：價格只用成交明細的實際成交價；以前用停利觸發價或標記價估，是把未知包裝成已知
-            _fq, px, last_t = _close_fills(sym, pos, qty_needed=reduced)
+            _fq, px, last_id = _close_fills(sym, pos, qty_needed=reduced)
             sgn = 1 if pos["side"] == "LONG" else -1
             part_pnl = (px - pos["entry"]) * sgn * reduced if isinstance(px, (int, float)) else None
             pos.setdefault("qty0", pos["qty"])
@@ -1604,8 +1615,9 @@ def sync_positions():
                                                    "pnl": round(part_pnl, 4) if part_pnl is not None else None,
                                                    "ts": now_ms, "how": how})
             pos["qty"] = q_live
-            # 之後的出場價只看「已採用的成交裡最晚那筆」之後的成交；用偵測當下的時間會跟那筆成交落在同一毫秒而重算
-            pos["fillsSince"] = (last_t + 1) if isinstance(last_t, int) else now_ms
+            # 之後的出場價只看「已採用的最後一筆成交 id」之後的成交（r31：用 id，不用時間——同一毫秒可能有好幾筆）
+            if isinstance(last_id, int):
+                pos["fillsFromId"] = last_id + 1
             save_state()
             r_unit = (pos.get("exits") or {}).get("R") or 0
             if part_pnl is None:

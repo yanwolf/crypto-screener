@@ -12,7 +12,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "backend"))
 sys.path.insert(0, ROOT)
 import trader as T                                              # noqa: E402
-from tests.fake_exchange import Ex17, Clock, need, entry_sent, injected_at_step  # noqa: E402
+from tests.fake_exchange import Ex17, Clock, need, entry_sent, injected_at_step, titled  # noqa: E402
 
 RESULTS = []
 from tests.harness import make_case                          # noqa: E402
@@ -111,7 +111,7 @@ def _():
             T.sync_positions()
         except Exception:
             pass
-    need(("每日統計", "XUSDT") in T._pos_errors or any("統計壞了" in a["text"] for a in T.drain_alerts()),
+    need(len(titled(T.drain_alerts(), "⚠ 每日統計出錯（第 1 次）")) == 1,
          "結帳之後那一步沒有真的出錯（前提，r28：程式變穩後舊測試可能測不到）")
     booked = [t for t in T.STATE["trades"] if t.get("symbol") == "XUSDT"]
     need(any(c[0] == "DELETE" for c in ex.calls), "沒有撤條件單（前提：要測的是撤了之後出錯）")
@@ -126,7 +126,9 @@ def _():
     ex, clock = fresh()
     open_long(ex)
     T.STATE["positions"]["XUSDT"]["exits"] = {}               # 缺 R（r24 起不再拋錯，R 倍數記為未知）
-    ex.pos[("XUSDT", "LONG")] = [0, 0]
+    # 第 22 種（r32）：以前用「把部位歸零」模擬出場，沒有成交紀錄，出場價本來就查不到——
+    # R 倍數是 None 其實是因為出場價未知，不是因為缺 R。改成留下真的成交，讓損益是已知的
+    ex.trigger("XUSDT", "LONG", T.STATE["positions"]["XUSDT"]["qty"], 99.0)
     for _ in range(3):
         try:
             T.sync_positions()
@@ -135,6 +137,7 @@ def _():
     booked = [t for t in T.STATE["trades"] if t.get("symbol") == "XUSDT"]
     if len(booked) != 1 or "XUSDT" in T.STATE["positions"]:
         return f"缺欄位就結不了帳：結帳 {len(booked)} 次、帳上仍有 {'XUSDT' in T.STATE['positions']}"
+    need(booked[0].get("pnl") is not None, "損益是未知的（前提：R 倍數要是因為缺 R 才未知，第 16、22 種）")
     if booked[0].get("rMultiple") is not None:
         return f"缺 R 卻算出了 R 倍數 {booked[0].get('rMultiple')}"
 
@@ -151,7 +154,7 @@ def _():
         return "壞掉的那筆被丟掉了"
     if any(l.get("id") == 7001 for l in T.STATE["leftovers"]):
         return "好的那筆撤掉了卻還在清單"
-    if not any("殘留單" in a["title"] and "出錯" in a["title"] for a in T.drain_alerts()):
+    if len(titled(T.drain_alerts(), "⚠ 殘留單重試出錯（第 1 次）")) != 1:
         return "壞掉的那筆沒有推播"
 
 
@@ -183,8 +186,9 @@ def _():
         return "結帳前出錯，部位卻從帳上消失了"
     if not p.get("pendingClose"):
         return "結帳前出錯沒有記待平倉（使用者要平倉的意圖丟了）"
-    if not any("XUSDT" in a["text"] for a in T.drain_alerts()):
-        return "沒有推播"
+    al = T.drain_alerts()
+    if len(titled(al, "⚠ 手動平倉出錯（第 1 次）")) != 1 or len(titled(al, "⚠ 平倉失敗，部位仍在（第 1 次）")) != 1:
+        return f"沒有推播「手動平倉出錯」與「平倉失敗，部位仍在」：{[x['title'] for x in al]}"
 
 
 @case("8-q2", "手動平倉在結帳後出錯（收尾出錯）：回報已平倉，不能再記待平倉", allow=("XUSDT", "統計壞了"))
@@ -224,7 +228,8 @@ def _():
     rnd = getattr(M, "monitor_round", None)
     need(rnd is not None, "沒有可單獨執行一輪的 monitor_round（進入點寫死在無窮迴圈裡）")
     rnd()
-    if not any("評分壞了" in x for _, x in pushed):
+    me = titled(pushed, "⚠ 背景監控出錯（第 1 次）")
+    if len(me) != 1 or "評分壞了" not in me[0]["text"]:
         return f"監控執行緒出錯沒有推播：{pushed}"
 
 
@@ -238,7 +243,8 @@ def _():
     code, body = safe("/api/trade/close", {"symbol": "XUSDT"})
     if code != 500 or "平倉路由壞了" not in str(body):
         return f"沒有回錯誤給網頁：{code} {body}"
-    if not any("平倉路由壞了" in x for _, x in pushed):
+    we = titled(pushed, "⚠ 網頁交易操作出錯")
+    if len(we) != 1 or "平倉路由壞了" not in we[0]["text"]:
         return "沒有推播"
 
 

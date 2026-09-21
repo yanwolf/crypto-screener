@@ -15,7 +15,8 @@ import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TARGETS = {"backend/trader.py": ["_guard_one", "move_to_breakeven", "place_stop", "_market_close",
                                  "_own_live", "_live_row", "_exit_price", "_close_fills",
-                                 "_close_position_impl", "cancel_orphan"]}
+                                 "_close_position_impl", "cancel_orphan", "close_position"],
+           "backend/main.py": ["trade_handle_safe"]}
 
 
 def own_returns(fn):

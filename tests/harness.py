@@ -79,6 +79,23 @@ def selftest_modules():
     return seen
 
 
+def selftest_thread():
+    """stderr 攔截的金絲雀（r32）：讓一條背景執行緒丟例外，確認 traceback 真的寫進被攔截的 sys.stderr。
+    用**另一個緩衝區**接——traceback 的「Exception in thread」「Traceback」兩行不含注入標記，
+    跟測試期間的輸出混在一起會被當成程式錯誤。回傳 (攔到了沒, 內容摘要)。"""
+    import threading
+    buf, old = io.StringIO(), sys.stderr
+    sys.stderr = buf
+    try:
+        t = threading.Thread(target=lambda: (_ for _ in ()).throw(RuntimeError("金絲雀：背景執行緒的例外")), daemon=True)
+        t.start()
+        t.join(5)
+    finally:
+        sys.stderr = old
+    out = buf.getvalue()
+    return ("Traceback" in out and "金絲雀：背景執行緒的例外" in out), out.strip().splitlines()[-1:] if out else []
+
+
 def selftest():
     """固定人造案例：攔截要真的生效。"""
     res = []

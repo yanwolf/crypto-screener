@@ -11,7 +11,7 @@ sys.path.insert(0, os.path.join(ROOT, "backend"))
 sys.path.insert(0, ROOT)
 import trader as T                                              # noqa: E402
 import tests.fake_exchange as FX                                # noqa: E402
-from tests.fake_exchange import Ex17, Clock, need, entry_sent   # noqa: E402
+from tests.fake_exchange import Ex17, Clock, need, entry_sent, titled  # noqa: E402
 
 RESULTS = []
 from tests.harness import make_case, selftest as harness_selftest  # noqa: E402
@@ -114,15 +114,19 @@ def _():
     ex, clock = fresh()
     M, pushed = _main()
     open_long(ex)
+    q_ = T.STATE["positions"]["XUSDT"]["qty"]
     T.STATE["positions"]["XUSDT"]["entry"] = "壞掉的資料"        # 結帳算損益會失敗 → 損益記為未知
-    ex.pos[("XUSDT", "LONG")] = [0, 0]
+    # 第 22 種（r32）：留下真的成交，出場價是已知的——損益未知只能是因為進場價壞掉
+    ex.trigger("XUSDT", "LONG", q_, 99.0)
     M.position_round(20)
     need(any(t.get("symbol") == "XUSDT" for t in T.STATE["trades"]), "沒有結帳（前提）")
-    need(T.STATE["trades"][-1].get("pnl") is None, "壞資料沒有讓損益變成未知（前提，r28：程式變穩後可能不再觸發）")
+    need(T.STATE["trades"][-1].get("exit") is not None, "出場價是未知的（前提：未知要是因為壞資料，第 16、22 種）")
+    need(T.STATE["trades"][-1].get("pnl") is None, "壞資料沒有讓損益變成未知（前提，r28）")
+    need(len(titled(pushed, "⚠ 結帳損益計算出錯（第 1 次）")) == 1, "損益未知的原因不是算損益出錯（前提，第 16 種）")
     titles = [t for t, _ in pushed]
-    if not any("平倉" in t and "損益未知" in t for t in titles):
+    if len(titled(pushed, "平倉（損益未知）")) != 1:
         return f"沒有收到平倉通知：{titles}"
-    if any("平倉通知" in t and "出錯" in t for t in titles):
+    if any(t.startswith("⚠ 部位監看［平倉通知］出錯") for t in titles):
         return f"平倉通知本身出錯：{titles}"
 
 
@@ -145,7 +149,8 @@ def _():
     tick = getattr(M, "position_tick", None)
     need(tick is not None, "沒有可單獨執行的 position_tick")
     tick(20)
-    if not any("整輪壞了" in x for _, x in pushed):
+    te = titled(pushed, "⚠ 部位監看整輪出錯（第 1 次）")
+    if len(te) != 1 or "整輪壞了" not in te[0]["text"]:
         return f"整輪出錯沒有推播：{pushed}"
 
 

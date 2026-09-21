@@ -13,7 +13,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "backend"))
 sys.path.insert(0, ROOT)
 import trader as T                                              # noqa: E402
-from tests.fake_exchange import Ex17, Clock, need, injected_at_step  # noqa: E402
+from tests.fake_exchange import Ex17, Clock, need, injected_at_step, titled  # noqa: E402
 
 RESULTS = []
 from tests.harness import make_case                          # noqa: E402
@@ -263,7 +263,8 @@ def _():
          "守衛完全沒查到 XUSDT")
     if not any(c[1] == "/fapi/v1/algoOrder" and c[2].get("type") == "STOP_MARKET" for c in ex.calls[n0:]):
         return "一個部位丟例外，其他部位的停損就沒補掛"
-    if not any("BADUSDT" in a["text"] and "出錯" in a["title"] for a in T.drain_alerts()):
+    ge = titled(T.drain_alerts(), "⚠ 停損檢查出錯（第 1 次）")
+    if len(ge) != 1 or "BADUSDT" not in ge[0]["text"]:
         return "出錯的部位沒有告警（錯誤被守衛的 try 吞掉，第 14 條）"
 
 
@@ -287,8 +288,9 @@ def _():
         rnd(20)
     if not any(c[1] == "/fapi/v1/algoOrder" and c[2].get("type") == "STOP_MARKET" for c in ex.calls[n0:]):
         return "移損丟例外，守衛整輪被跳過，停損不見了沒補"
-    if not any("停損" in t for t in pushed):
-        return f"告警沒有送出：{pushed}"
+    if len(titled([(t, "") for t in pushed], "停損已補掛")) < 1 or \
+            len(titled([(t, "") for t in pushed], "⚠ 部位監看［移損］出錯（第 1 次）")) != 1:
+        return f"告警沒有送出（要有「停損已補掛」與「⚠ 部位監看［移損］出錯（第 1 次）」）：{pushed}"
 
 
 if __name__ == "__main__":

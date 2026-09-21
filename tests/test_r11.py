@@ -22,7 +22,7 @@ from tests.harness import make_case                          # noqa: E402
 case = make_case(RESULTS)                                    # 共用框架（tests/harness.py）
 
 
-from tests.fake_exchange import FakeEx, need, entry_sent  # noqa: E402
+from tests.fake_exchange import FakeEx, need, entry_sent, titled  # noqa: E402
 
 
 def fresh(mode="oneway"):
@@ -185,8 +185,8 @@ def _():
     alerts()
     T.move_to_breakeven(p, 106.0, force=True)                 # 反向訊號路徑的呼叫方式
     a = alerts()
-    hit = [x for x in a if "XUSDT" in x["text"] and "第 1 次" in x["title"] + x["text"]]
-    if not hit:
+    hit = titled(a, "移損到成本仍未成功（第 1 次）")
+    if len(hit) != 1 or "XUSDT" not in hit[0]["text"]:
         return f"第一次失敗沒有告警：{[x['title'] for x in a]}"
     t = hit[0]["text"]
     for field in ("想要的停損", "目前停損", "busy"):
@@ -208,7 +208,7 @@ def _():
     T._request_raw = del_fail
     T.close_position("XUSDT")
     a = alerts()
-    hit = [x for x in a if "殘留" in x["title"] and "第 1 次" in x["title"] + x["text"]]
+    hit = titled(a, "⚠ 殘留單撤不掉（第 1 次）")
     if not hit:
         return f"手動平倉時殘留單第一次撤不掉沒有告警：{[x['title'] for x in a]}"
     if not all("busy" in x["text"] for x in hit):
@@ -231,7 +231,8 @@ def _():
                                      if params.get("type") == "STOP_MARKET" else None)
     T.guard_positions()
     a = alerts()
-    if not any("恢復" in x["title"] or "已補上" in x["text"] for x in a):
+    rec = titled(a, "停損已恢復")
+    if len(rec) != 1 or "已補上" not in rec[0]["text"]:
         return f"誤報時沒有發恢復：{[x['title'] for x in a]}"
     if T._replace_fails.get("XUSDT"):
         return f"誤報後補掛失敗次數沒歸零：{T._replace_fails.get('XUSDT')}"
@@ -246,8 +247,8 @@ def _():
     ex.pos[("XUSDT", "LONG")] = [0, 0]                        # 停損觸發，部位沒了
     T.sync_positions()
     a = alerts()
-    if not any("XUSDT" in x["text"] and ("結束" in x["title"] or "已平倉" in x["text"]) and "移損" in x["title"] + x["text"]
-               for x in a):
+    end = titled(a, "移損失敗狀態結束：部位已平倉")
+    if len(end) != 1 or "XUSDT" not in end[0]["text"]:
         return f"移損失敗狀態隨平倉消失，沒有收尾通知：{[x['title'] for x in a]}"
 
 
@@ -265,8 +266,8 @@ def _():
     ex.pos[("XUSDT", "LONG")] = [0, 0]
     T.sync_positions()
     a = alerts()
-    if not any("XUSDT" in x["text"] and "補掛" in x["title"] + x["text"] and
-               ("結束" in x["title"] or "已平倉" in x["text"]) for x in a):
+    end = titled(a, "補掛失敗狀態結束：部位已平倉")
+    if len(end) != 1 or "XUSDT" not in end[0]["text"]:
         return f"補掛失敗狀態隨平倉消失，沒有收尾通知：{[x['title'] for x in a]}"
     if T._replace_fails.get("XUSDT"):
         return f"平倉後補掛失敗次數還留著 {T._replace_fails.get('XUSDT')}，下次同幣會接著數"
@@ -288,7 +289,7 @@ def _():
     alerts()
     T.sync_positions()
     a = alerts()
-    if not any("部分" in x["title"] or "減碼" in x["title"] for x in a):
+    if len(titled(a, "部分出場：第一目標停利")) != 1:
         return f"出一半成交沒有通知：{[x['title'] for x in a]}"
     if abs(T.STATE["positions"]["XUSDT"]["qty"] - (q0 - half)) > 1e-9:
         return f"帳上數量沒更新：{T.STATE['positions']['XUSDT']['qty']}，應為 {q0 - half}"

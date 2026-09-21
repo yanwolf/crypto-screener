@@ -18,7 +18,7 @@ import sys
 import tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SUITES = ["test_r11", "test_r14", "test_r17", "test_r20", "test_r23", "test_r26", "test_r29"]
+SUITES = ["test_r11", "test_r14", "test_r17", "test_r20", "test_r23", "test_r26", "test_r29", "test_r32"]
 # (測試檔, 項目) → (類別, 引用的項目, 理由)。目前沒有需要人工豁免的項目：
 # 突變下仍通過的全部是命中 0 次（自動判定無關）。
 EXEMPT = {}
