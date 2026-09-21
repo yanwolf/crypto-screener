@@ -29,6 +29,9 @@ def apply(edits):
         n = buf[path].count(old)
         if n != count:
             raise SystemExit(f"✕ apply 中止（一個檔都沒寫）［{label}］{path}：預期命中 {count} 次，實際 {n} 次\n---\n{old[:300]}")
+        if old.endswith("\n") != new.endswith("\n"):
+            # r26、r28：從檔案擷取的原文結尾有換行、替換內容沒有，下一行就會黏上來
+            raise SystemExit(f"✕ apply 中止（一個檔都沒寫）［{label}］{path}：原文與替換內容的結尾換行不一致")
         buf[path] = buf[path].replace(old, new)
     for path in order:
         with open(path, "w", encoding="utf-8") as fh:
@@ -48,6 +51,11 @@ def selftest():
         pass
     if open(a, encoding="utf-8").read() != "甲乙丙":
         return "中止了，但第一個檔已經被改了"
+    try:
+        apply([(a, "甲乙丙", "甲乙丙\n", 1, "結尾換行不一致")])
+        return "結尾換行不一致卻沒有中止"
+    except SystemExit:
+        pass
     apply([(a, "乙", "X", 1, "一"), (a, "X丙", "XY", 1, "同檔第二處依序套用"), (b, "戊", "Z", 1, "二")])
     if open(a, encoding="utf-8").read() != "甲XY" or open(b, encoding="utf-8").read() != "丁Z己":
         return "全部命中時沒有正確寫入"
@@ -56,5 +64,5 @@ def selftest():
 
 if __name__ == "__main__":
     err = selftest()
-    print("✕ patch 自我驗證：" + err if err else "✓ patch 自我驗證：比對不到時一個檔都不寫、同檔多處依序套用")
+    print("✕ patch 自我驗證：" + err if err else "✓ patch 自我驗證：比對不到時一個檔都不寫、結尾換行不一致時中止、同檔多處依序套用")
     sys.exit(1 if err else 0)

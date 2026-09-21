@@ -15,7 +15,7 @@ import time
 
 import trader as T
 
-VERSION = "2026-09-21r27"        # 與 BINANCE_LESSONS.md 最上面的版本一致
+VERSION = "2026-09-21r30"        # 與 BINANCE_LESSONS.md 最上面的版本一致
 
 
 def _msg(d):
@@ -94,7 +94,9 @@ def check():
 
     # 第 3 條：送了單但沒記到帳
     now = int(time.time() * 1000)
-    stale = [s for s, p in (T.STATE.get("pending") or {}).items() if now - (p.get("ts") or now) > 120000]
+    # 時間戳是 0 或缺值時算成很久以前（逾時）；以前 `or now` 把它當成剛送出，逾時的 pending 被藏起來（第 8 條 r28）
+    stale = [s for s, p in (T.STATE.get("pending") or {}).items()
+             if not isinstance(p.get("ts"), (int, float)) or now - p["ts"] > 120000]
     add("未認領的送單", "ok" if not stale else "warn",
         "無" if not stale else f"{'、'.join(stale)} 送單超過 2 分鐘仍未記帳", 3)
 

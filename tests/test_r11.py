@@ -303,15 +303,16 @@ def _():
     tp = [o for o in p["orders"] if o["type"] == "TAKE_PROFIT_MARKET"][0]
     half = float(ex.algo[tp["id"]]["quantity"])
     ex.algo.pop(tp["id"])
-    ex.pos[("XUSDT", "LONG")][0] -= half
-    ex.mark["XUSDT"] = tp1
+    # r28：出場價只讀成交明細，所以用 trigger 模擬「真的在目標價成交」，不是只改標記價
+    ex.trigger("XUSDT", "LONG", half, tp1)
     T.sync_positions()
     exit_px = entry                                           # 剩下的在成本出場
-    ex.pos[("XUSDT", "LONG")] = [0, 0]
-    ex.mark["XUSDT"] = exit_px
+    ex.trigger("XUSDT", "LONG", q0 - half, exit_px)
+    ex.mark["XUSDT"] = exit_px + 3                            # 標記價刻意不同，確認用的是成交價
     T.sync_positions()
     t = T.STATE["trades"][-1]
     want = half * (tp1 - entry) + (q0 - half) * (exit_px - entry)
+    need(t.get("pnl") is not None, f"損益記成未知（成交明細沒讀到）：{t}")
     if abs(t["pnl"] - want) > 0.01:
         return f"損益 {t['pnl']:.2f}，應為 {want:.2f}（一半在 {tp1:g}、一半在 {exit_px:g}）"
 

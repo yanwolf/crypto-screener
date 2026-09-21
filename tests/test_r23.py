@@ -97,18 +97,22 @@ def _():
 
 # ════ 第 8 條 r22：except 不能把已做完的動作當成沒做 ════════
 
-@case("8-o", "結帳時收尾通知出錯：部位只結帳一次、不會被放回帳上重結", allow=("XUSDT",))
+@case("8-o", "結帳之後的步驟出錯：部位只結帳一次、不會被放回帳上重結", allow=("XUSDT", "統計壞了"))
 def _():
     ex, clock = fresh()
     open_long(ex)
     p = T.STATE["positions"]["XUSDT"]
-    p["wantStop"], p["beFails"] = "壞掉的資料", 1              # 收尾通知格式化時會丟例外
+    # r28：以前靠「wantStop 是字串 → 收尾通知格式化時拋錯」，r24 起通知先檢查型別、不再拋錯，這項就測不到了。
+    # 改成讓結帳之後的一步（每日統計）確實失敗，並檢查前提「那一步真的出錯了」
+    T.conflict_on_close = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("統計壞了"))
     ex.pos[("XUSDT", "LONG")] = [0, 0]
     for _ in range(3):
         try:
             T.sync_positions()
         except Exception:
             pass
+    need(("每日統計", "XUSDT") in T._pos_errors or any("統計壞了" in a["text"] for a in T.drain_alerts()),
+         "結帳之後那一步沒有真的出錯（前提，r28：程式變穩後舊測試可能測不到）")
     booked = [t for t in T.STATE["trades"] if t.get("symbol") == "XUSDT"]
     need(any(c[0] == "DELETE" for c in ex.calls), "沒有撤條件單（前提：要測的是撤了之後出錯）")
     if len(booked) != 1:
@@ -121,7 +125,7 @@ def _():
 def _():
     ex, clock = fresh()
     open_long(ex)
-    T.STATE["positions"]["XUSDT"]["exits"] = {}               # 缺 R，算 R 倍數會丟 KeyError
+    T.STATE["positions"]["XUSDT"]["exits"] = {}               # 缺 R（r24 起不再拋錯，R 倍數記為未知）
     ex.pos[("XUSDT", "LONG")] = [0, 0]
     for _ in range(3):
         try:
@@ -131,6 +135,8 @@ def _():
     booked = [t for t in T.STATE["trades"] if t.get("symbol") == "XUSDT"]
     if len(booked) != 1 or "XUSDT" in T.STATE["positions"]:
         return f"缺欄位就結不了帳：結帳 {len(booked)} 次、帳上仍有 {'XUSDT' in T.STATE['positions']}"
+    if booked[0].get("rMultiple") is not None:
+        return f"缺 R 卻算出了 R 倍數 {booked[0].get('rMultiple')}"
 
 
 @case("8-p", "殘留單重撤：壞掉的那筆（缺 symbol）留在清單並告警，其他筆照常", allow=("None#", "KeyError"))
@@ -171,6 +177,7 @@ def _():
     if raised:
         return f"例外往外傳（{type(raised).__name__}），呼叫端（網頁）只看到連線中斷"
     need(not r.get("ok"), "平倉沒有失敗（前提：要測的是結帳前出錯）")
+    need(("手動平倉", "XUSDT") in T._pos_errors, "結帳前沒有真的出錯（前提，r28）")
     p = T.STATE["positions"].get("XUSDT")
     if not p:
         return "結帳前出錯，部位卻從帳上消失了"
@@ -180,17 +187,17 @@ def _():
         return "沒有推播"
 
 
-@case("8-q2", "手動平倉在結帳後出錯（收尾出錯）：回報已平倉，不能再記待平倉", allow=("XUSDT",))
+@case("8-q2", "手動平倉在結帳後出錯（收尾出錯）：回報已平倉，不能再記待平倉", allow=("XUSDT", "統計壞了"))
 def _():
     ex, clock = fresh()
     open_long(ex)
-    T.STATE["positions"]["XUSDT"]["wantStop"] = "壞掉的資料"
-    T.STATE["positions"]["XUSDT"]["beFails"] = 1
+    T.conflict_on_close = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("統計壞了"))   # 結帳之後那一步確實失敗（r28）
     n0 = len(ex.calls)
     try:
         r = T.close_position("XUSDT")
     except Exception as e:
         return f"結帳後出錯，例外往外傳（{type(e).__name__}）"
+    need(("每日統計", "XUSDT") in T._pos_errors, "結帳之後那一步沒有真的出錯（前提）")
     need(any(c[2].get("type") == "MARKET" and c[2].get("reduceOnly") for c in ex.calls[n0:]), "沒有送平倉單（前提）")
     need(any(t.get("symbol") == "XUSDT" for t in T.STATE["trades"]), "沒有結帳（前提）")
     if "XUSDT" in T.STATE["positions"]:

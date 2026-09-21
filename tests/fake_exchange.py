@@ -45,6 +45,9 @@ class FakeEx:
         self.reject_algo = None        # callable(params) → (st, body) 或 None
         self.calls = []
         self.inject_log = []
+        self.fills = []                  # 成交明細（userTrades）
+        self.slip = 0.001                # 市價單滑價
+        self.trades_fail = False         # 成交明細查詢失敗
         self.cache_seen_on_resend = []
 
     def _mode_ok(self, params, reduce_kind):
@@ -85,6 +88,17 @@ class FakeEx:
             _mutation_hit()
         return self._handle(method, path, params, signed, timeout)
 
+    def _fill(self, sym, side, pside, qty, px):
+        self.fills.append({"symbol": sym, "side": side, "positionSide": pside if self.mode == "hedge" else "BOTH",
+                           "qty": str(qty), "price": str(px), "time": int(T.time.time() * 1000) + len(self.fills),
+                           "orderId": len(self.fills) + 1})
+
+    def trigger(self, sym, pside, qty, px):
+        """模擬交易所端的停損／停利觸發：減部位、記一筆成交（價格＝實際成交價）。"""
+        q, e = self.pos.get((sym, pside), [0, 0])
+        self.pos[(sym, pside)] = [max(0.0, q - qty), e]
+        self._fill(sym, "SELL" if pside == "LONG" else "BUY", pside, qty, px)
+
     def _inject(self, kind, path, params):
         """注入觸發時記下當下已送出哪些單（第 18 種：斷言注入是在被測那一步觸發）。"""
         sent = [c[2] for c in self.calls if c[1] in ("/fapi/v1/order", "/fapi/v1/algoOrder") and c[0] == "POST"]
@@ -114,6 +128,11 @@ class FakeEx:
             if params.get("symbol") and os.environ.get("MUTATE_SYMBOL_EMPTY"):
                 return 200, []                                # 突變測試：逐幣查詢一律回空清單（計數在 __call__）
             return 200, self.rows(params.get("symbol"))
+        if path == "/fapi/v1/userTrades":
+            if self.trades_fail:
+                return 500, {"msg": "Internal error"}
+            since = int(params.get("startTime") or 0)
+            return 200, [dict(f) for f in self.fills if f["symbol"] == params.get("symbol") and f["time"] >= since]
         if path == "/fapi/v1/openAlgoOrders":
             return 200, [dict(v, algoId=k) for k, v in self.algo.items()
                          if not params.get("symbol") or v.get("symbol") == params.get("symbol")]
@@ -133,16 +152,20 @@ class FakeEx:
             if reduce and sym in self.reject_market:
                 return 400, {"code": -2019, "msg": "Margin is insufficient."}
             q, e = self.pos.get((sym, pside), [0, 0])
+            # 實際成交價刻意跟標記價差一點（滑價），測試才分得出程式用的是成交價還是標記價（r28）
+            mk = self.mark.get(sym, 100.0)
+            fill = round(mk * (1 - self.slip) if side == "SELL" else mk * (1 + self.slip), 6)
             if reduce:
                 if self.mode == "hedge" and qty > q + 1e-9:
                     return 400, {"code": -4118, "msg": "ReduceOnly Order Failed."}
                 self.pos[(sym, pside)] = [max(0.0, q - qty), e]
+                self._fill(sym, side, pside, qty, fill)
             else:
-                px = self.mark.get(sym, 100.0)
-                self.pos[(sym, pside)] = [q + qty, px]
+                self.pos[(sym, pside)] = [q + qty, fill]    # 部位均價＝實際成交價（跟成交紀錄一致）
+                self._fill(sym, side, pside, qty, fill)
                 if self.entry_timeout:
                     return 0, {"error": "timed out"}
-            return 200, {"orderId": 1}
+            return 200, {"orderId": 1, "avgPrice": str(fill), "executedQty": str(qty), "status": "FILLED"}
         if path == "/fapi/v1/order" and method == "POST" and params.get("type") != "MARKET":
             # 真實幣安 2025-12-09 起：條件單送到舊端點一律 -4120（清單第 1 條）
             return 400, {"code": -4120, "msg": "Order type not supported for this endpoint. "

@@ -14,7 +14,7 @@ import os
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-FILES = ["test_r11.py", "test_r14.py", "test_r17.py", "test_r20.py", "test_r23.py", "test_r26.py"]
+FILES = ["test_r11.py", "test_r14.py", "test_r17.py", "test_r20.py", "test_r23.py", "test_r26.py", "test_r29.py"]
 STATEY = ("STATE", "positions", "pending", "leftovers", ".pos", "ex.algo")
 
 
@@ -68,6 +68,19 @@ def fail_branches(fn):
     return out
 
 
+def infra_touches_program(fn):
+    """infra 項在 fresh() 之後不能碰程式：不能讀寫 T.（trader）、M.（main）的任何東西（r28：防止拿標記繞過檢查）。"""
+    body = [s for s in fn.body if not (isinstance(s, ast.Expr) and isinstance(getattr(s, "value", None), ast.Constant))][1:]
+    return sorted({f"{n.value.id}.{n.attr}" for s in body for n in ast.walk(s)
+                   if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name) and n.value.id in ("T", "M")})
+
+
+def is_infra(fn):
+    return any(isinstance(d, ast.Call) and getattr(d.func, "id", "") == "case"
+               and any(k.arg == "infra" and getattr(k.value, "value", False) is True for k in d.keywords)
+               for d in fn.decorator_list)
+
+
 def has_need(fn):
     return any(isinstance(n, ast.Call) and getattr(n.func, "id", "") == "need" for n in ast.walk(fn))
 
@@ -106,7 +119,15 @@ def main():
         for w in wrong:
             print("✕ 檢查器自我驗證失敗：" + w)
         return 1
-    print(f"✓ 檢查器自我驗證：{len(SELFTEST)} 組固定人造資料全部判對")
+    # infra 規則的自我驗證：標成 infra 卻碰了程式 → 要抓到；只碰模擬交易所 → 不報
+    probe = {"@case('t', 'd', infra=True)\ndef _():\n    ex = fresh()\n    T.guard_positions()\n": True,
+             "@case('t', 'd', infra=True)\ndef _():\n    ex = fresh()\n    ex('GET', '/x', {}, True, 5)\n": False}
+    for src, want in probe.items():
+        fn = next(c[2] for c in cases(src))
+        if bool(infra_touches_program(fn)) != want:
+            print("✕ 檢查器自我驗證失敗：infra 規則判錯")
+            return 1
+    print(f"✓ 檢查器自我驗證：{len(SELFTEST)} 組否定句＋2 組 infra 固定人造資料全部判對")
     bad, total, neg = [], 0, 0
     for f in FILES:
         src = open(os.path.join(HERE, f), encoding="utf-8").read()
@@ -120,6 +141,10 @@ def main():
             call = first.value if isinstance(first, (ast.Assign, ast.Expr)) else None
             if not (isinstance(call, ast.Call) and getattr(call.func, "id", "") == "fresh"):
                 bad.append(f"{f} [{tag}] 第一個動作不是 fresh()（第 14 種）")
+            if is_infra(fn):
+                touched = infra_touches_program(fn)
+                if touched:
+                    bad.append(f"{f} [{tag}] 標成 infra 卻碰了程式：{'、'.join(touched)}（不能拿這個標記繞過突變檢查）")
             br = fail_branches(fn)
             if br and all(negative(c, src) for c in br):
                 neg += 1

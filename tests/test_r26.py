@@ -118,6 +118,7 @@ def _():
     ex.pos[("XUSDT", "LONG")] = [0, 0]
     M.position_round(20)
     need(any(t.get("symbol") == "XUSDT" for t in T.STATE["trades"]), "沒有結帳（前提）")
+    need(T.STATE["trades"][-1].get("pnl") is None, "壞資料沒有讓損益變成未知（前提，r28：程式變穩後可能不再觸發）")
     titles = [t for t, _ in pushed]
     if not any("平倉" in t and "損益未知" in t for t in titles):
         return f"沒有收到平倉通知：{titles}"
@@ -150,7 +151,7 @@ def _():
 
 # ════ 用法第 5 點 r25：命中次數算「被呼叫」 ═════════════════
 
-@case("25-a", "突變命中：情境自己注入「逐幣回空」時，被突變的查詢被呼叫也要算命中")
+@case("25-a", "突變命中：情境自己注入「逐幣回空」時，被突變的查詢被呼叫也要算命中", infra=True)
 def _():
     ex, clock = fresh()
     old = os.environ.get("MUTATE_SYMBOL_EMPTY")
@@ -163,7 +164,6 @@ def _():
         if FX.HITS.get("25-a", 0) != 1:
             return f"命中 {FX.HITS.get('25-a', 0)} 次，應為 1（注入先回，突變分支沒執行，但查詢確實被呼叫了）"
     finally:
-        FX.HITS.pop("25-a", None)                             # 這項測的是計數本身，自己的命中不算進突變檢查
         if old is None:
             os.environ.pop("MUTATE_SYMBOL_EMPTY", None)
         else:
@@ -172,7 +172,7 @@ def _():
 
 # ════ 測錯方式第 19 種：全域檢查本身也要有前提 ═══════════════
 
-@case("19-a", "測試框架的錯誤輸出攔截真的生效（固定人造案例）")
+@case("19-a", "測試框架的錯誤輸出攔截真的生效（固定人造案例）", infra=True)
 def _():
     ex, clock = fresh()
     err, n = harness_selftest()
@@ -181,18 +181,15 @@ def _():
         return f"攔截沒生效：{err}"
 
 
-@case("19-b", "注入綁定的檢查真的抓得到錯位（人造：注入打在第二次查詢）")
+@case("19-b", "注入綁定的檢查真的抓得到錯位（人造：注入打在第二次查詢）", infra=True)
 def _():
     ex, clock = fresh()
     from tests.fake_exchange import injected_at_step
-    saved = os.environ.pop("MUTATE_SYMBOL_EMPTY", None)     # 這項測的是模擬交易所本身，不受程式突變影響
     n0 = len(ex.calls)
     ex("GET", "/fapi/v2/positionRisk", {"symbol": "XUSDT"}, True, 5)     # 被測那一步的第一次查詢（沒注入）
     ex.symbol_empty = 1
     ex("GET", "/fapi/v2/positionRisk", {"symbol": "XUSDT"}, True, 5)     # 注入打在第二次
     ok_, why_ = injected_at_step(ex, n0)
-    if saved is not None:
-        os.environ["MUTATE_SYMBOL_EMPTY"] = saved
     need(ex.inject_log, "注入沒有觸發（前提）")
     if ok_:
         return f"錯位沒被抓到：{why_}"

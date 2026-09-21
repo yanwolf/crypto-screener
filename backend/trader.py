@@ -928,6 +928,7 @@ def auto_roll_day():
         AUTO["day"] = d
         AUTO["opened"] = 0
         AUTO["closedR"] = 0.0
+        AUTO["unknownToday"] = 0
         AUTO["closedUsd"] = 0.0
         AUTO["blocked"] = None
         AUTO["blockedAtR"] = None
@@ -955,19 +956,23 @@ def auto_can_trade(symbol):
         mark = live.get("mark")
         r_amt = ((pos.get("exits") or {}).get("R") or 0) * (pos.get("qty") or 0)
         rm = (live.get("pnl") / r_amt) if (mark and r_amt) else None
-        held = (time.time() * 1000 - (pos.get("opened") or 0)) / 3600000
+        op_ = pos.get("opened")
+        held = (time.time() * 1000 - op_) / 3600000 if isinstance(op_, (int, float)) else None
         detail = f"這檔已有部位（{'做多' if pos['side'] == 'LONG' else '做空'}，進場 {pos['entry']:g}"
         if rm is not None:
             detail += f"，目前 {rm:+.2f}R"
-        detail += f"，持有 {held:.1f} 小時），不重複進場"
+        detail += (f"，持有 {held:.1f} 小時）" if held is not None else "，持有時間未知）") + "，不重複進場"
         return False, detail
     last = AUTO["lastClose"].get(symbol)
     if last:
         won = AUTO.get("lastCloseWin", {}).get(symbol, False)
-        cd = AUTO.get("cooldownWinMin", 15) if won else AUTO["cooldownMin"]
+        # 損益未知（None）：套較長的冷卻（只是等久一點，不影響統計），但不寫成「虧損」
+        cd = AUTO.get("cooldownWinMin", 15) if won is True else AUTO["cooldownMin"]
         if (time.time() - last) < cd * 60:
             left = int((cd * 60 - (time.time() - last)) / 60)
-            return False, f"剛{'獲利' if won else '虧損'}平倉，冷卻中還剩 {left} 分鐘（{'獲利後短冷卻' if won else '虧損後長冷卻'}）"
+            what = "獲利" if won is True else ("虧損" if won is False else "平倉（損益未知）")
+            kind = "獲利後短冷卻" if won is True else ("虧損後長冷卻" if won is False else "損益未知，採較長冷卻")
+            return False, f"剛{what}{'平倉' if won is not None else ''}，冷卻中還剩 {left} 分鐘（{kind}）"
 
     # ── 全域額度 ──
     if AUTO["blocked"]:
@@ -975,8 +980,10 @@ def auto_can_trade(symbol):
     if AUTO["closedR"] <= AUTO["dailyLossR"]:
         AUTO["blockedAtR"] = AUTO["closedR"]
         AUTO["blockedAtUsd"] = AUTO.get("closedUsd", 0.0)
+        unk = AUTO.get("unknownToday", 0)
         AUTO["blocked"] = (f"當日已虧損 {AUTO['closedR']:.2f}R（{AUTO.get('closedUsd', 0.0):+.0f} U），"
-                           f"達停損上限，今日停止新開倉；已有部位仍依停損出場")
+                           f"達停損上限，今日停止新開倉；已有部位仍依停損出場"
+                           + (f"（另有 {unk} 筆損益未知，未計入）" if unk else ""))
         save_state()
         return False, AUTO["blocked"]
     if AUTO["opened"] >= AUTO["maxPerDay"]:
@@ -1034,6 +1041,45 @@ def _live_qty(symbol, side):
     return _live_row(symbol, side)[0]
 
 
+_last_close_fill = {}          # symbol → 我們自己平倉單的實際成交均價（_market_close 成功時寫入）
+
+
+def _close_fills(sym, pos, qty_needed=None):
+    """成交明細裡，這個部位開倉之後、平倉方向的成交：回傳 (數量, 均價, 最晚一筆的時間)；查不到回 (None, None, None)。
+
+    第 8 條 r28：出場價與部分出場價只用實際成交價。有基準部位（同側有別人的倉）時，
+    成交明細分不出哪幾筆是自己的，回 (None, None)——記未知，不猜。"""
+    if float(pos.get("base") or 0) > 0:
+        return None, None, None
+    since = pos.get("fillsSince") if isinstance(pos.get("fillsSince"), (int, float)) else pos.get("opened")
+    if not isinstance(since, (int, float)):
+        return None, None, None
+    st, d = _request("GET", "/fapi/v1/userTrades", {"symbol": sym, "startTime": int(since), "limit": 100}, signed=True)
+    if st != 200 or not isinstance(d, list):
+        return None, None, None
+    close_side = "SELL" if pos.get("side") == "LONG" else "BUY"
+    rows = [x for x in d if x.get("side") == close_side
+            and (x.get("positionSide") or "BOTH") in ("BOTH", pos.get("side"))]
+    q = sum(float(x.get("qty") or 0) for x in rows)
+    if q <= 0:
+        return None, None, None
+    if qty_needed is not None and q < float(qty_needed) * 0.99:
+        return None, None, None                  # 湊不滿：有成交沒查到，不拿部分當全部
+    px = sum(float(x.get("qty") or 0) * float(x.get("price") or 0) for x in rows) / q
+    last_t = max(int(x.get("time") or 0) for x in rows)
+    return q, px, last_t
+
+
+def _exit_price(sym, pos):
+    """出場價：先用我們自己平倉單的成交均價，否則查成交明細；都沒有就回 None（損益記未知）。
+    以前是「標記價，查不到再用進場價」——用進場價時損益剛好是 0，是把未知包裝成已知（第 8 條 r28）。"""
+    avg = _last_close_fill.pop(sym, None)
+    if isinstance(avg, (int, float)) and avg > 0:
+        return avg
+    _q, px, _t = _close_fills(sym, pos, qty_needed=pos.get("qty"))
+    return px
+
+
 def _market_close(symbol, side, qty, base=0.0):
     """市價平倉，回傳 (結果, 說明)。結果：True 已確認平掉／False 沒平掉／"gone" 送單前那一側就已經不在。
 
@@ -1055,6 +1101,12 @@ def _market_close(symbol, side, qty, base=0.0):
         "quantity": q, **_reduce(side),
     }, signed=True)
     if st == 200:
+        try:
+            avg = float((d or {}).get("avgPrice") or 0) if isinstance(d, dict) else 0.0
+        except (TypeError, ValueError):
+            avg = 0.0
+        if avg > 0:
+            _last_close_fill[symbol] = avg            # 這張單的實際成交均價（r28：出場價只用實際成交價）
         return True, (None if q == qty else f"帳上 {qty:g}、交易所自己的 {own:g}，以實際數量平倉")
     why = str((d or {}).get("msg") or (d or {}).get("error") if isinstance(d, dict) else d)[:100]
     after = _live_qty(symbol, side)
@@ -1129,7 +1181,7 @@ def retry_pending_closes():
                 events.append({"symbol": sym, "action": "gone"})     # 交給對帳記帳
                 continue
             if closed:
-                px = mark_price(sym) or pos["entry"]
+                px = _exit_price(sym, pos)
                 n = pc["attempts"]
                 record_close(pos, px, pc["reason"])
                 _notify("已平倉", f"{sym} {pc['reason']}（已補上：先前平倉失敗 {n} 次）。")
@@ -1183,7 +1235,7 @@ def _close_position_impl(symbol, reason="手動平倉"):
             # 沒平掉就不記帳、不撤停損；記待平倉，每輪重試（第 8 條 r13）
             _set_pending_close(pos, reason, why)
             return {"ok": False, "symbol": symbol, "error": f"平倉失敗：{why}（已記為待平倉，每輪重試）"}
-    px = mark_price(symbol) or pos["entry"]
+    px = _exit_price(symbol, pos)
     record_close(pos, px, reason)
     return {"ok": True, "symbol": symbol, "exit": px}
 
@@ -1364,10 +1416,15 @@ def record_close(pos, exit_px, reason):
         sgn = 1 if pos.get("side") == "LONG" else -1
         parts = pos.get("partials") or []
         qty0 = pos.get("qty0") or pos.get("qty") or 0
-        pnl = sum(float(p.get("pnl") or 0) for p in parts) + \
-            (float(exit_px) - float(pos.get("entry") or 0)) * sgn * float(pos.get("qty") or 0)
-        r_unit = float((pos.get("exits") or {}).get("R") or 0) * float(qty0)
-        pnl_r, rmult = round(pnl, 4), (round(pnl / r_unit, 2) if r_unit else None)
+        if exit_px is None or any(p.get("pnl") is None for p in parts):
+            # 出場價或某一段部分出場的成交價查不到：整筆損益未知（第 8 條 r28）。
+            # 這是正常的未知，不是程式出錯，不告警；以前未知那段會被 `or 0` 當成 0 加總。
+            pnl_r, rmult = None, None
+        else:
+            pnl = sum(float(p["pnl"]) for p in parts) + \
+                (float(exit_px) - float(pos.get("entry"))) * sgn * float(pos.get("qty") or 0)
+            r_unit = float((pos.get("exits") or {}).get("R") or 0) * float(qty0)
+            pnl_r, rmult = round(pnl, 4), (round(pnl / r_unit, 2) if r_unit else None)
     except Exception as e:
         parts, qty0, pnl_r, rmult = pos.get("partials") or [], pos.get("qty"), None, None
         _pos_step_error("結帳損益計算", sym_, e)
@@ -1442,7 +1499,11 @@ def record_close(pos, exit_px, reason):
     def _stats():
         conflict_on_close(sym_, rmult)
         AUTO["lastClose"][sym_] = time.time()
-        AUTO.setdefault("lastCloseWin", {})[sym_] = (pnl_r or 0) > 0
+        # 損益未知記 None：冷卻不寫成「虧損」；每日虧損不加進去，但筆數放進風控狀態（第 8 條 r29）
+        AUTO.setdefault("lastCloseWin", {})[sym_] = (pnl_r > 0) if pnl_r is not None else None
+        if pnl_r is None:
+            auto_roll_day()
+            AUTO["unknownToday"] = AUTO.get("unknownToday", 0) + 1
         if rmult is not None:
             auto_roll_day()
             AUTO["closedR"] += rmult
@@ -1528,22 +1589,32 @@ def sync_positions():
                 continue
             reduced = pos["qty"] - q_live
             tp = next((o for o in pos.get("orders") or [] if _order_type(o) == "TAKE_PROFIT_MARKET"), None)
-            if tp and tp.get("qty") and abs(float(tp["qty"]) - reduced) <= max(step, 1e-12) and tp.get("px"):
-                px, how = float(tp["px"]), "第一目標停利"
+            if tp and tp.get("qty") and abs(float(tp["qty"]) - reduced) <= max(step, 1e-12):
+                how = "第一目標停利"
                 pos["orders"] = [o for o in pos["orders"] if o is not tp]       # 已觸發，不再追蹤
             else:
-                px, how = (mark_price(sym) or pos["entry"]), "部分減碼（價格以標記價估計）"
+                how = "部分減碼"
+            # 第 8 條 r28：價格只用成交明細的實際成交價；以前用停利觸發價或標記價估，是把未知包裝成已知
+            _fq, px, last_t = _close_fills(sym, pos, qty_needed=reduced)
             sgn = 1 if pos["side"] == "LONG" else -1
-            part_pnl = (px - pos["entry"]) * sgn * reduced
+            part_pnl = (px - pos["entry"]) * sgn * reduced if isinstance(px, (int, float)) else None
             pos.setdefault("qty0", pos["qty"])
-            pos.setdefault("partials", []).append({"qty": reduced, "px": px, "pnl": round(part_pnl, 4),
-                                                   "ts": int(time.time() * 1000), "how": how})
+            now_ms = int(time.time() * 1000)
+            pos.setdefault("partials", []).append({"qty": reduced, "px": px,
+                                                   "pnl": round(part_pnl, 4) if part_pnl is not None else None,
+                                                   "ts": now_ms, "how": how})
             pos["qty"] = q_live
+            # 之後的出場價只看「已採用的成交裡最晚那筆」之後的成交；用偵測當下的時間會跟那筆成交落在同一毫秒而重算
+            pos["fillsSince"] = (last_t + 1) if isinstance(last_t, int) else now_ms
             save_state()
             r_unit = (pos.get("exits") or {}).get("R") or 0
+            if part_pnl is None:
+                detail = "（成交價查不到，這一段損益記為未知）"
+            else:
+                detail = (f"（{part_pnl:+.2f} U" + (f"，{part_pnl / (r_unit * pos['qty0']):+.2f}R" if r_unit else "") + "）")
             _notify(f"部分出場：{how}",
-                    f"{sym} {'做多' if sgn > 0 else '做空'}　出場 {reduced:g} @ {px:g}"
-                    f"（{part_pnl:+.2f} U" + (f"，{part_pnl / (r_unit * pos['qty0']):+.2f}R" if r_unit else "") + "）\n"
+                    f"{sym} {'做多' if sgn > 0 else '做空'}　出場 {reduced:g}"
+                    + (f" @ {px:g}" if isinstance(px, (int, float)) else "") + detail + "\n"
                     f"剩餘 {q_live:g}，移動停利與停損繼續保護。")
         except Exception as e:
             _pos_step_error("部分出場偵測", sym, e)
@@ -1555,7 +1626,7 @@ def sync_positions():
         try:
             if sym not in live:
                 pos = STATE["positions"][sym]
-                px = mark_price(sym) or pos["entry"]
+                px = _exit_price(sym, pos)
                 record_close(pos, px, "交易所出場（停損或停利觸發）")
                 closed.append(sym)
         except Exception as e:
@@ -1891,7 +1962,7 @@ def _guard_one(sym, pos, events):
         _missing_streak[sym] = 0
         closed, cwhy = _market_close(sym, pos["side"], pos["qty"], pos.get("base") or 0)
         if closed is True:
-            px = mark_price(sym) or pos["entry"]
+            px = _exit_price(sym, pos)
             _replace_fails.pop(sym, None)
             record_close(pos, px, "停損不見且價格已穿過停損價，直接出場")
             events.append({"symbol": sym, "action": "closed", "why": msg[:120]})
@@ -1926,7 +1997,7 @@ def _guard_one(sym, pos, events):
     if CFG.get("guardClose") and not pos.get("pendingClose"):   # 原則 4；待平倉期間只讓重試路徑送單
         closed, cwhy = _market_close(sym, pos["side"], pos["qty"], pos.get("base") or 0)
         if closed is True:
-            px = mark_price(sym) or pos["entry"]
+            px = _exit_price(sym, pos)
             record_close(pos, px, "停損單遺失且無法補掛，強制平倉")
             events.append({"symbol": sym, "action": "closed", "why": msg[:120]})
             _notify("⚠ 停損遺失，已強制平倉", f"{sym} 連續三輪查不到停損、補掛也失敗，已依設定市價平倉。\n原因：{msg[:120]}")
@@ -2078,7 +2149,7 @@ def move_to_breakeven(pos, mark, force=False, reason=None):
     if code == -2021:
         closed, cwhy = _market_close(sym, pos["side"], pos["qty"], pos.get("base") or 0)
         if closed is True:
-            px = mark_price(sym) or want
+            px = _exit_price(sym, pos)
             record_close(pos, px, "移損到成本時價格已穿過成本，直接出場")
             _notify("移損時已跌回成本，直接出場",
                     f"{sym} 想把停損移到 {want:g}，但價格已穿過，改以市價出場（約略打平）。")
@@ -2321,7 +2392,7 @@ def status():
         "symbols": len(_filters),
         "auto": {**{k: AUTO.get(k) for k in
                     ("on", "maxPerDay", "dailyLossR", "cooldownMin", "minScore",
-                     "opened", "closedR", "closedUsd", "blocked", "blockedAtR", "blockedAtUsd", "day",
+                     "opened", "closedR", "closedUsd", "unknownToday", "blocked", "blockedAtR", "blockedAtUsd", "day",
                  "cooldownWinMin")},
                  "oneR": _one_r_usd()},
     }

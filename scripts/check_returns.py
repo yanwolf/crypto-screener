@@ -14,7 +14,8 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TARGETS = {"backend/trader.py": ["_guard_one", "move_to_breakeven", "place_stop", "_market_close",
-                                 "_own_live", "_live_row"]}
+                                 "_own_live", "_live_row", "_exit_price", "_close_fills",
+                                 "_close_position_impl", "cancel_orphan"]}
 
 
 def own_returns(fn):
@@ -85,14 +86,19 @@ def main():
                 bad.append(f"{rel} 找不到函式 {name}（前提：要檢查的函式真的存在）")
                 continue
             found += 1
-            nret += len(own_returns(fn))
+            k = len(own_returns(fn))
+            nret += k
+            if k < 2:
+                # 第 19 種（r29）：每個函式都要真的解析到多個 return，只看總數會被別的函式撐過去
+                bad.append(f"{name} 只解析到 {k} 個 return（前提：這種函式都有多個出口）")
             bad += [f"{name}：{p}" for p in check_fn(fn)]
     want = sum(len(v) for v in TARGETS.values())
     if found != want or nret < found:
         bad.append(f"前提不成立：只找到 {found}/{want} 個函式、{nret} 個 return")
     for b in bad:
         print("✕ " + b)
-    print(("✓" if not bad else "✕") + f" 回傳檢查：{len(SELFTEST)} 組人造函式自我驗證通過；{found} 個函式、{nret} 個 return，問題 {len(bad)} 項")
+    print(("✓" if not bad else "✕") + f" 回傳檢查：{len(SELFTEST)} 組人造函式自我驗證通過；{found} 個函式、{nret} 個 return"
+          f"（每個函式至少 2 個 return），問題 {len(bad)} 項")
     return 1 if bad else 0
 
 

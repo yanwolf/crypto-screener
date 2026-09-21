@@ -499,7 +499,8 @@ def notify_trade_close(t):
                          f"賺賠比 {p.get('payoff') or '—'}　期望值 {p.get('expectancyR')}R"
                          + (f"　（另有 {p['unknown']} 筆損益未知，未計入）" if p.get("unknown") else ""))
             a = trader.AUTO
-            lines.append(f"今日 {a['opened']} 筆　已實現 {a['closedR']:+.2f}R（{a.get('closedUsd', 0.0):+.0f} U）")
+            lines.append(f"今日 {a['opened']} 筆　已實現 {a['closedR']:+.2f}R（{a.get('closedUsd', 0.0):+.0f} U）"
+                         + (f"　另有 {a['unknownToday']} 筆損益未知（未計入）" if a.get("unknownToday") else ""))
             b, _ = trader.account_balance(max_age=0)
             if b:
                 lines.append(f"帳戶　權益 {b['equity']:,.2f} U　可用 {b['avail']:,.2f} U"
@@ -1335,7 +1336,8 @@ def cache_cleanup(max_age_h=None, max_mb=None, dry_run=False):
         ts = st.st_mtime
         try:
             with open(p) as f:
-                ts = float(json.load(f).get("ts") or st.st_mtime)
+                ts_ = json.load(f).get("ts")
+                ts = float(ts_) if isinstance(ts_, (int, float)) else st.st_mtime
         except Exception:
             pass
         entries.append((ts, p, st.st_size))
