@@ -406,6 +406,7 @@ def _():
     r = open_long(ex)
     p = T.STATE["positions"]["XUSDT"]
     mine = r["sizing"]["qty"]                                 # 修正：不從帳上讀（帳上可能已混了基準部位）
+    need([o for o in p["orders"] if o["type"] == "TAKE_PROFIT_MARKET"], "要取的清單是空的（前提，r35：先確認有東西再索引）")
     tp = [o for o in p["orders"] if o["type"] == "TAKE_PROFIT_MARKET"][0]
     half = T.round_step(mine * T.CFG["tp1Portion"], 0.1)       # 這張單應出一半的數量
     ex.algo.pop(tp["id"])

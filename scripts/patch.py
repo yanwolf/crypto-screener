@@ -35,6 +35,12 @@ def apply(edits):
             raise SystemExit(f"✕ apply 中止（一個檔都沒寫）［{label}］{path}：原文與替換內容的結尾換行不一致")
         buf[path] = buf[path].replace(old, new)
     for path in order:
+        if path.endswith(".py"):
+            try:
+                compile(buf[path], path, "exec")          # r35：寫入前先編譯，語法錯就一個檔都不寫
+            except SyntaxError as e:
+                raise SystemExit(f"✕ apply 中止（一個檔都沒寫）：{path} 改完後有語法錯（第 {e.lineno} 行）：{e.msg}")
+    for path in order:
         with open(path, "w", encoding="utf-8") as fh:
             fh.write(buf[path])
     return order
@@ -63,6 +69,15 @@ def selftest():
         return "結尾換行不一致卻沒有中止"
     except SystemExit:
         pass
+    c = os.path.join(d, "c.py")
+    open(c, "w", encoding="utf-8").write("x = 1\ny = 2\n")
+    try:
+        apply([(a, "甲", "甲2", 1, "先改一個非 py 檔"), (c, "y = 2", "y = (2", 1, "改出語法錯")])
+        return "改出語法錯卻沒有中止"
+    except SystemExit:
+        pass
+    if open(c, encoding="utf-8").read() != "x = 1\ny = 2\n" or open(a, encoding="utf-8").read() != "甲乙丙":
+        return "改出語法錯中止了，但檔案已經被寫了"
     open(b, "w", encoding="utf-8").write("第一行\n要刪的\n第三行\n")
     apply([(b, "要刪的\n", "", 1, "整段刪除")])
     if open(b, encoding="utf-8").read() != "第一行\n第三行\n":
@@ -78,5 +93,5 @@ def selftest():
 
 if __name__ == "__main__":
     err = selftest()
-    print("✕ patch 自我驗證：" + err if err else "✓ patch 自我驗證：比對不到時一個檔都不寫、結尾換行不一致時中止（整段刪除除外）、同檔多處依序套用、exact() 讀對行")
+    print("✕ patch 自我驗證：" + err if err else "✓ patch 自我驗證：比對不到時一個檔都不寫、結尾換行不一致時中止（整段刪除除外）、改出語法錯時一個檔都不寫、同檔多處依序套用、exact() 讀對行")
     sys.exit(1 if err else 0)

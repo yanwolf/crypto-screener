@@ -14,7 +14,7 @@ import os
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-FILES = ["test_r11.py", "test_r14.py", "test_r17.py", "test_r20.py", "test_r23.py", "test_r26.py", "test_r29.py", "test_r32.py"]
+FILES = ["test_r11.py", "test_r14.py", "test_r17.py", "test_r20.py", "test_r23.py", "test_r26.py", "test_r29.py", "test_r32.py", "test_r35.py"]
 STATEY = ("STATE", "positions", "pending", "leftovers", ".pos", "ex.algo")
 
 

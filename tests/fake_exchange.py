@@ -55,6 +55,8 @@ class FakeEx:
         self.slip = 0.001                # 市價單滑價
         self.trades_fail = False         # 成交明細查詢失敗
         self.same_ms = False             # 所有成交落在同一毫秒
+        self.clock_lag_ms = 0            # 交易所時鐘比本機慢幾毫秒（成交時間戳往前）
+        self.next_order = 70000          # 市價單單號（每張不同）
         self.cache_seen_on_resend = []
 
     def _mode_ok(self, params, reduce_kind):
@@ -95,16 +97,16 @@ class FakeEx:
             _mutation_hit()
         return self._handle(method, path, params, signed, timeout)
 
-    def _fill(self, sym, side, pside, qty, px, realized=0.0):
+    def _fill(self, sym, side, pside, qty, px, realized=0.0, order_id=None):
         """記一筆成交。r31：不用退化值——遞增的成交 id、非零手續費、平倉那筆的 realizedPnl（打平出場時剛好是 0）。
         same_ms：讓所有成交落在同一毫秒，測「界線用時間」會漏掉同一毫秒的另一筆。"""
         n = len(self.fills)
         self.fills.append({"id": 5000 + n, "symbol": sym, "side": side,
                            "positionSide": pside if self.mode == "hedge" else "BOTH",
                            "qty": str(qty), "price": str(px),
-                           "time": int(T.time.time() * 1000) + (0 if self.same_ms else n),
+                           "time": int(T.time.time() * 1000) + (0 if self.same_ms else n) - self.clock_lag_ms,
                            "commission": str(round(qty * px * 0.0004, 8)), "realizedPnl": str(round(realized, 8)),
-                           "orderId": n + 1})
+                           "orderId": order_id if order_id is not None else 900000 + n})
 
     def trigger(self, sym, pside, qty, px):
         """模擬交易所端的停損／停利觸發：減部位、記一筆成交（價格＝實際成交價）。"""
@@ -151,7 +153,9 @@ class FakeEx:
             if self.trades_fail:
                 return 500, {"msg": "Internal error"}
             rows = [dict(f) for f in self.fills if f["symbol"] == params.get("symbol")]
-            if params.get("fromId") is not None:
+            if params.get("orderId") is not None:
+                rows = [f for f in rows if f["orderId"] == int(params["orderId"])]
+            elif params.get("fromId") is not None:
                 rows = [f for f in rows if f["id"] >= int(params["fromId"])]
             else:
                 since = params.get("startTime")
@@ -179,18 +183,21 @@ class FakeEx:
             # 實際成交價刻意跟標記價差一點（滑價），測試才分得出程式用的是成交價還是標記價（r28）
             mk = self.mark.get(sym, 100.0)
             fill = round(mk * (1 - self.slip) if side == "SELL" else mk * (1 + self.slip), 6)
+            self.next_order += 1
+            oid = self.next_order
             if reduce:
                 if self.mode == "hedge" and qty > q + 1e-9:
                     return 400, {"code": -4118, "msg": "ReduceOnly Order Failed."}
                 self.pos[(sym, pside)] = [max(0.0, q - qty), e]
-                self._fill(sym, side, pside, qty, fill, realized=(fill - e) * (1 if pside == "LONG" else -1) * qty)
+                self._fill(sym, side, pside, qty, fill, realized=(fill - e) * (1 if pside == "LONG" else -1) * qty,
+                           order_id=oid)
             else:
                 # 部位均價＝加權均價（r31：不能只記最後一筆；跟成交紀錄一致）
                 self.pos[(sym, pside)] = [q + qty, (q * e + qty * fill) / (q + qty)]
-                self._fill(sym, side, pside, qty, fill)
+                self._fill(sym, side, pside, qty, fill, order_id=oid)
                 if self.entry_timeout:
                     return 0, {"error": "timed out"}
-            return 200, {"orderId": 1, "avgPrice": str(fill), "executedQty": str(qty), "status": "FILLED"}
+            return 200, {"orderId": oid, "avgPrice": str(fill), "executedQty": str(qty), "status": "FILLED"}
         if path == "/fapi/v1/order" and method == "POST" and params.get("type") != "MARKET":
             # 真實幣安 2025-12-09 起：條件單送到舊端點一律 -4120（清單第 1 條）
             return 400, {"code": -4120, "msg": "Order type not supported for this endpoint. "

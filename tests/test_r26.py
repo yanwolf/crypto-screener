@@ -82,6 +82,7 @@ def _():
                          capture_output=True, text=True, encoding="utf-8", errors="replace").stdout
     need("組人造函式自我驗證通過" in out and "個函式" in out, f"檢查器沒有真的跑完（第 19 種）：{out[-200:]}")
     if "問題 0 項" not in out:
+        need(out.strip(), "要取的清單是空的（前提，r35：先確認有東西再索引）")
         return out.strip().splitlines()[-1]
 
 
@@ -181,7 +182,7 @@ def _():
 def _():
     ex, clock = fresh()
     err, n = harness_selftest()
-    need(n == 4, f"自我驗證只跑了 {n} 個人造案例（前提，第 19 種）")
+    need(n == 5, f"自我驗證只跑了 {n} 個人造案例（前提，第 19 種）")
     if err:
         return f"攔截沒生效：{err}"
 

@@ -59,8 +59,10 @@ def _():
                          capture_output=True, text=True, encoding="utf-8", errors="replace").stdout
     need("組人造函式自我驗證通過" in out, f"檢查器沒有真的跑完：{out[-200:]}")
     if "每個函式至少 2 個 return" not in out:
+        need(out.strip(), "要取的清單是空的（前提，r35：先確認有東西再索引）")
         return f"檢查器沒有「每個函式解析到多個 return」的前提（第 19 種）：{out.strip().splitlines()[-1]}"
     if "問題 0 項" not in out:
+        need(out.strip(), "要取的清單是空的（前提，r35：先確認有東西再索引）")
         return out.strip().splitlines()[-1]
 
 
@@ -75,8 +77,10 @@ def _():
     r = T.close_position("XUSDT")
     need(r.get("ok") and any(c[2].get("type") == "MARKET" and c[2].get("reduceOnly") for c in ex.calls[n0:]),
          f"平倉沒有完成（前提）：{r}")
+    need(ex.fills, "要取的清單是空的（前提，r35：先確認有東西再索引）")
     fill = float(ex.fills[-1]["price"])
     need(abs(fill - 104.0) > 1e-9, "模擬成交價跟標記價一樣，分不出來（前提）")
+    need(T.STATE["trades"], "要取的清單是空的（前提，r35：先確認有東西再索引）")
     t = T.STATE["trades"][-1]
     if t.get("exit") is None or abs(float(t["exit"]) - fill) > 1e-9:
         return f"出場價 {t.get('exit')}，應為實際成交均價 {fill}（標記價是 104.0）"
@@ -142,6 +146,7 @@ def _():
     ex2.trades_fail = False
     ex2.trigger("XUSDT", "LONG", r2["qty"] - half2, 101.0)
     T.sync_positions()
+    need(T.STATE["trades"], "要取的清單是空的（前提，r35：先確認有東西再索引）")
     t = T.STATE["trades"][-1]
     need(t.get("symbol") == "XUSDT", "沒有結帳（前提）")
     if t.get("pnl") is not None:

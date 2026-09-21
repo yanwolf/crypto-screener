@@ -16,6 +16,19 @@ import tests.fake_exchange as FX
 from tests.fake_exchange import Pre, PROGRAM_ERRORS
 
 
+def _where(e):
+    """例外發生在哪裡（r35）：traceback 最後一層落在測試檔 → 測試本身崩掉（那一項後面的斷言全部沒檢查）；
+    落在被測程式 → 被測程式拋錯。"""
+    import traceback
+    frames = traceback.extract_tb(e.__traceback__)
+    last = frames[-1].filename.replace("\\", "/") if frames else ""
+    if "/tests/" in last:
+        return "測試本身崩掉："
+    if "/backend/" in last:
+        return "被測程式拋錯："
+    return ""
+
+
 def make_case(results):
     def case(tag, desc, allow=(), infra=False):
         """allow：這一項刻意注入、預期會出現在錯誤輸出的字串（其他程式錯誤照樣攔下）。
@@ -30,7 +43,7 @@ def make_case(results):
             except Pre as e:
                 err = f"前提不成立：{e}"
             except Exception as e:
-                err = f"{type(e).__name__}: {e}"
+                err = f"{_where(e)}{type(e).__name__}: {e}"
             finally:
                 sys.stderr = old
             logged = [l for l in buf.getvalue().splitlines() if any(k in l for k in PROGRAM_ERRORS)
@@ -117,6 +130,16 @@ def selftest():
     def _():
         return None
 
+    @case("s5", "測試裡對空清單取 [-1]（先索引、沒先確認有東西）→ 要分類成測試本身崩掉")
+    def _():
+        empty = []
+        return empty[-1]
+
     got = {t: bool(e) for t, _, e in res}
-    want = {"s1": True, "s2": False, "s3": True, "s4": False}
-    return (None if got == want else f"預期 {want}，實際 {got}"), len(res)
+    want = {"s1": True, "s2": False, "s3": True, "s4": False, "s5": True}
+    s5 = next((e for t, _, e in res if t == "s5"), "") or ""
+    if got != want:
+        return f"預期 {want}，實際 {got}", len(res)
+    if not s5.startswith("測試本身崩掉："):
+        return f"測試裡的崩掉沒有被分類出來：{s5}", len(res)
+    return None, len(res)

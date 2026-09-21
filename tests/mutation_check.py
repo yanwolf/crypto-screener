@@ -18,10 +18,11 @@ import sys
 import tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SUITES = ["test_r11", "test_r14", "test_r17", "test_r20", "test_r23", "test_r26", "test_r29", "test_r32"]
+SUITES = ["test_r11", "test_r14", "test_r17", "test_r20", "test_r23", "test_r26", "test_r29", "test_r32", "test_r35"]
 # (測試檔, 項目) → (類別, 引用的項目, 理由)。目前沒有需要人工豁免的項目：
 # 突變下仍通過的全部是命中 0 次（自動判定無關）。
 EXEMPT = {}
+CRASHES = {}                        # 突變下測試本身崩掉的項目（r35）
 
 
 def evaluate(normal, mutated, hits, exempt):
@@ -75,8 +76,19 @@ SELFTEST = [
 ]
 
 
+def parse_crashes(out):
+    """從測試輸出挑出「測試本身崩掉」的項目：[(項目, 原因)]。"""
+    return [(m.group(1), m.group(2)) for m in
+            re.finditer(r"^✕ \[([^\]]+)\][^\n]*\n\s+→ 測試本身崩掉：([^\n]*)", out, re.M)]
+
+
 def selftest():
     wrong = []
+    sample = ("✓ [a] 正常\n✕ [b] 斷言失敗\n      → 平倉沒完成\n"
+              "✕ [c] 測試崩掉\n      → 測試本身崩掉：IndexError: list index out of range\n"
+              "✕ [d] 程式拋錯\n      → 被測程式拋錯：TypeError: x\n")
+    if parse_crashes(sample) != [("c", "IndexError: list index out of range")]:
+        wrong.append(f"解析「測試本身崩掉」錯了：{parse_crashes(sample)}")
     for name, normal, mutated, hits, exempt, want_bad in SELFTEST:
         bad, _ = evaluate(normal, mutated, hits, exempt)
         if bool(bad) != want_bad:
@@ -96,6 +108,9 @@ def run(suite, mutate):
     out = subprocess.run([sys.executable, "-m", f"tests.{suite}"], cwd=ROOT, env=env,
                          capture_output=True, text=True, encoding="utf-8", errors="replace").stdout
     res = {(suite, m.group(2)): m.group(1) == "✓" for m in re.finditer(r"^([✓✕]) \[([^\]]+)\]", out, re.M)}
+    if mutate:
+        for tag, why in parse_crashes(out):
+            CRASHES[(suite, tag)] = why
     hits = {}
     if log and os.path.exists(log):
         hits = {(suite, k): v for k, v in json.load(open(log, encoding="utf-8")).items()}
@@ -127,6 +142,9 @@ def main():
         failed = sum(1 for k, ok in m.items() if not ok)
         print(f"  {s}：突變下 {failed} 項明確失敗、{len(m) - failed} 項通過")
     bad, auto = evaluate(normal, mutated, hits, EXEMPT)
+    # r35：突變下「測試本身崩掉」＝那一項後面的斷言全部沒檢查，要補前提讓它如實報失敗
+    for key, why in sorted(CRASHES.items()):
+        bad.append(f"{key} 突變下測試本身崩掉（後面的斷言沒檢查）：{why[:100]}")
     print(f"  自動判定無關（突變命中 0 次）：{len(auto)} 項 " + "、".join(f"{k[0][5:]}[{k[1]}]" for k in auto))
     for b in bad:
         print("✕ " + b)

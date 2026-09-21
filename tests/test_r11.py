@@ -77,6 +77,7 @@ def _():
     ex.dual_fail = True
     st, _ = T._request("POST", "/fapi/v1/order", {"symbol": "XUSDT", "side": "BUY", "type": "MARKET",
                                                   "quantity": 1, **T._ps("LONG")}, signed=True)
+    need([c for c in ex.calls if c[1] == "/fapi/v1/order"], "要取的清單是空的（前提，r35：先確認有東西再索引）")
     first = [c for c in ex.calls if c[1] == "/fapi/v1/order"][0][2]
     if "positionSide" in first or st != 200:
         return f"沒有先假設單向：第一張帶 positionSide={'positionSide' in first}，HTTP {st}"
@@ -281,6 +282,7 @@ def _():
     open_long(ex)
     p = T.STATE["positions"]["XUSDT"]
     q0 = p["qty"]
+    need([o for o in p["orders"] if o["type"] == "TAKE_PROFIT_MARKET"], "要取的清單是空的（前提，r35：先確認有東西再索引）")
     tp = [o for o in p["orders"] if o["type"] == "TAKE_PROFIT_MARKET"][0]
     half = float(ex.algo[tp["id"]]["quantity"])
     ex.algo.pop(tp["id"])                                     # 停利觸發
@@ -301,6 +303,7 @@ def _():
     open_long(ex)
     p = T.STATE["positions"]["XUSDT"]
     q0, entry, tp1 = p["qty"], p["entry"], p["exits"]["tp1"]
+    need([o for o in p["orders"] if o["type"] == "TAKE_PROFIT_MARKET"], "要取的清單是空的（前提，r35：先確認有東西再索引）")
     tp = [o for o in p["orders"] if o["type"] == "TAKE_PROFIT_MARKET"][0]
     half = float(ex.algo[tp["id"]]["quantity"])
     ex.algo.pop(tp["id"])
@@ -311,6 +314,7 @@ def _():
     ex.trigger("XUSDT", "LONG", q0 - half, exit_px)
     ex.mark["XUSDT"] = exit_px + 3                            # 標記價刻意不同，確認用的是成交價
     T.sync_positions()
+    need(T.STATE["trades"], "要取的清單是空的（前提，r35：先確認有東西再索引）")
     t = T.STATE["trades"][-1]
     want = half * (tp1 - entry) + (q0 - half) * (exit_px - entry)
     need(t.get("pnl") is not None, f"損益記成未知（成交明細沒讀到）：{t}")

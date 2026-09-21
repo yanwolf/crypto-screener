@@ -49,8 +49,10 @@ def _():
     p = T.STATE["positions"]["XUSDT"]
     entry = p["entry"]
     ex.trigger("XUSDT", "LONG", r["qty"], entry)              # 在成本價被停損
+    need(ex.fills, "要取的清單是空的（前提，r35：先確認有東西再索引）")
     need(float(ex.fills[-1]["realizedPnl"]) == 0.0, "模擬的平倉成交 realizedPnl 不是 0（前提）")
     T.sync_positions()
+    need(T.STATE["trades"], "要取的清單是空的（前提，r35：先確認有東西再索引）")
     t = T.STATE["trades"][-1]
     need(t.get("symbol") == "XUSDT", "沒有結帳（前提）")
     if t.get("pnl") is None or abs(t["pnl"]) > 1e-9:
@@ -71,8 +73,10 @@ def _():
     part = (T.STATE["positions"]["XUSDT"].get("partials") or [None])[-1]
     need(part and part.get("px") == 110.0, f"部分出場沒有讀到成交價（前提）：{part}")
     ex.trigger("XUSDT", "LONG", r["qty"] - half, 101.0)        # 同一毫秒
+    need(len(ex.fills) >= 2, "要取的清單是空的（前提，r35：先確認有東西再索引）")
     need(ex.fills[-1]["time"] == ex.fills[-2]["time"], "兩筆成交不在同一毫秒（前提）")
     T.sync_positions()
+    need(T.STATE["trades"], "要取的清單是空的（前提，r35：先確認有東西再索引）")
     t = T.STATE["trades"][-1]
     need(t.get("symbol") == "XUSDT", "沒有結帳（前提）")
     if t.get("exit") is None or abs(float(t["exit"]) - 101.0) > 1e-9:

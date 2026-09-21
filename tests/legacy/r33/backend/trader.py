@@ -824,10 +824,6 @@ def open_position(symbol_base, side, entry_hint, stop, info=None, note="", stop_
         }
         STATE["positions"][sym] = pos
         STATE["pending"].pop(sym, None)
-        try:
-            _mark_boundary(sym, pos, (entry_res or {}).get("orderId"))   # 起始界線在開倉當下記（r35）
-        except Exception as e:
-            _pos_step_error("記成交界線", sym, e)
         save_state()
 
         # 停損：統一走 place_stop（第 2 條 r20）。部位剛由成交確認過，直接帶自己的數量
@@ -1063,8 +1059,7 @@ def _close_fills(sym, pos, qty_needed=None):
         q_params = {"symbol": sym, "fromId": from_id, "limit": 100}
     else:
         since = pos.get("fillsSince") if isinstance(pos.get("fillsSince"), (int, float)) else pos.get("opened")
-        if not isinstance(since, (int, float)) or since <= 0:
-            # 0 或缺值不能當界線：從頭查起，這個幣歷史上所有的平倉成交都會被算進來——那是算錯，不是未知（r34）
+        if not isinstance(since, (int, float)):
             return None, None, None
         q_params = {"symbol": sym, "startTime": int(since), "limit": 100}
     st, d = _request("GET", "/fapi/v1/userTrades", q_params, signed=True)
@@ -1082,31 +1077,6 @@ def _close_fills(sym, pos, qty_needed=None):
     ids = [x.get("id") for x in rows if isinstance(x.get("id"), int)]
     last_id = max(ids) if ids else None
     return q, px, last_id
-
-
-def _mark_boundary(sym, pos, order_id=None):
-    """記下成交明細的起始界線（第 8 條 r34、r35）：開倉成交後、認領當下就記，跟著部位存進狀態檔。
-
-    - 開倉：用開倉那張單的單號查它的成交，最後一筆 id＋1。
-    - 認領（沒有單號）：查最近的成交，最後一筆 id＋1；最近沒有成交就記下認領當下的時間。
-    以前是平倉時才用「開倉時間」查：交易所時鐘比本機慢時平倉成交被篩掉；時間戳是 0 時從頭查起，
-    這個幣歷史上所有的平倉成交都被算成這筆的出場。查不到就不記——之後會記未知，不會算錯。
-    回傳記下的方式：id／time／none。"""
-    if order_id is not None:
-        st, d = _request("GET", "/fapi/v1/userTrades", {"symbol": sym, "orderId": order_id}, signed=True)
-    else:
-        st, d = _request("GET", "/fapi/v1/userTrades",
-                         {"symbol": sym, "startTime": int(time.time() * 1000) - 600000, "limit": 1000}, signed=True)
-    if st != 200 or not isinstance(d, list):
-        return "none"
-    ids = [x.get("id") for x in d if isinstance(x.get("id"), int)]
-    if ids:
-        pos["fillsFromId"] = max(ids) + 1
-        return "id"
-    if order_id is None:
-        pos["fillsSince"] = int(time.time() * 1000)
-        return "time"
-    return "none"
 
 
 def _exit_price(sym, pos):
@@ -1428,10 +1398,6 @@ def adopt_pending(live):
             pos["warnings"].append(f"補掛停損失敗：{(r or {}).get('msg') or r}（守衛會再試）")
         STATE["positions"][sym] = pos
         STATE["pending"].pop(sym, None)
-        try:
-            _mark_boundary(sym, pos)                                    # 認領當下記界線（r34）
-        except Exception as e:
-            _pos_step_error("記成交界線", sym, e)
         save_state()
         ADOPTED.append({"symbol": sym, "qty": qty, "entry": entry, "stop": stop_px, "stopOk": st == 200})
 
@@ -2335,11 +2301,8 @@ def save_state():
                        # 金鑰與網路別刻意不存：金鑰只該在環境變數，
                        # 網路別只該由啟動參數決定，避免存檔把正式網狀態帶回來
                        "cfg": {k: CFG[k] for k in PERSIST_CFG}}, f)
-    except Exception as e:
-        # 以前是 except: pass——存檔失敗完全沒有訊息。狀態檔是成交界線、待平倉、pending 能跨重啟的唯一依據
-        _pos_step_error("存檔", "狀態檔", e)
-    else:
-        _pos_step_ok("存檔", "狀態檔")
+    except Exception:
+        pass
 
 
 def state_path(cache_dir, live):
