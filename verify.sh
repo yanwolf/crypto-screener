@@ -28,8 +28,15 @@ done
 curl -s http://127.0.0.1:8899/ | grep -q '<div id="root">' && echo "  首頁送出建置後的 index.html"
 sleep 10 || true
 
-echo "── 5. 區域變數順序 ──"
+echo "── 5. 區域變數順序／未定義名稱（BINANCE_LESSONS 第 14 條）──"
 python3 scripts/check_locals.py
+if python3 -m pyflakes --version >/dev/null 2>&1; then
+  und=$(python3 -m pyflakes backend/ tests/ scripts/ 2>&1 | grep "undefined name" || true)
+  if [ -n "$und" ]; then echo "  ✕ 有未定義名稱，不能部署："; echo "$und"; exit 1; fi
+  echo "✓ pyflakes：沒有未定義名稱"
+else
+  echo "  ⚠ 沒裝 pyflakes，略過未定義名稱檢查（pip install pyflakes）"
+fi
 
 echo "── 6. 欄位對應 ──"
 python3 scripts/check_fields.py
@@ -45,6 +52,9 @@ python3 -m tests.test_lessons
 
 echo "── 10. r8→r11 逐段檢查項目 ──"
 python3 -m tests.test_r11
+
+echo "── 11. r12→r14 逐段檢查項目 ──"
+python3 -m tests.test_r14
 
 echo
 echo "全部通過"

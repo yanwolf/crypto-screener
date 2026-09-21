@@ -101,7 +101,7 @@ check(not T.has_stop_order([{"algoId": 5, "orderType": "STOP_MARKET", "side": "B
 
 fresh()
 T.STATE["positions"] = {"XUSDT": pos("LONG", stop_id=111)}
-T.open_algo_orders = lambda sym: (others, True)
+T.open_algo_orders = lambda sym, **kw: (others, True)
 T._request = lambda m, p, params=None, signed=False, timeout=15: (200, {"algoId": 222})
 for _ in range(3):
     ev = T.guard_positions()
@@ -144,9 +144,26 @@ p = pos("LONG")
 closed = []
 T.record_close = lambda pp, px, reason: closed.append(reason)
 T.mark_price = lambda s: 99.0
-T._request = lambda m, path, params=None, signed=False, timeout=15: (
-    (200, {}) if m == "DELETE" or path == "/fapi/v1/order"
-    else (400, {"code": -2021, "msg": "Order would immediately trigger."}))
+_held = {"q": p["qty"]}
+
+
+def _ex3(m, path, params=None, signed=False, timeout=15):
+    # 模擬環境要夠真實（用法第 5 點）：查部位回傳真的部位；只有新停損（成本附近）回 -2021，舊停損掛回去會成功
+    params = params or {}
+    if path == "/fapi/v2/positionRisk":
+        return 200, [{"symbol": "XUSDT", "positionAmt": str(_held["q"]), "positionSide": "BOTH", "entryPrice": "100"}]
+    if m == "DELETE":
+        return 200, {}
+    if path == "/fapi/v1/algoOrder":
+        trig = float(params.get("triggerPrice") or 0)
+        return (400, {"code": -2021, "msg": "Order would immediately trigger."}) if trig > 99 else (200, {"algoId": 7})
+    if path == "/fapi/v1/order" and params.get("type") == "MARKET":
+        _held["q"] = 0
+        return 200, {"orderId": 1}
+    return 200, {}
+
+
+T._request = _ex3
 e3 = T.move_to_breakeven(p, p["exits"]["breakeven"] + 0.5)
 check(e3 and e3.get("exited") and closed, f"8 價格已穿過想要的停損（-2021）應直接出場，實際 {e3}")
 
@@ -212,7 +229,7 @@ check(due == [1, 5, 30, 150, 270, 390], f"告警節奏應為 1,5,30,150,270,390�
 # ── 第 2 條：守衛補掛失敗依節奏告警、補上時通知 ─────────────────
 fresh()
 T.STATE["positions"] = {"XUSDT": pos("LONG", stop_id=111)}
-T.open_algo_orders = lambda sym: ([], True)                 # 停損不在
+T.open_algo_orders = lambda sym, **kw: ([], True)                 # 停損不在
 T._request = lambda m, p, params=None, signed=False, timeout=15: (400, {"code": -1000, "msg": "busy"})
 alerts = []
 for _ in range(2 + 31):                                     # 前 2 輪只累計不補掛，之後 31 次補掛失敗

@@ -824,6 +824,12 @@ def position_worker(every_s=20):
                     elif ev["action"] == "false_alarm":
                         sys.stderr.write(f"  ~ {ev['symbol']} 停損檢查誤報（交易所回報已存在），不動作\n")
 
+            # 平倉沒平掉的部位：每輪重試（第 8 條 r13）。待平倉期間只有這條路會送平倉單（r14）
+            if trader and any(p.get("pendingClose") for p in trader.STATE["positions"].values()):
+                for ev in trader.retry_pending_closes():
+                    if ev["action"] == "retry":
+                        sys.stderr.write(f"  ! {ev['symbol']} 待平倉重試失敗（第 {ev['attempt']} 次）\n")
+
             # 平倉後撤不掉的條件單：每輪重試（第 13 條）
             if trader and trader.STATE.get("leftovers"):
                 trader.retry_leftovers()

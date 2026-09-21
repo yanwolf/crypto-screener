@@ -29,117 +29,7 @@ def case(tag, desc):
     return deco
 
 
-class FakeEx:
-    """模擬幣安合約帳戶：持倉模式、部位、條件單、各種拒絕與逾時。"""
-
-    def __init__(self, mode="oneway"):
-        self.mode = mode
-        self.dual_fail = False
-        self.pos = {}                  # (symbol, side) → [qty, entry]
-        self.algo = {}                 # algoId → params
-        self.next_id = 1000
-        self.mark = {}
-        self.reject_market = set()     # 這些幣的市價單被拒（例如保證金不足）
-        self.entry_timeout = False     # 進場市價單成交了，但回應逾時（狀態 0）
-        self.reject_algo = None        # callable(params) → (st, body) 或 None
-        self.calls = []
-        self.cache_seen_on_resend = []
-
-    def _mode_ok(self, params, reduce_kind):
-        has_ps = "positionSide" in params
-        if self.mode == "hedge":
-            if not has_ps:
-                return False, -4061
-            if params.get("reduceOnly"):
-                return False, -1106
-        elif has_ps:
-            return False, -4061
-        return True, None
-
-    def rows(self, sym=None):
-        out = []
-        syms = {s for s, _ in self.pos} | ({sym} if sym else set())
-        for s in syms:
-            if sym and s != sym:
-                continue
-            if self.mode == "hedge":
-                for side in ("LONG", "SHORT"):
-                    q, e = self.pos.get((s, side), [0, 0])
-                    out.append({"symbol": s, "positionSide": side, "positionAmt": str(q if side == "LONG" else -q),
-                                "entryPrice": str(e), "markPrice": str(self.mark.get(s, e)), "unRealizedProfit": "0"})
-            else:
-                lq, le = self.pos.get((s, "LONG"), [0, 0])
-                sq, se = self.pos.get((s, "SHORT"), [0, 0])
-                amt, e = (lq, le) if lq else (-sq, se)
-                out.append({"symbol": s, "positionSide": "BOTH", "positionAmt": str(amt), "entryPrice": str(e),
-                            "markPrice": str(self.mark.get(s, e)), "unRealizedProfit": "0"})
-        return out
-
-    def __call__(self, method, path, params, signed, timeout):
-        params = dict(params or {})
-        self.calls.append((method, path, params))
-        if path == "/fapi/v1/positionSide/dual":
-            return (0, {"error": "timeout"}) if self.dual_fail else (200, {"dualSidePosition": self.mode == "hedge"})
-        if path == "/fapi/v2/account":
-            return 200, {"totalWalletBalance": "1000", "totalMarginBalance": "1000", "availableBalance": "1000",
-                         "totalPositionInitialMargin": "0", "totalUnrealizedProfit": "0"}
-        if path == "/fapi/v1/premiumIndex":
-            return 200, {"markPrice": str(self.mark.get(params.get("symbol"), 100.0))}
-        if path in ("/fapi/v1/leverage", "/fapi/v1/leverageBracket"):
-            return 200, {}
-        if path == "/fapi/v2/positionRisk":
-            return 200, self.rows(params.get("symbol"))
-        if path == "/fapi/v1/openAlgoOrders":
-            return 200, [dict(v, algoId=k) for k, v in self.algo.items()
-                         if not params.get("symbol") or v.get("symbol") == params.get("symbol")]
-        if path == "/fapi/v1/order" and method == "POST" and params.get("type") == "MARKET":
-            sym, side = params["symbol"], params["side"]
-            ok, code = self._mode_ok(params, None)
-            if not ok:
-                self.cache_seen_on_resend.append(T._mode.get("hedge"))
-                return 400, {"code": code, "msg": "position side does not match"}
-            qty = float(params["quantity"])
-            if self.mode == "hedge":
-                pside = params["positionSide"]
-                reduce = (pside == "LONG" and side == "SELL") or (pside == "SHORT" and side == "BUY")
-            else:
-                reduce = bool(params.get("reduceOnly"))
-                pside = ("LONG" if side == "SELL" else "SHORT") if reduce else ("LONG" if side == "BUY" else "SHORT")
-            if reduce and sym in self.reject_market:
-                return 400, {"code": -2019, "msg": "Margin is insufficient."}
-            q, e = self.pos.get((sym, pside), [0, 0])
-            if reduce:
-                if self.mode == "hedge" and qty > q + 1e-9:
-                    return 400, {"code": -4118, "msg": "ReduceOnly Order Failed."}
-                self.pos[(sym, pside)] = [max(0.0, q - qty), e]
-            else:
-                px = self.mark.get(sym, 100.0)
-                self.pos[(sym, pside)] = [q + qty, px]
-                if self.entry_timeout:
-                    return 0, {"error": "timed out"}
-            return 200, {"orderId": 1}
-        if path == "/fapi/v1/order" and method == "POST" and params.get("type") != "MARKET":
-            # 真實幣安 2025-12-09 起：條件單送到舊端點一律 -4120（清單第 1 條）
-            return 400, {"code": -4120, "msg": "Order type not supported for this endpoint. "
-                                                "Please use the Algo Order API endpoints instead."}
-        if path == "/fapi/v1/algoOrder" and method == "POST":
-            ok, code = self._mode_ok(params, None)
-            if not ok:
-                return 400, {"code": code, "msg": "position side does not match"}
-            if self.reject_algo:
-                r = self.reject_algo(params)
-                if r:
-                    return r
-            self.next_id += 1
-            self.algo[self.next_id] = params
-            return 200, {"algoId": self.next_id}
-        if path == "/fapi/v1/algoOrder" and method == "DELETE":
-            i = int(params["algoId"])
-            if i in self.algo:
-                self.algo.pop(i)
-                return 200, {}
-            return 400, {"code": -2011, "msg": "Unknown order sent."}
-        return 200, {}
+from tests.fake_exchange import FakeEx                      # noqa: E402
 
 
 def fresh(mode="oneway"):
@@ -260,8 +150,12 @@ def _():
     open_long(ex)
     T._mode.update({"hedge": True, "ts": 9e18})              # 快取猜錯成雙向
     ex.dual_fail = True
-    r = T.close_position("XUSDT")
+    n0 = len([c for c in ex.calls if c[1] == "/fapi/v1/order" and c[2].get("type") == "MARKET"])
+    T.close_position("XUSDT")
+    sent = [c for c in ex.calls if c[1] == "/fapi/v1/order" and c[2].get("type") == "MARKET"][n0:]
     left = ex.pos.get(("XUSDT", "LONG"), [0])[0]
+    if not sent:
+        return "沒有送出平倉單"
     if left > 0:
         return f"平倉單沒有成功送出，交易所還有 {left}"
 
@@ -315,8 +209,11 @@ def _():
     T._request_raw = del_fail
     T.close_position("XUSDT")
     a = alerts()
-    if not any("殘留" in x["title"] and "第 1 次" in x["title"] + x["text"] for x in a):
+    hit = [x for x in a if "殘留" in x["title"] and "第 1 次" in x["title"] + x["text"]]
+    if not hit:
         return f"手動平倉時殘留單第一次撤不掉沒有告警：{[x['title'] for x in a]}"
+    if not all("busy" in x["text"] for x in hit):
+        return f"告警裡的錯誤不是注入的那一個：{hit[0]['text'][:120]}"
 
 
 @case("8-2a", "補掛回報已存在（誤報）時，先前的失敗要發恢復並歸零")
