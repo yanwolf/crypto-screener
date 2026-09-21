@@ -160,7 +160,8 @@ class FakeEx:
             else:
                 since = params.get("startTime")
                 rows = [f for f in rows if since is None or f["time"] >= int(since)]
-            return 200, rows
+            # 照 limit 截斷（沒給時 500，跟幣安一樣）。以前一律回全部——「只查一頁」的錯永遠測不出來（r31 退化值）
+            return 200, rows[:int(params.get("limit") or 500)]
         if path == "/fapi/v1/openAlgoOrders":
             return 200, [dict(v, algoId=k) for k, v in self.algo.items()
                          if not params.get("symbol") or v.get("symbol") == params.get("symbol")]

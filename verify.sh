@@ -88,9 +88,13 @@ python3 -m tests.test_r32
 echo "── 18. r33→r35 逐段檢查項目 ──"
 python3 -m tests.test_r35
 
-echo "── 19. 測試本身與工具的檢查（用法第 5 點、第 14 條）──"
+echo "── 19. r36→r38 逐段檢查項目 ──"
+python3 -m tests.test_r38
+
+echo "── 20. 測試本身與工具的檢查（用法第 5 點、第 14 條）──"
 python3 -m tests.check_indexing        # 先索引、沒先確認有東西（r35）
 python3 -m tests.run_on_legacy r33     # 現在的測試跑舊版程式：測試本身崩掉要是 0（r35、r36）
+python3 -m tests.run_on_legacy r36
 python3 scripts/patch.py              # apply 比對不到時一個檔都不寫（r26）
 python3 -m tests.check_tests          # 每個案例從 fresh() 開始（第 14 種）、否定句要有前提（r19）
 python3 -m tests.mutation_check       # 逐項突變比對：仍通過的必須在豁免清單（r18、r20）

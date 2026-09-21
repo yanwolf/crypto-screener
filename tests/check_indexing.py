@@ -46,6 +46,8 @@ def scan(src, fname="<src>"):
         if isinstance(n.value, ast.Call) and getattr(n.value.func, "attr", "") == "get" and len(n.value.args) >= 2:
             continue                                  # .get(k, [0])
         line = lines[n.lineno - 1]
+        if "# 固定長度" in line:
+            continue                                  # 明寫標記：固定長度的回傳值（看得到、也審得到，r38 gold-scalper）
         key = base if len(base) < 40 else base[:40]
         if any(g in line for g in (f"{key} and ", f"not {key} or")) or \
                 (f"len({key})" in line and line.index(f"len({key})") < line.index(key + ("[" if not key.endswith("]") else ""))):
@@ -66,6 +68,8 @@ SELFTEST = [
     ("def f(h):\n    if len(h) != 1 or 'a' not in h[0]['text']:\n        return 1\n", 0),
     ("def f(y):\n    return (y or [None])[-1]\n", 0),
     ("def f(ex):\n    need(len(ex.fills) >= 2 and ex.fills[-1]['a'], 'x')\n", 0),
+    ("def f(g):\n    return g()[0]  # 固定長度\n", 0),
+    ("def f(out):\n    return out.strip().splitlines()[-1]\n", 1),         # 函式呼叫的結果可能是空的，不整類排除
 ]
 
 

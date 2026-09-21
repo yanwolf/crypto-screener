@@ -15,7 +15,7 @@ import time
 
 import trader as T
 
-VERSION = "2026-09-21r39"        # 與 BINANCE_LESSONS.md 最上面的版本一致
+VERSION = "2026-09-21r36"        # 與 BINANCE_LESSONS.md 最上面的版本一致
 
 
 def _msg(d):
@@ -101,9 +101,6 @@ def check():
         "無" if not stale else f"{'、'.join(stale)} 送單超過 2 分鐘仍未記帳", 3)
 
     # 帳上有、交易所沒有；交易所有、帳上沒有
-    if T.STATE.get("loadError"):
-        le = T.STATE["loadError"]
-        add("持倉紀錄", "fail", f"持倉紀錄還沒載入，無法對帳（{le.get('error')}；壞檔另存於 {le.get('backup') or '—'}）", 8)
     mine = set(T.STATE.get("positions") or {})
     ghost = mine - live_syms if st == 200 else set()
     extra = live_syms - mine if st == 200 else set()

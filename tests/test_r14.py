@@ -408,7 +408,7 @@ def _():
     mine = r["sizing"]["qty"]                                 # 修正：不從帳上讀（帳上可能已混了基準部位）
     need([o for o in p["orders"] if o["type"] == "TAKE_PROFIT_MARKET"], "要取的清單是空的（前提，r35：先確認有東西再索引）")
     tp = [o for o in p["orders"] if o["type"] == "TAKE_PROFIT_MARKET"][0]
-    half = T.round_step(mine * T.CFG["tp1Portion"], 0.1)       # 這張單應出一半的數量
+    half = float(ex.algo[tp["id"]]["quantity"])               # 交易所實際收到的停利數量（第 24 種：不借用程式的 round_step 算預期值）
     ex.algo.pop(tp["id"])
     ex.pos[("XUSDT", "LONG")][0] -= half
     T.sync_positions()
