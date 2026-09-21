@@ -9,6 +9,7 @@ backend/    Python 伺服器，純標準函式庫，零依賴
   main.py     HTTP 伺服器、CoinGecko/GeckoTerminal/GoPlus/Binance 代理、快取、監控、通知
   engine.py   評分引擎（與前端 src/engine.js、src/trade.js 逐條對齊，交叉驗證）
   trader.py   幣安合約下單、風控閘門、帳本
+  preflight.py 交易所相容性自檢，每項對應 BINANCE_LESSONS.md 的一條
 frontend/   Vite + React，建置輸出單一 index.html
   src/
     theme.js constants.js util.js api.js demo.js
@@ -17,7 +18,9 @@ frontend/   Vite + React，建置輸出單一 index.html
     pages/       各分頁（Radar / Watch / Chain / Trade / Signals / Alerts / DetailModal …）
     App.jsx      狀態擁有者，分頁透過狀態袋 s 取用
   scripts/   smoke.js（jsdom 掛載並走訪全部分頁）、xval.js（交叉驗證）
-scripts/    check_fields.py、xval.py
+scripts/    check_fields.py、check_locals.py、xval.py
+tests/      test_parity.py（出場位階一致性，BINANCE_LESSONS 第 11 條）
+BINANCE_LESSONS.md  三個幣安專案共用的踩坑清單，版本日期必須一致
 Dockerfile  多階段：node 建前端 → python:slim 只帶建好的 HTML
 verify.sh   打包前完整驗證
 GO_LIVE.md  接入正式網流程與並存部署

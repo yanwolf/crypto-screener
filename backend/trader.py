@@ -85,6 +85,7 @@ _time_offset = [0]                 # 伺服器與幣安的時鐘差
 
 STATE = {
     "enabled": False,
+    "pending": {},                 # symbol → 已送單、尚未記帳的部位（第 3 條）
     "positions": {},               # symbol → 部位紀錄
     "trades": [],                  # 已平倉紀錄
     "errors": [],
@@ -458,14 +459,34 @@ def place_conditional(params: dict):
     return st, d, "legacy"
 
 
-def cancel_conditional(symbol):
-    """兩種端點都清一次，避免殘留掛單擋住下一筆。"""
-    out = []
-    st, d = _request("DELETE", "/fapi/v1/algoOpenOrders", {"symbol": symbol}, signed=True)
-    out.append(("algo", st))
-    st2, d2 = _request("DELETE", "/fapi/v1/allOpenOrders", {"symbol": symbol}, signed=True)
-    out.append(("legacy", st2))
-    return out
+def cancel_position_orders(symbol, pos, only_type=None):
+    """用記錄下來的 algoId / orderId 精準撤掉這個部位的條件單（BINANCE_LESSONS 第 7 條）。
+
+    不用 symbol 全撤：共用帳號時會把別的專案同一個幣的掛單一起撤掉。
+    已經不存在（觸發過或被撤過）視為成功，回傳 (撤掉張數, 已不存在張數, 失敗清單)。
+    """
+    done = gone = 0
+    failed = []
+    for o in pos.get("orders") or []:
+        if not o.get("id"):
+            continue
+        if only_type and _order_type(o) != only_type:
+            continue
+        if o.get("via") == "algo":
+            st, d = _request("DELETE", "/fapi/v1/algoOrder", {"symbol": symbol, "algoId": o["id"]}, signed=True)
+        else:
+            st, d = _request("DELETE", "/fapi/v1/order", {"symbol": symbol, "orderId": o["id"]}, signed=True)
+        if st == 200:
+            done += 1
+            continue
+        code = d.get("code") if isinstance(d, dict) else None
+        msg = str((d or {}).get("msg") if isinstance(d, dict) else d)
+        # -2011 Unknown order / 不存在：已經觸發或被撤過，不是錯誤
+        if code in (-2011, -2013) or "Unknown" in msg or "not exist" in msg.lower():
+            gone += 1
+        else:
+            failed.append(f"{_order_type(o)}#{o['id']}：{msg[:60]}")
+    return done, gone, failed
 
 
 # ── 下單 ────────────────────────────────────────────────────
@@ -631,11 +652,21 @@ def open_position(symbol_base, side, entry_hint, stop, info=None, note="", stop_
 
     # newOrderRespType=RESULT 讓市價單回傳成交結果而非只回 ACK，
     # 這樣才拿得到實際成交均價。
+    # 送單前先寫 pending（BINANCE_LESSONS 第 3 條）：市價單送出後到記帳之間
+    # 任何一處拋例外，下一輪對帳都能把交易所上的部位認領回來，不會變成沒人管的孤兒倉。
+    params = {k: CFG.get(k) for k in PARAM_KEYS}
+    STATE["pending"][sym] = {"side": side, "qty": qty, "stop": stop, "stopPct": stop_pct,
+                             "note": note, "params": params, "minScore": AUTO.get("minScore"),
+                             "leverage": lev_used or CFG["leverage"], "ts": int(time.time() * 1000)}
+    save_state()
+
     st, entry_res = _request("POST", "/fapi/v1/order", {
         "symbol": sym, "side": order_side, "type": "MARKET", "quantity": qty,
         "newOrderRespType": "RESULT", **_ps(side),
     }, signed=True)
     if st != 200:
+        STATE["pending"].pop(sym, None)
+        save_state()
         return {"ok": False, "error": f"進場失敗：{entry_res.get('msg') or entry_res}"}
 
     # 等部位真的出現在帳戶上再掛條件單。
@@ -643,7 +674,8 @@ def open_position(symbol_base, side, entry_hint, stop, info=None, note="", stop_
     # 錯誤訊息是「TIF GTE can only be used with open positions」。
     actual_qty, actual_entry = wait_position(sym, qty, side=side)
     if actual_qty <= 0:
-        return {"ok": False, "error": "進場單已送出，但 6 秒內查不到部位，請到幣安確認後手動處理"}
+        # pending 留著：之後部位若出現，對帳會認領並補掛停損
+        return {"ok": False, "error": "進場單已送出，但 6 秒內查不到部位；已記為待認領，下一輪對帳會自動接手"}
     qty = actual_qty
     if actual_entry:
         px = actual_entry            # 用實際成交均價重算出場位階
@@ -651,6 +683,9 @@ def open_position(symbol_base, side, entry_hint, stop, info=None, note="", stop_
 
     tick = (info or {}).get("tick") or 0.01
     stop_px = round_step(stop, tick)
+    # 出場位階必須用「實際掛出去的停損價」算：用未取整的停損算，R 與各級目標
+    # 會跟真正的停損差一個跳動點，績效的 R 倍數也跟著偏（tests/test_parity.py 抓到的）
+    exits = plan_exits(px, stop_px, side)
     sub, errs = [], []
 
     # 掛停損前用「當下」的標記價再檢查一次。
@@ -665,9 +700,26 @@ def open_position(symbol_base, side, entry_hint, stop, info=None, note="", stop_
             "symbol": sym, "side": close_side, "type": "MARKET",
             "quantity": qty, **_reduce(side),
         }, signed=True)
+        STATE["pending"].pop(sym, None)
+        save_state()
         return {"ok": False, "error": (
             f"下單瞬間價格已越過預定停損（現價 {live:g}，停損 {stop_px:g}），"
             f"進場前提不成立，已立即平倉不留倉位")}
+
+    # 成交確認後立刻記帳，再掛條件單（第 3 條的順序：pending → 記帳 → 掛停損）。
+    # sub 與 pos["orders"] 是同一個串列，後面掛上的單會直接出現在帳上。
+    pos = {
+        "version": strategy_label(params),
+        "leverage": lev_used or CFG["leverage"],
+        "params": params, "minScore": AUTO.get("minScore"),
+        "symbol": sym, "side": side, "qty": qty, "entry": px,
+        "stop": stop_px, "exits": exits, "sizing": detail,
+        "orders": sub, "opened": int(time.time() * 1000),
+        "note": note, "warnings": errs,
+    }
+    STATE["positions"][sym] = pos
+    STATE["pending"].pop(sym, None)
+    save_state()
 
     # 停損：closePosition 確保無論部位多大都全平
     st2, r2, ep2 = place_conditional({
@@ -681,6 +733,8 @@ def open_position(symbol_base, side, entry_hint, stop, info=None, note="", stop_
             "symbol": sym, "side": close_side, "type": "MARKET",
             "quantity": qty, **_reduce(side),
         }, signed=True)
+        STATE["positions"].pop(sym, None)     # 沒掛上停損就平掉，不列入績效（跟以前一致）
+        save_state()
         return {"ok": False, "error": "；".join(errs) + "　已立即平倉，避免無停損部位"}
     sub.append({"type": "STOP_MARKET", "id": r2.get("algoId") or r2.get("orderId"),
                 "px": stop_px, "via": ep2})
@@ -715,17 +769,8 @@ def open_position(symbol_base, side, entry_hint, stop, info=None, note="", stop_
         else:
             errs.append(f"移動停利掛單失敗：{r4.get('msg') or r4}")
 
-    params = {k: CFG.get(k) for k in PARAM_KEYS}
-    pos = {
-        "version": strategy_label(params),
-        "leverage": lev_used or CFG["leverage"],
-        "params": params, "minScore": AUTO.get("minScore"),
-        "symbol": sym, "side": side, "qty": qty, "entry": px,
-        "stop": stop_px, "exits": exits, "sizing": detail,
-        "orders": sub, "opened": int(time.time() * 1000),
-        "note": note, "warnings": (errs + ([lev_note] if lev_note else [])),
-    }
-    STATE["positions"][sym] = pos
+    if lev_note:
+        errs.append(lev_note)
     save_state()
     return {"ok": True, **pos}
 
@@ -849,13 +894,105 @@ def close_position(symbol, reason="手動平倉"):
             "symbol": symbol, "side": close_side, "type": "MARKET",
             "quantity": pos["qty"], **_reduce(pos["side"]),
         }, signed=True)
-        cancel_conditional(symbol)
     px = mark_price(symbol) or pos["entry"]
     record_close(pos, px, reason)
     return {"ok": True, "symbol": symbol, "exit": px}
 
 
+def cancel_orphan(symbol, algo_id):
+    """撤掉一張孤兒條件單（自檢列出的）。
+
+    幣安子帳戶的網頁訂單管理看不到 Algo 條件單，手動撤不了，所以從這裡撤。
+    安全檢查：這個幣現在有部位、或這張單屬於帳上某個部位，就拒絕——那不是孤兒。
+    """
+    if not symbol or not algo_id:
+        return {"ok": False, "error": "缺少 symbol 或 algoId"}
+    for p in STATE["positions"].values():
+        for o in p.get("orders") or []:
+            if str(o.get("id")) == str(algo_id):
+                return {"ok": False, "error": f"這張單屬於帳上的 {p['symbol']} 部位，不是孤兒單"}
+    st, d = _request("GET", "/fapi/v2/positionRisk", {"symbol": symbol}, signed=True)
+    if st != 200 or not isinstance(d, list):
+        return {"ok": False, "error": "查不到這個幣的部位，為安全起見不撤（查不到不等於不存在）"}
+    if any(abs(float(r.get("positionAmt") or 0)) > 0 for r in d):
+        return {"ok": False, "error": f"{symbol} 目前有部位，這張單可能正在保護它，不撤"}
+    st, d = _request("DELETE", "/fapi/v1/algoOrder", {"symbol": symbol, "algoId": algo_id}, signed=True)
+    if st == 200:
+        return {"ok": True, "symbol": symbol, "algoId": algo_id}
+    return {"ok": False, "error": str((d or {}).get("msg") if isinstance(d, dict) else d)[:120]}
+
+
+def adopt_pending(live):
+    """把「送了單但沒記到帳」的部位認領回來（BINANCE_LESSONS 第 3 條）。
+
+    30 秒後交易所上有這個幣、帳上卻沒有 → 用 pending 裡的參數建立紀錄，並立刻補掛停損。
+    2 分鐘後交易所上也沒有 → 那張單根本沒成交，丟掉 pending。
+    """
+    now = int(time.time() * 1000)
+    for sym, pd in list((STATE.get("pending") or {}).items()):
+        ts = pd.get("ts")
+        age = now - (ts if isinstance(ts, (int, float)) else now)
+        if age < 30000 or sym in STATE["positions"]:
+            if sym in STATE["positions"]:
+                STATE["pending"].pop(sym, None)
+            continue
+        lp = live.get(sym)
+        if not lp:
+            if age > 120000:
+                STATE["pending"].pop(sym, None)
+                save_state()
+            continue
+        try:
+            qty = abs(float(lp.get("positionAmt") or 0))
+            entry = float(lp.get("entryPrice") or 0)
+        except Exception:
+            continue
+        if qty <= 0 or entry <= 0:
+            continue
+        side = pd["side"]
+        sp = pd.get("stopPct")
+        stop = (entry * (1 - sp / 100) if side == "LONG" else entry * (1 + sp / 100)) if sp else pd.get("stop")
+        info = _filters.get(sym) or {}
+        stop_px = round_step(stop, info.get("tick") or 0.01)
+        close_side = "SELL" if side == "LONG" else "BUY"
+        pos = {"version": strategy_label(pd.get("params")), "leverage": pd.get("leverage"),
+               "params": pd.get("params"), "minScore": pd.get("minScore"),
+               "symbol": sym, "side": side, "qty": qty, "entry": entry, "stop": stop_px,
+               "exits": plan_exits(entry, stop_px, side), "orders": [],
+               "opened": pd.get("ts"), "note": (pd.get("note") or "") + "（對帳認領）",
+               "warnings": ["送單後未記帳，由對帳認領；只補掛停損，停利與移動停利未掛"]}
+        st, r, ep = place_conditional({"symbol": sym, "side": close_side, "type": "STOP_MARKET",
+                                       "stopPrice": stop_px, "workingType": "MARK_PRICE",
+                                       **_close_all(side)})
+        if st == 200:
+            pos["orders"].append({"type": "STOP_MARKET", "id": r.get("algoId") or r.get("orderId"),
+                                  "px": stop_px, "via": ep})
+        else:
+            pos["warnings"].append(f"補掛停損失敗：{(r or {}).get('msg') or r}（守衛會再試）")
+        STATE["positions"][sym] = pos
+        STATE["pending"].pop(sym, None)
+        save_state()
+        ADOPTED.append({"symbol": sym, "qty": qty, "entry": entry, "stop": stop_px, "stopOk": st == 200})
+
+
+ADOPTED = []          # 本輪認領的部位，給 main.py 推播用
+
+
 def record_close(pos, exit_px, reason):
+    """記帳並撤掉這個部位剩下的條件單（BINANCE_LESSONS 第 13 條）。
+
+    交易所端任一張條件單觸發平倉後，其餘的會留下來變孤兒：
+    停損觸發 → 停利與移動停利還在；移動停利出場 → closePosition 停損還在。
+    下次同一個幣再進場時，舊的 closePosition 停損會讓新停損被拒（第 8 條），
+    進而觸發「沒有停損就不留倉」而立刻平倉；共用帳號時還可能動到別的專案的倉。
+    """
+    leftover = None
+    if not CFG["dryRun"] and pos.get("orders"):
+        try:
+            done, gone, failed = cancel_position_orders(pos["symbol"], pos)
+            leftover = {"cancelled": done, "alreadyGone": gone, "failed": failed}
+        except Exception as e:
+            leftover = {"failed": [str(e)[:80]]}
     sgn = 1 if pos["side"] == "LONG" else -1
     pnl = (exit_px - pos["entry"]) * sgn * pos["qty"]
     r = pos["exits"]["R"] * pos["qty"]
@@ -866,6 +1003,8 @@ def record_close(pos, exit_px, reason):
         "symbol": pos["symbol"], "side": pos["side"], "qty": pos["qty"],
         "entry": pos["entry"], "exit": exit_px, "pnl": round(pnl, 4),
         "rMultiple": round(pnl / r, 2) if r else None,
+        "orders": pos.get("orders") or [],           # 保留訂單 id，事後查孤兒單用
+        "leftover": leftover,
         "opened": pos["opened"], "closed": int(time.time() * 1000),
         "reason": reason, "note": pos.get("note", ""),
     })
@@ -901,6 +1040,8 @@ def sync_positions():
         if mine and ps not in ("BOTH", mine["side"]):
             continue                     # 雙向模式下另一側不是我們的
         live[p["symbol"]] = p
+    adopt_pending(live)
+
     closed = []
     for sym in list(STATE["positions"].keys()):
         if sym not in live:
@@ -1020,16 +1161,19 @@ def missed_evaluate(hourly_prices_fn, horizon_h=72):
             continue
         sgn = 1 if m["side"] == "LONG" else -1
         entry = m["price"]
-        r_unit = entry * m["stopPct"] / 100.0
-        stop = entry - sgn * r_unit
-        tp2 = entry + sgn * 2 * r_unit
+        # 出場位階與實盤共用 plan_exits（BINANCE_LESSONS 第 11 條），不另外寫一套
+        stop = entry - sgn * entry * m["stopPct"] / 100.0
+        ex = plan_exits(entry, stop, m["side"])
+        r_unit = ex["R"]
+        tp2 = ex["tp1"]
+        tp_r = CFG["tp1R"]
         res, r, hit_t = "none", None, None
         for t_, p in pts:
             if (p - stop) * sgn <= 0:
                 res, r, hit_t = "stop", -1.0, t_
                 break
             if (p - tp2) * sgn >= 0:
-                res, r, hit_t = "tp2", 2.0, t_
+                res, r, hit_t = "tp2", float(tp_r), t_
                 break
         if res == "none":
             if not expired:
@@ -1373,7 +1517,7 @@ def save_state():
         return
     try:
         with open(STATE_FILE, "w") as f:
-            json.dump({"state": {k: STATE.get(k) for k in ("enabled", "positions", "trades", "lastNet")},
+            json.dump({"state": {k: STATE.get(k) for k in ("enabled", "pending", "positions", "trades", "lastNet")},
                        "missed": MISSED, "conflicts": CONFLICTS,
                        "auto": AUTO,
                        # 金鑰與網路別刻意不存：金鑰只該在環境變數，
@@ -1409,6 +1553,7 @@ def load_state(path):
         STATE["positions"] = st.get("positions", {})
         STATE["trades"] = st.get("trades", [])
         STATE["lastNet"] = st.get("lastNet")
+        STATE["pending"] = st.get("pending") or {}
         for i, t in enumerate(STATE["trades"]):
             if not t.get("id"):
                 t["id"] = f"{t.get('symbol', 'X')}-{t.get('closed') or i}"

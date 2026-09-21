@@ -28,11 +28,17 @@ done
 curl -s http://127.0.0.1:8899/ | grep -q '<div id="root">' && echo "  首頁送出建置後的 index.html"
 sleep 10 || true
 
-echo "── 5. 欄位對應 ──"
+echo "── 5. 區域變數順序 ──"
+python3 scripts/check_locals.py
+
+echo "── 6. 欄位對應 ──"
 python3 scripts/check_fields.py
 
-echo "── 6. 前後端引擎交叉驗證 ──"
+echo "── 7. 前後端引擎交叉驗證 ──"
 python3 scripts/xval.py
+
+echo "── 8. 出場規則一致性（BINANCE_LESSONS 第 11 條）──"
+python3 -m tests.test_parity
 
 echo
 echo "全部通過"

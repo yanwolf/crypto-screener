@@ -4,7 +4,7 @@ import { fmtPrice, store } from "../util.js";
 
 /* 由 App.jsx 抽出。共用狀態透過 s 傳入，避免逐一列 props。 */
 export default function TradePage({ s }) {
-  const { DOWN, UP, autoEdit, cfg, liveBusy, liveCheck, refreshTrade, setAutoEdit, setLiveBusy, setLiveCheck, setTargetEdit, setTgAdmin, setTrade, setTradeIdx, setTradeMsg, setTradeTargets, setTradesLimit, setTradesOpen, targetEdit, tgAdmin, trade, tradeBaseRef, tradeBusy, tradeCall, tradeIdx, tradeMsg, tradeTargets, tradesLimit, tradesOpen } = s;
+  const { DOWN, UP, autoEdit, cfg, liveBusy, liveCheck, pf, pfBusy, refreshTrade, setAutoEdit, setLiveBusy, setLiveCheck, setPf, setPfBusy, setTargetEdit, setTgAdmin, setTrade, setTradeIdx, setTradeMsg, setTradeTargets, setTradesLimit, setTradesOpen, targetEdit, tgAdmin, trade, tradeBaseRef, tradeBusy, tradeCall, tradeIdx, tradeMsg, tradeTargets, tradesLimit, tradesOpen } = s;
   return (
 <div className="mt-3">
             {/* 網路別橫幅：正式網必須一眼看出來 */}
@@ -272,6 +272,77 @@ export default function TradePage({ s }) {
                 )}
               </div>
             )}
+
+            {/* 交易所自檢：每一項對應 BINANCE_LESSONS.md 的一條 */}
+            <div className="mt-3 rounded p-3" style={{ background: C.panel2, border: `1px solid ${C.line}` }}>
+              <div className="flex items-center gap-2 flex-wrap">
+                <span style={{ fontFamily: FONT.display, fontSize: 13 }}>交易所自檢</span>
+                {pf && (
+                  <span style={{ fontSize: 11, color: C.muted }}>
+                    {pf.results.filter((x) => x.status === "ok").length}/{pf.results.length} 通過　{pf.version}
+                    {pf.cached ? "（60 秒內的結果）" : ""}
+                  </span>
+                )}
+                <button
+                  onClick={async () => {
+                    setPfBusy(true);
+                    try {
+                      const r = await fetch(tradeBaseRef.current + "/api/trade/preflight", { cache: "no-store" });
+                      setPf(await r.json());
+                    } catch (e) { setTradeMsg(["err", "自檢失敗：" + e.message]); }
+                    finally { setPfBusy(false); }
+                  }}
+                  disabled={pfBusy} className="ml-auto px-2.5 py-1 rounded"
+                  style={{ background: C.panel, border: `1px solid ${C.line}`, color: C.muted, fontSize: 11.5 }}>
+                  {pfBusy ? "檢查中…" : pf ? "重新檢查" : "執行"}
+                </button>
+              </div>
+              {!pf && (
+                <div className="mt-1.5" style={{ fontSize: 11, color: C.muted, lineHeight: 1.6 }}>
+                  確認幣安 API 沒有改動：精度、條件單端點、持倉模式、槓桿上限、限流、未記帳的送單、孤兒條件單。
+                  全部唯讀，不會下單。開機時也會自動跑一次，有異常會推 Telegram。
+                </div>
+              )}
+              {pf && pf.results.map((x, i) => (
+                <div key={i} className="flex gap-2" style={{ fontSize: 11.5, lineHeight: 1.8 }}>
+                  <span style={{ color: x.status === "ok" ? C.teal : x.status === "warn" ? C.gold : C.red, minWidth: 12 }}>
+                    {x.status === "ok" ? "✓" : x.status === "warn" ? "⚠" : "✕"}
+                  </span>
+                  <span style={{ color: C.bone, minWidth: 96 }}>{x.item}</span>
+                  <span style={{ color: C.muted, wordBreak: "break-all" }}>
+                    {x.msg}{x.lesson ? `　〔第 ${x.lesson} 條〕` : ""}
+                  </span>
+                </div>
+              ))}
+              {pf && pf.results.flatMap((x) => x.orphans || []).map((o) => (
+                <div key={o.algoId} className="mt-1.5 px-2.5 py-1.5 rounded flex items-center gap-2 flex-wrap"
+                  style={{ background: C.panel, border: `1px solid ${C.gold}`, fontFamily: FONT.data, fontSize: 11.5 }}>
+                  <span>{o.symbol}</span>
+                  <span style={{ color: C.muted }}>{o.type}</span>
+                  {o.price && <span style={{ color: C.muted }}>@ {o.price}</span>}
+                  <span style={{ color: o.ours ? C.teal : C.muted, fontSize: 10.5 }}>{o.ours ? "本專案" : "來源不明"}</span>
+                  <button
+                    onClick={async () => {
+                      const j = await tradeCall("cancel_orphan", { symbol: o.symbol, algoId: o.algoId });
+                      if (j && j.ok) {
+                        setTradeMsg(["ok", `已撤掉 ${o.symbol} #${o.algoId}`]);
+                        const r = await fetch(tradeBaseRef.current + "/api/trade/preflight", { cache: "no-store" });
+                        setPf(await r.json());
+                      }
+                    }}
+                    className="ml-auto px-2 py-0.5 rounded"
+                    style={{ background: "transparent", border: `1px solid ${C.gold}`, color: C.gold, fontSize: 11 }}>
+                    撤掉
+                  </button>
+                </div>
+              ))}
+              {pf && pf.results.some((x) => (x.orphans || []).some((o) => !o.ours)) && (
+                <div className="mt-1" style={{ fontSize: 10.5, color: C.muted, lineHeight: 1.6 }}>
+                  「來源不明」是帳上沒有紀錄的單：正式網子帳戶只有本專案在用，可以放心撤；
+                  模擬網共用帳號時可能是其他專案的，撤之前先確認。有部位的幣一律拒撤。
+                </div>
+              )}
+            </div>
 
             {/* 自動下單 */}
             {trade.auto && (

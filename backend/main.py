@@ -349,8 +349,10 @@ except Exception:                       # 缺少 engine.py 時只停用監控，
 
 try:
     import trader                       # 模擬單模組；缺少時只停用交易頁
+    import preflight                    # 交易所相容性自檢（BINANCE_LESSONS 對應的檢查）
 except Exception:
     trader = None
+    preflight = None
 
 MON = {"on": False, "watch": [], "cfg": None, "states": {}, "scope": "watch", "topN": 100,
        "history": [], "lastRun": None, "lastCount": 0, "lastError": None,
@@ -780,13 +782,23 @@ def position_worker(every_s=20):
     idle = 0
     while True:
         try:
-            if trader and trader.STATE["positions"]:
+            if trader and (trader.STATE["positions"] or trader.STATE.get("pending")):
                 idle = 0
                 before = len(trader.STATE["trades"])
                 trader.sync_positions()
                 for t in trader.STATE["trades"][before:]:
                     ti, tx = notify_trade_close(t)
+                    lo = t.get("leftover") or {}
+                    if lo.get("failed"):
+                        tx += "\n\n⚠ 剩餘條件單撤不掉：" + "；".join(lo["failed"]) + "\n請到幣安手動撤，否則下次同幣進場會衝突"
                     push_all(ti, tx)
+                for a in trader.ADOPTED:
+                    push_all("⚠ 認領未記帳的部位",
+                             f"{a['symbol']} 送單後程式沒記到帳，對帳時在交易所找到並接手。\n"
+                             f"數量 {a['qty']:g}　進場 {a['entry']:g}　停損 {a['stop']:g}"
+                             f"（{'已補掛' if a['stopOk'] else '補掛失敗，守衛會再試'}）\n"
+                             f"只補掛了停損，停利與移動停利沒有掛，請留意。")
+                trader.ADOPTED.clear()
 
                 # 主動管理：到 1R 把停損移到成本
                 for ev in trader.manage_positions():
@@ -879,9 +891,26 @@ def trade_handle(path, payload):
             out["markPrice"] = px
         return 200, out
 
+    if path == "/api/trade/preflight":
+        if not preflight:
+            return 503, {"error": "自檢模組未載入"}
+        # 60 秒內重複呼叫回傳上次結果：自檢會打一次權重 40 的查詢，
+        # 這個 GET 不需要管理金鑰，不能讓它被反覆觸發而把 IP 打到限流（第 6 條）
+        last = preflight.LAST.get("at") or 0
+        cached = time.time() * 1000 - last < 60000 and preflight.LAST["results"]
+        res = preflight.LAST["results"] if cached else preflight.run()
+        return 200, {"at": preflight.LAST["at"], "version": preflight.VERSION,
+                     "results": res, "cached": bool(cached)}
+
     need = os.environ.get("ADMIN_KEY", "").strip()
     if need and str(payload.get("adminKey", "")) != need:
         return 403, {"error": "admin_key_required"}
+
+    if path == "/api/trade/cancel_orphan":
+        r = trader.cancel_orphan(str(payload.get("symbol", "")), str(payload.get("algoId", "")))
+        if preflight and r.get("ok"):
+            preflight.LAST["at"] = 0          # 下次自檢重新查，不用快取
+        return (200 if r.get("ok") else 400), r
 
     if path == "/api/trade/config":
         limits = {"riskPct": (0.1, 5.0), "maxPositions": (1, 20), "leverage": (1, 20),
@@ -1943,6 +1972,12 @@ def main():
         只有壞消息會通知的話，沒消息時分不出是『一切正常』還是『服務掛了』。
         同樣內容 6 小時內不重複，避免連續部署洗版。"""
         time.sleep(12)          # 等背景的連線與帳戶資訊載入
+        pf_lines = []
+        if preflight and trader and trader.CFG["key"]:
+            try:
+                pf_lines = preflight.summary_lines(preflight.run())
+            except Exception as e:
+                pf_lines = [f"自檢　執行失敗：{e}"]
         live = bool(trader and trader.CFG["live"])
         lines = []
         head = "正式網運作中" if live else "模擬網運作中"
@@ -1975,6 +2010,9 @@ def main():
 
         mon = "運作中" if MON["on"] else "未啟用"
         lines.append(f"監控　{mon}　資料來源 {CG_UPSTREAM or 'CoinGecko 直連'}")
+        lines += pf_lines
+        if any(l.startswith("自檢") and "異常" in l for l in pf_lines) and not head.startswith("⚠"):
+            head = "⚠ " + head + "（自檢有異常）"
 
         # 自動下單開著、但這台沒有訊號來源：等於永遠不會下單
         if trader and trader.AUTO["on"] and not MON["on"]:
