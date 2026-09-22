@@ -403,7 +403,11 @@ def tg_handle(path, payload):
     if path == "/api/tg/unpair":
         if not tg_admin_ok(payload):
             return 403, {"error": "admin_key_required"}
-        cid = str(payload.get("id", ""))
+        cid = str(payload.get("id", "")).strip()
+        if not cid:
+            return 400, {"error": "沒有指定要解除的聊天室，什麼都沒改"}        # r47、r48：空的不回成功
+        if cid not in [str(c.get("id")) for c in _tg["chats"]]:
+            return 404, {"error": f"沒有這個聊天室：{cid}"}
         with _tg_lock:
             _tg["chats"] = [c for c in _tg["chats"] if c["id"] != cid]
             tg_save()
@@ -1114,16 +1118,52 @@ MON_SPEC = {
 }
 
 
+def _no_fields(payload, meta=("adminKey", "admin")):
+    """第 8 條 r45：一個要改的欄位都沒有 → 回錯誤（以前回成功，其實什麼都沒改）。"""
+    if not [k for k in (payload or {}) if k not in meta]:
+        return 400, {"ok": False, "error": "沒有要改的欄位，什麼都沒改"}
+    return None
+
+
 def _invalid(bad):
     return 400, {"ok": False, "invalid": bad,
                  "error": "設定沒有套用（有不合法的值，整批不套用）：" + "、".join(bad)}
+
+
+ENGINE_WAIT = 10.0          # 網頁交易操作等引擎鎖的上限（秒），拿不到就回「背景正在處理」（第 8 條 r48）
+TRADE_UNLOCKED = ("/api/trade/check", "/api/trade/preflight")   # 只查交易所、不動帳本，不必等背景那輪
+
+
+def _trade_locked(path, payload):
+    """網頁交易操作拿引擎鎖再做（第 8 條 r48）：背景的對帳／出場管理／守衛正在查交易所時，
+    手動平倉、改設定不能插進去。等 ENGINE_WAIT 秒拿不到就回 503，不讓請求一直掛著。
+    狀態頁只等 2 秒，拿不到就不拿鎖讀一份（讀的途中帳本被改動就重讀），並標記 engineBusy。"""
+    if trader is None or path in TRADE_UNLOCKED:
+        return trade_handle(path, payload)
+    status = path == "/api/trade/status"
+    try:
+        with trader.engine_wait(2.0 if status else ENGINE_WAIT), trader.engine_section():
+            return trade_handle(path, payload)
+    except trader.EngineBusy:
+        if not status:
+            return 503, {"ok": False, "busy": True,
+                         "error": "背景正在處理部位（對帳、移損或守衛），這次操作沒有執行，請稍後再試"}
+    for i in range(3):
+        try:
+            code, body = trade_handle(path, payload)
+            if isinstance(body, dict):
+                body["engineBusy"] = True
+            return code, body
+        except RuntimeError:                  # 讀的途中帳本被背景改動（dictionary changed size…）
+            time.sleep(0.2)
+    return 503, {"ok": False, "busy": True, "error": "背景正在處理部位，狀態稍後更新"}
 
 
 def trade_handle_safe(path, payload):
     """網頁交易操作（手動開倉、平倉、撤孤兒單…）的外層：第 8 條 r23。
     請求處理也是另一條執行緒，例外穿出去時網頁只看到連線中斷、沒有推播。"""
     try:
-        return trade_handle(path, payload)
+        return _trade_locked(path, payload)
     except Exception as e:
         sys.stderr.write(f"  ! 網頁交易操作 {path} 出錯：{type(e).__name__}: {e}\n")
         push_all("⚠ 網頁交易操作出錯", f"{path}\n{type(e).__name__}: {str(e)[:150]}")
@@ -1187,6 +1227,8 @@ def trade_handle(path, payload):
         return (200 if r.get("ok") else 400), r
 
     if path == "/api/trade/config":
+        if _no_fields(payload):
+            return _no_fields(payload)
         kw, bad = validate_fields(payload, TRADE_CFG_SPEC)
         if bad:
             return _invalid(bad)
@@ -1215,6 +1257,8 @@ def trade_handle(path, payload):
 
     if path == "/api/trade/auto":
         # r40：以前 on 先套用、後面的 int() 丟例外——自動下單已經打開，其他欄位沒套用，網頁看到 500
+        if _no_fields(payload):
+            return _no_fields(payload)
         kw, bad = validate_fields(payload, AUTO_SPEC)
         if "dailyLossR" in kw and kw["dailyLossR"] == 0:
             bad.append("dailyLossR=0（當日停損上限不能是 0）")
@@ -1273,6 +1317,8 @@ def mon_handle(path, payload):
         if not tg_admin_ok(payload):
             return 403, {"error": "admin_key_required"}
         # r40、r41：先整批驗證，全部合法才一次套用（以前一邊套用一邊轉型，中途出錯留下半套）
+        if _no_fields(payload):
+            return _no_fields(payload)
         spec = {k: v for k, v in MON_SPEC.items() if v[0] not in ("list", "dict")}
         kw, bad = validate_fields({k: v for k, v in payload.items() if k not in ("watch", "cfg")}, spec)
         if "watch" in payload:
@@ -1281,10 +1327,15 @@ def mon_handle(path, payload):
             else:
                 bad.append(f"watch（要是清單，收到 {type(payload['watch']).__name__}）")
         if "cfg" in payload:
-            if isinstance(payload["cfg"], dict):
-                kw["cfg"] = payload["cfg"]
+            c = payload["cfg"]
+            # r48：空的 cfg 會讓背景監控靜靜停掉（mon_run_once 看到空設定就不跑）、缺 bull／bear 會讓評分整輪丟例外——
+            # 任何 bug 讓設定沒帶到都等於「清空全部」。要清掉監控用 on=0，不是送空的 cfg
+            if not isinstance(c, dict):
+                bad.append(f"cfg（要是物件，收到 {type(c).__name__}）")
+            elif not all(isinstance(c.get(s), dict) and c.get(s) for s in ("bull", "bear")):
+                bad.append("cfg（要有非空的 bull 與 bear 兩組條件；要停用監控請關閉開關）")
             else:
-                bad.append(f"cfg（要是物件，收到 {type(payload['cfg']).__name__}）")
+                kw["cfg"] = c
         if bad:
             return _invalid(bad)
         with _mon_lock:
@@ -1807,6 +1858,11 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             payload = json.loads(self.rfile.read(n) or b"{}")
         except Exception:
             return self.send_json(400, b'{"error":"bad_json"}')
+        if not isinstance(payload, dict):
+            # 第 8 條 r45：解析得了但不是物件（[]、"x"、null）→ 以前各處理函式 .get() 丟例外、回 500，
+            # 或被當成空的。格式不對就回錯誤、什麼都不改
+            return self.send_json(400, json.dumps({"error": f"請求內容要是 JSON 物件，收到 {type(payload).__name__}"},
+                                                  ensure_ascii=False).encode())
 
         if self.path.startswith("/api/tg/"):
             code, body = tg_handle(self.path, payload)
@@ -2061,6 +2117,26 @@ def lan_ip():
         return None
 
 
+def warn_live_ledger():
+    """切到模擬網時檢查正式網帳本：還有持倉要講清楚；讀不到也要講（第 8 條 r44）。"""
+    try:
+        lp = os.path.join(CACHE_DIR, "trader.live.json")
+        if os.path.exists(lp):
+            with open(lp) as f:
+                live_pos = (json.load(f).get("state") or {}).get("positions") or {}
+            if live_pos:
+                m = (f"正式網帳本裡還有 {len(live_pos)} 筆持倉（{'、'.join(live_pos)}）。"
+                     f"它們仍在幣安、停損單仍有效，但模擬網模式不會追蹤或移損；切回正式網會自動接續。")
+                sys.stderr.write(f"  ⚠ {m}\n")
+                push_all("⚠ 正式網仍有持倉", m)
+    except Exception as e:
+        # 第 8 條 r44：讀不到不等於「沒有持倉」——以前 except: pass，正式網帳本壞掉時切到模擬網沒有任何提醒
+        m = (f"切到模擬網時讀不到正式網帳本（{type(e).__name__}: {str(e)[:100]}），無法確認正式網還有沒有持倉；"
+             f"請到幣安正式網確認，那些部位的停損單仍在交易所上，但這裡不會追蹤")
+        sys.stderr.write(f"  ⚠ {m}\n")
+        push_all("⚠ 讀不到正式網帳本", m)
+
+
 def selftest():
     print("  檢查對外連線 …", end=" ", flush=True)
     status, body = fetch_upstream("/ping")
@@ -2192,18 +2268,7 @@ def main():
         # 切回模擬網時，正式網帳本裡若還有持倉要講清楚：
         # 那些部位仍在幣安、停損單仍有效，只是這裡不再追蹤，切回正式網會接續。
         if not want_live:
-            try:
-                lp = os.path.join(CACHE_DIR, "trader.live.json")
-                if os.path.exists(lp):
-                    with open(lp) as f:
-                        live_pos = (json.load(f).get("state") or {}).get("positions") or {}
-                    if live_pos:
-                        m = (f"正式網帳本裡還有 {len(live_pos)} 筆持倉（{'、'.join(live_pos)}）。"
-                             f"它們仍在幣安、停損單仍有效，但模擬網模式不會追蹤或移損；切回正式網會自動接續。")
-                        sys.stderr.write(f"  ⚠ {m}\n")
-                        push_all("⚠ 正式網仍有持倉", m)
-            except Exception:
-                pass
+            warn_live_ledger()
 
         last_net = trader.STATE.get("lastNet")
         if last_net == "live" and not want_live:

@@ -128,9 +128,11 @@ for side in ("LONG", "SHORT"):
     T._request = realistic(lambda m, p, params=None, signed=False, timeout=15: (200, {"algoId": 10}),
                            positions={"YUSDT": pos})         # 移損前會先確認部位（第 2 條 r20）
     be = pos["exits"]["breakeven"]
-    nd = T.move_to_breakeven(dict(pos), be - sgn * 0.02)
+    T.STATE["positions"]["YUSDT"] = mp = dict(pos)            # 移損只動帳上那一筆（r51：拿鎖後確認部位還在帳上）
+    nd = T.move_to_breakeven(mp, be - sgn * 0.02)
     check(nd and nd.get("skipped") == "not_due", f"{side} 未到 breakeven 應回報 not_due，實際 {nd}")
-    ev = T.move_to_breakeven(dict(pos), be + sgn * 0.02)
+    T.STATE["positions"]["YUSDT"] = mp = dict(pos)
+    ev = T.move_to_breakeven(mp, be + sgn * 0.02)
     check(ev and ev.get("ok"), f"{side} 到 breakeven 沒有移損")
     check(ev and (ev["new"] - entry) * sgn >= 0 and abs(ev["new"] - entry) < entry * 0.005,
           f"{side} 移損後停損 {ev and ev.get('new')} 不在成本附近")

@@ -131,6 +131,7 @@ def ex8(m, path, params=None, signed=False, timeout=15):
 
 
 T._request = realistic(ex8, positions={"XUSDT": p})
+T.STATE["positions"]["XUSDT"] = p                              # 移損只動帳上那一筆（r51）
 e1 = T.move_to_breakeven(p, be + 0.5)
 check(e1 and e1.get("retry") and e1.get("attempt") == 1 and e1.get("alert"),
       f"8 第一次失敗應回報 attempt=1 並告警，實際 {e1}")
@@ -166,6 +167,7 @@ def _ex3(m, path, params=None, signed=False, timeout=15):
 
 
 T._request = _ex3
+T.STATE["positions"]["XUSDT"] = p
 e3 = T.move_to_breakeven(p, p["exits"]["breakeven"] + 0.5)
 check(e3 and e3.get("exited") and closed, f"8 價格已穿過想要的停損（-2021）應直接出場，實際 {e3}")
 
@@ -175,6 +177,7 @@ placed = []
 T._request = realistic(lambda m, path, params=None, signed=False, timeout=15: (
     (400, {"code": -1000, "msg": "internal error"}) if m == "DELETE"
     else (placed.append(1) or (200, {"algoId": 1}))), positions={"XUSDT": p})
+T.STATE["positions"]["XUSDT"] = p
 e4 = T.move_to_breakeven(p, p["exits"]["breakeven"] + 0.5)
 check(e4 and e4.get("retry") and not placed, "8 撤不掉舊停損時不該掛新的")
 check(any(o["id"] == 111 for o in p["orders"]), "8 撤舊失敗時舊 id 要留在帳上，平倉時一起撤")

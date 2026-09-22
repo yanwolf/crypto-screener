@@ -2352,6 +2352,11 @@ def move_to_breakeven(pos, mark, force=False, reason=None):
     價格若已穿過想要的停損（-2021），直接市價出場，結果就是約略打平。
     回傳事件：ok / retry（first 表示第一次失敗）/ exited / naked。
     """
+    # 第 8 條 r51：部位是呼叫端在拿鎖**之前**讀出來的（main 的反向訊號收緊：讀出部位後還查交易所、查衍生數據才呼叫）。
+    # 拿到鎖之後先確認它還是帳上那一筆——這段期間被手動平掉的話，照舊移損會替不存在的部位重掛停損（孤兒單，第 13 條）
+    if STATE["positions"].get(pos.get("symbol")) is not pos:
+        return {"symbol": pos.get("symbol"), "ok": False, "skipped": "gone",
+                "error": "部位已不在帳上（剛被平倉或換成另一筆），不移損"}
     if pos.get("beMoved") or pos.get("pendingClose"):
         # 待平倉期間只讓「每輪重試」那條路動它（第 8 條 r14）
         return {"symbol": pos.get("symbol"), "ok": False,
