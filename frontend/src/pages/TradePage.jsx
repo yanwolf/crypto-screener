@@ -37,7 +37,7 @@ export default function TradePage({ s }) {
                 style={{ background: C.panel, border: `1px solid ${C.line}`, color: C.muted, fontSize: 11.5 }}>
                 {tradeBusy ? "…" : "重新整理"}
               </button>
-              <button onClick={async () => { const j = await tradeCall("sync", {}); if (j) { setTradeMsg(["ok", `對帳完成${j.closed?.length ? "，平倉 " + j.closed.join("、") : "，無異動"}`]); refreshTrade(); } }}
+              <button onClick={async () => { const j = await tradeCall("sync", {}); if (j && j.error) { setTradeMsg(["err", j.error]); } else if (j) { setTradeMsg(["ok", `對帳完成${j.closed?.length ? "，平倉 " + j.closed.join("、") : "，無異動"}`]); refreshTrade(); } }}
                 disabled={tradeBusy} className="px-2.5 py-1 rounded"
                 style={{ background: C.panel, border: `1px solid ${C.line}`, color: C.muted, fontSize: 11.5 }}>
                 與交易所對帳
@@ -748,7 +748,7 @@ export default function TradePage({ s }) {
                   <span style={{ fontFamily: FONT.data, fontSize: 11.5, color: C.muted }}>
                     {p.qty} @ {fmtPrice(p.entry)}
                   </span>
-                  <button onClick={async () => { const j = await tradeCall("close", { symbol: p.symbol }); if (j?.ok) { setTradeMsg(["ok", `${p.symbol} 已平倉`]); refreshTrade(); } }}
+                  <button onClick={async () => { const j = await tradeCall("close", { symbol: p.symbol }); if (j?.ok) { setTradeMsg(["ok", `${p.symbol} 已平倉`]); refreshTrade(); } else if (j?.error) { setTradeMsg(["err", `${p.symbol} ${j.error}`]); refreshTrade(); } }}
                     disabled={tradeBusy} className="ml-auto px-2.5 py-1 rounded"
                     style={{ background: C.panel, border: `1px solid ${C.red}`, color: C.red, fontSize: 11.5 }}>
                     平倉

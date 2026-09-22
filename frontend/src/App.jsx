@@ -649,6 +649,11 @@ function CryptoScreener() {
         setTradeMsg(["err", adminRef.current
           ? "管理金鑰不正確，與伺服器的 ADMIN_KEY 環境變數不符。"
           : "這個動作需要管理金鑰。到「模擬單」分頁最上方填入伺服器設定的 ADMIN_KEY。"]);
+      } else if (j && j.invalid) {
+        // 第 8 條 r41：設定整批不套用時要讓人看到是哪幾個欄位，不能畫面沒反應
+        setTradeMsg(["err", j.error]);
+      } else if (j && j.warning) {
+        setTradeMsg(["err", j.warning]);
       }
       return j;
     } catch (e) {

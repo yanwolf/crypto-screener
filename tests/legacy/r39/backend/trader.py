@@ -675,6 +675,9 @@ def open_position(symbol_base, side, entry_hint, stop, info=None, note="", stop_
     停損一定在進場後立刻掛出。如果掛停損失敗，會立刻market平掉剛進的倉，
     因為沒有停損的部位違反這套系統的前提。
     """
+    if STATE.get("loadError"):
+        # 手動開倉也不經過 auto_can_trade，這裡再擋一次（第 8 條 r38：讀不到持倉紀錄時不開新倉）
+        return {"ok": False, "error": "持倉紀錄還沒載入（狀態檔讀不到），暫停開新倉"}
     ok, sym, msg, finfo = check_tradable(symbol_base)
     if not ok:
         return {"ok": False, "error": msg}
@@ -824,6 +827,10 @@ def open_position(symbol_base, side, entry_hint, stop, info=None, note="", stop_
         }
         STATE["positions"][sym] = pos
         STATE["pending"].pop(sym, None)
+        try:
+            _mark_boundary(sym, pos, (entry_res or {}).get("orderId"))   # 起始界線在開倉當下記（r35）
+        except Exception as e:
+            _pos_step_error("記成交界線", sym, e)
         save_state()
 
         # 停損：統一走 place_stop（第 2 條 r20）。部位剛由成交確認過，直接帶自己的數量
@@ -988,6 +995,8 @@ def auto_can_trade(symbol):
         return False, AUTO["blocked"]
     if AUTO["opened"] >= AUTO["maxPerDay"]:
         return False, f"今日已開 {AUTO['opened']} 筆，達上限"
+    if STATE.get("loadError"):
+        return False, "持倉紀錄還沒載入（狀態檔讀不到），暫停開新倉"
     # r13：pending 期間同幣不能再下單，持倉數也要算 pending
     if symbol in (STATE.get("pending") or {}):
         return False, "這檔剛送出進場單、還在等交易所確認，不重複下單"
@@ -1041,7 +1050,9 @@ def _live_qty(symbol, side):
     return _live_row(symbol, side)[0]
 
 
-_last_close_fill = {}          # symbol → 我們自己平倉單的實際成交均價（_market_close 成功時寫入）
+_last_close_fill = {}
+FILLS_PAGE = 1000              # userTrades 一頁上限
+FILLS_MAX_PAGES = 10          # symbol → 我們自己平倉單的實際成交均價（_market_close 成功時寫入）
 
 
 def _close_fills(sym, pos, qty_needed=None):
@@ -1059,12 +1070,27 @@ def _close_fills(sym, pos, qty_needed=None):
         q_params = {"symbol": sym, "fromId": from_id, "limit": 100}
     else:
         since = pos.get("fillsSince") if isinstance(pos.get("fillsSince"), (int, float)) else pos.get("opened")
-        if not isinstance(since, (int, float)):
+        if not isinstance(since, (int, float)) or since <= 0:
+            # 0 或缺值不能當界線：從頭查起，這個幣歷史上所有的平倉成交都會被算進來——那是算錯，不是未知（r34）
             return None, None, None
         q_params = {"symbol": sym, "startTime": int(since), "limit": 100}
-    st, d = _request("GET", "/fapi/v1/userTrades", q_params, signed=True)
-    if st != 200 or not isinstance(d, list):
-        return None, None, None
+    # 分頁拿完（r37）：只拿一頁時，界線之後的平倉成交掉了幾筆，程式照樣用剩下的算出「確定的」錯數字。
+    # 第一頁之後一律改用 fromId（上一頁最後一筆 id＋1）往後查；超過頁數上限記未知。
+    q_params = dict(q_params, limit=FILLS_PAGE)
+    d = []
+    for _page in range(FILLS_MAX_PAGES):
+        st, page = _request("GET", "/fapi/v1/userTrades", q_params, signed=True)
+        if st != 200 or not isinstance(page, list):
+            return None, None, None
+        d += page
+        if len(page) < FILLS_PAGE:
+            break
+        ids_ = [x.get("id") for x in page if isinstance(x.get("id"), int)]
+        if not ids_:
+            return None, None, None
+        q_params = {"symbol": sym, "fromId": max(ids_) + 1, "limit": FILLS_PAGE}
+    else:
+        return None, None, None                      # 頁數上限內拿不完：記未知，不拿部分當全部
     close_side = "SELL" if pos.get("side") == "LONG" else "BUY"
     rows = [x for x in d if x.get("side") == close_side
             and (x.get("positionSide") or "BOTH") in ("BOTH", pos.get("side"))]
@@ -1077,6 +1103,31 @@ def _close_fills(sym, pos, qty_needed=None):
     ids = [x.get("id") for x in rows if isinstance(x.get("id"), int)]
     last_id = max(ids) if ids else None
     return q, px, last_id
+
+
+def _mark_boundary(sym, pos, order_id=None):
+    """記下成交明細的起始界線（第 8 條 r34、r35）：開倉成交後、認領當下就記，跟著部位存進狀態檔。
+
+    - 開倉：用開倉那張單的單號查它的成交，最後一筆 id＋1。
+    - 認領（沒有單號）：查最近的成交，最後一筆 id＋1；最近沒有成交就記下認領當下的時間。
+    以前是平倉時才用「開倉時間」查：交易所時鐘比本機慢時平倉成交被篩掉；時間戳是 0 時從頭查起，
+    這個幣歷史上所有的平倉成交都被算成這筆的出場。查不到就不記——之後會記未知，不會算錯。
+    回傳記下的方式：id／time／none。"""
+    if order_id is not None:
+        st, d = _request("GET", "/fapi/v1/userTrades", {"symbol": sym, "orderId": order_id}, signed=True)
+    else:
+        st, d = _request("GET", "/fapi/v1/userTrades",
+                         {"symbol": sym, "startTime": int(time.time() * 1000) - 600000, "limit": 1000}, signed=True)
+    if st != 200 or not isinstance(d, list):
+        return "none"
+    ids = [x.get("id") for x in d if isinstance(x.get("id"), int)]
+    if ids:
+        pos["fillsFromId"] = max(ids) + 1
+        return "id"
+    if order_id is None:
+        pos["fillsSince"] = int(time.time() * 1000)
+        return "time"
+    return "none"
 
 
 def _exit_price(sym, pos):
@@ -1398,6 +1449,10 @@ def adopt_pending(live):
             pos["warnings"].append(f"補掛停損失敗：{(r or {}).get('msg') or r}（守衛會再試）")
         STATE["positions"][sym] = pos
         STATE["pending"].pop(sym, None)
+        try:
+            _mark_boundary(sym, pos)                                    # 認領當下記界線（r34）
+        except Exception as e:
+            _pos_step_error("記成交界線", sym, e)
         save_state()
         ADOPTED.append({"symbol": sym, "qty": qty, "entry": entry, "stop": stop_px, "stopOk": st == 200})
 
@@ -2292,8 +2347,13 @@ def set_excluded(trade_id, excluded):
 def save_state():
     if not STATE_FILE:
         return
+    if STATE.get("loadError"):
+        # 讀取失敗期間不覆寫原檔：否則下一次重試會「成功」讀到一份空白的狀態（r37）
+        return
+    tmp = f"{STATE_FILE}.tmp"
     try:
-        with open(STATE_FILE, "w") as f:
+        # 先寫暫存檔再換名：直接覆蓋寫，寫到一半當機就會留下壞檔（r37）
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump({"state": {k: STATE.get(k) for k in ("enabled", "pending", "positions", "trades",
                                                            "lastNet", "leftovers")},
                        "missed": MISSED, "conflicts": CONFLICTS,
@@ -2301,8 +2361,14 @@ def save_state():
                        # 金鑰與網路別刻意不存：金鑰只該在環境變數，
                        # 網路別只該由啟動參數決定，避免存檔把正式網狀態帶回來
                        "cfg": {k: CFG[k] for k in PERSIST_CFG}}, f)
-    except Exception:
-        pass
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, STATE_FILE)
+    except Exception as e:
+        # 以前是 except: pass——存檔失敗完全沒有訊息。狀態檔是成交界線、待平倉、pending 能跨重啟的唯一依據
+        _pos_step_error("存檔", "狀態檔", e)
+    else:
+        _pos_step_ok("存檔", "狀態檔")
 
 
 def state_path(cache_dir, live):
@@ -2320,20 +2386,29 @@ def state_path(cache_dir, live):
     return p
 
 
-def load_state(path):
+def load_state(path, _retry=False):
+    """讀狀態檔。回傳 (ok, 錯誤)。第 8 條 r37、r38：「讀取失敗」與「沒有資料」不能是同一個結果。
+
+    - 檔案不存在：全新開始，(True, None)。
+    - 其他讀取或解析失敗：壞檔另存一份、記錯誤、推播；這段期間**暫停開新倉**、**不覆寫原檔**，
+      每輪重試讀取（retry_load_state），讀到了發恢復通知。以前是 except: pass——靜靜回到空白，
+      持倉、成交界線、待平倉、pending 全部消失，第一次存檔就把壞檔蓋掉、連證據都沒了。
+    - 先全部解析到暫存，全部成功才一次換上，不留半套狀態。
+    """
     global STATE_FILE
     STATE_FILE = path
     try:
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             d = json.load(f)
+    except FileNotFoundError:
+        STATE["loadError"] = None
+        return True, None
+    except Exception as e:
+        return _load_failed(path, e, _retry)
+    try:
         st = d.get("state", d)          # 相容舊格式
-        STATE["enabled"] = st.get("enabled", False)
-        STATE["positions"] = st.get("positions", {})
-        STATE["trades"] = st.get("trades", [])
-        STATE["lastNet"] = st.get("lastNet")
-        STATE["pending"] = st.get("pending") or {}
-        STATE["leftovers"] = st.get("leftovers") or []
-        for i, t in enumerate(STATE["trades"]):
+        trades = [dict(t) for t in (st.get("trades") or [])]
+        for i, t in enumerate(trades):
             if not t.get("id"):
                 t["id"] = f"{t.get('symbol', 'X')}-{t.get('closed') or i}"
             t.setdefault("excluded", False)
@@ -2345,16 +2420,56 @@ def load_state(path):
                 t["rMultiple"] = round(float(t["rMultiple"]), 2)
             if t.get("pnl") is not None:
                 t["pnl"] = round(float(t["pnl"]), 4)
-        for k, v in (d.get("auto") or {}).items():
-            if k in AUTO:
-                AUTO[k] = v
-        for k, v in (d.get("cfg") or {}).items():
-            if k in PERSIST_CFG and v is not None:
-                CFG[k] = v
-        MISSED[:] = d.get("missed") or []
-        CONFLICTS[:] = d.get("conflicts") or []
-    except Exception:
-        pass
+        new_state = {"enabled": st.get("enabled", False), "positions": st.get("positions") or {},
+                     "trades": trades, "lastNet": st.get("lastNet"),
+                     "pending": st.get("pending") or {}, "leftovers": st.get("leftovers") or []}
+        new_auto = {k: v for k, v in (d.get("auto") or {}).items() if k in AUTO}
+        new_cfg = {k: v for k, v in (d.get("cfg") or {}).items() if k in PERSIST_CFG and v is not None}
+        missed, conflicts = list(d.get("missed") or []), list(d.get("conflicts") or [])
+    except Exception as e:
+        return _load_failed(path, e, _retry)
+    was = STATE.get("loadError")
+    STATE.update(new_state)
+    AUTO.update(new_auto)
+    CFG.update(new_cfg)
+    MISSED[:] = missed
+    CONFLICTS[:] = conflicts
+    STATE["loadError"] = None
+    if was:
+        _notify("狀態檔已讀到，恢復開新倉", f"{path}\n（已補上：先前讀取失敗 {was.get('attempts', 1)} 次）")
+    return True, None
+
+
+def _load_failed(path, e, retry):
+    err = f"{type(e).__name__}: {str(e)[:150]}"
+    le = STATE.get("loadError") or {}
+    if not retry or not le:
+        backup = None
+        try:
+            import shutil
+            backup = f"{path}.bad-{int(time.time())}"
+            shutil.copyfile(path, backup)
+        except Exception:
+            backup = None
+        le = {"path": path, "error": err, "backup": backup, "since": int(time.time() * 1000), "attempts": 0}
+    le["attempts"] = le.get("attempts", 0) + 1
+    le["error"] = err
+    STATE["loadError"] = le
+    sys.stderr.write(f"  ! 狀態檔讀取失敗（第 {le['attempts']} 次）：{err}\n")
+    if alert_due(le["attempts"]):
+        _notify(f"⚠ 狀態檔讀不到，暫停開新倉（第 {le['attempts']} 次）",
+                f"{path}\n{err}\n壞檔已另存：{le.get('backup') or '另存失敗'}\n"
+                f"持倉紀錄還沒載入：不開新倉、不覆寫原檔，交易所上的部位請先到幣安確認。每輪重試讀取。")
+    return False, err
+
+
+def retry_load_state():
+    """讀取失敗期間每輪重試（例如人工把狀態檔修好或還原）。回傳原因。"""
+    le = STATE.get("loadError")
+    if not le:
+        return "loaded"
+    ok, _err = load_state(le["path"], _retry=True)
+    return "loaded" if ok else "still_failed"
 
 
 def configure(**kw):

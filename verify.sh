@@ -91,10 +91,18 @@ python3 -m tests.test_r35
 echo "── 19. r36→r38 逐段檢查項目 ──"
 python3 -m tests.test_r38
 
-echo "── 20. 測試本身與工具的檢查（用法第 5 點、第 14 條）──"
+echo "── 20. r39→r42 逐段檢查項目（含第 15 條：市價單回 NEW）──"
+python3 -m tests.test_r42
+
+echo "── 21. 測試本身與工具的檢查（用法第 5 點、第 14 條）──"
 python3 -m tests.check_indexing        # 先索引、沒先確認有東西（r35）
-python3 -m tests.run_on_legacy r33     # 現在的測試跑舊版程式：測試本身崩掉要是 0（r35、r36）
-python3 -m tests.run_on_legacy r36
+# 現在的測試跑 tests/legacy/ 下每一版舊程式：測試本身崩掉要是 0（r35、r36；r41 gold-scalper：自動跑每一版）
+nleg=0
+for d in tests/legacy/*/; do
+  v=$(basename "$d"); nleg=$((nleg+1))
+  python3 -m tests.run_on_legacy "$v"
+done
+if [ "$nleg" -lt 1 ]; then echo "  ✕ tests/legacy/ 下沒有舊版程式"; exit 1; fi
 python3 scripts/patch.py              # apply 比對不到時一個檔都不寫（r26）
 python3 -m tests.check_tests          # 每個案例從 fresh() 開始（第 14 種）、否定句要有前提（r19）
 python3 -m tests.mutation_check       # 逐項突變比對：仍通過的必須在豁免清單（r18、r20）

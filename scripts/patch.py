@@ -33,6 +33,13 @@ def apply(edits):
             # 整段刪除（替換內容是空的）不檢查——以前會被這條擋下（r32 gold-scalper）
             # r26、r28：從檔案擷取的原文結尾有換行、替換內容沒有，下一行就會黏上來
             raise SystemExit(f"✕ apply 中止（一個檔都沒寫）［{label}］{path}：原文與替換內容的結尾換行不一致")
+        i = buf[path].find(old)
+        prev = [l for l in buf[path][:i].split("\n")[:-1] if l.strip()][-1:] if i > 0 else []
+        defs = lambda s: sum(1 for l in s.split("\n") if l.lstrip().startswith(("def ", "class ", "async def ")))
+        if prev and prev[0].strip().startswith("@") and defs(new) > defs(old):
+            # r41 gold-scalper：新函式插在 @property 與 def 中間，裝飾器就套到新函式上——語法合法、編譯抓不到
+            raise SystemExit(f"✕ apply 中止（一個檔都沒寫）［{label}］{path}：錨點緊接在裝飾器 {prev[0].strip()} 後面，"
+                             f"插入的內容會被那個裝飾器套上；錨點要選在裝飾器之前")
         buf[path] = buf[path].replace(old, new)
     for path in order:
         if path.endswith(".py"):
@@ -84,6 +91,13 @@ def selftest():
         return "整段刪除被擋下或刪錯"
     if exact(b, 2, 1) != "第三行\n":
         return "exact() 讀錯行"
+    open(c, "w", encoding="utf-8").write("class K:\n    @property\n    def x(self):\n        return 1\n")
+    try:
+        apply([(c, "    def x(self):\n", "    def y(self):\n        return 2\n\n    def x(self):\n", 1, "插在裝飾器與 def 中間")])
+        return "錨點緊接在裝飾器後面、插入新函式卻沒有中止"
+    except SystemExit:
+        pass
+    apply([(c, "        return 1\n", "        return 3\n", 1, "改裝飾過的函式內容（不是插在中間）")])
     open(b, "w", encoding="utf-8").write("丁戊己")
     apply([(a, "乙", "X", 1, "一"), (a, "X丙", "XY", 1, "同檔第二處依序套用"), (b, "戊", "Z", 1, "二")])
     if open(a, encoding="utf-8").read() != "甲XY" or open(b, encoding="utf-8").read() != "丁Z己":
@@ -93,5 +107,5 @@ def selftest():
 
 if __name__ == "__main__":
     err = selftest()
-    print("✕ patch 自我驗證：" + err if err else "✓ patch 自我驗證：比對不到時一個檔都不寫、結尾換行不一致時中止（整段刪除除外）、改出語法錯時一個檔都不寫、同檔多處依序套用、exact() 讀對行")
+    print("✕ patch 自我驗證：" + err if err else "✓ patch 自我驗證：比對不到時一個檔都不寫、結尾換行不一致時中止（整段刪除除外）、改出語法錯時一個檔都不寫、錨點緊接裝飾器時中止、同檔多處依序套用、exact() 讀對行")
     sys.exit(1 if err else 0)

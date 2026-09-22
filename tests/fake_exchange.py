@@ -57,6 +57,7 @@ class FakeEx:
         self.same_ms = False             # 所有成交落在同一毫秒
         self.clock_lag_ms = 0            # 交易所時鐘比本機慢幾毫秒（成交時間戳往前）
         self.next_order = 70000          # 市價單單號（每張不同）
+        self.orders = {}                 # 市價單單號 → 最終狀態（GET /fapi/v1/order 查得到，第 15 條）
         self.cache_seen_on_resend = []
 
     def _mode_ok(self, params, reduce_kind):
@@ -198,7 +199,16 @@ class FakeEx:
                 self._fill(sym, side, pside, qty, fill, order_id=oid)
                 if self.entry_timeout:
                     return 0, {"error": "timed out"}
-            return 200, {"orderId": oid, "avgPrice": str(fill), "executedQty": str(qty), "status": "FILLED"}
+            res = {"orderId": oid, "avgPrice": str(fill), "executedQty": str(qty), "origQty": str(qty), "status": "FILLED"}
+            self.orders[oid] = dict(res, symbol=sym)
+            if params.get("newOrderRespType") != "RESULT":
+                # 第 15 條：真的幣安沒帶 RESULT 時回 ACK——status NEW、成交 0、均價 0（以前一律回 FILLED，退化值）
+                return 200, {"orderId": oid, "symbol": sym, "status": "NEW", "executedQty": "0",
+                             "origQty": str(qty), "avgPrice": "0.00", "cumQuote": "0"}
+            return 200, res
+        if path == "/fapi/v1/order" and method == "GET":
+            o = self.orders.get(int(params.get("orderId") or 0))
+            return (200, dict(o)) if o else (400, {"code": -2013, "msg": "Order does not exist."})
         if path == "/fapi/v1/order" and method == "POST" and params.get("type") != "MARKET":
             # 真實幣安 2025-12-09 起：條件單送到舊端點一律 -4120（清單第 1 條）
             return 400, {"code": -4120, "msg": "Order type not supported for this endpoint. "
@@ -270,6 +280,12 @@ class Ex(FakeEx):
         if path == "/fapi/v1/order" and method == "DELETE":
             self.calls.append((method, path, params))
             i = int(params.get("orderId") or 0)
+            o = self.orders.get(i)
+            if o is not None:                                     # 市價單（第 15 條）：還沒到最終狀態才撤得掉
+                if o.get("status") in ("NEW", "PARTIALLY_FILLED"):
+                    o["status"] = "CANCELED"
+                    return 200, dict(o)
+                return 400, {"code": -2011, "msg": "Unknown order sent."}
             if i in self.legacy:
                 self.legacy.pop(i)
                 return 200, {}
@@ -303,7 +319,10 @@ class Ex(FakeEx):
                 if st in (200, 0):
                     self.pos[(sym, pside)] = [q0 + qty, (q0 * e0 + qty * fill) / (q0 + qty)]
                 if st == 200:
-                    d = dict(d, avgPrice=str(fill), executedQty=str(qty), status="FILLED")
+                    if isinstance(d, dict) and d.get("orderId") in self.orders:
+                        self.orders[d["orderId"]]["avgPrice"] = str(fill)
+                    if d.get("status") == "FILLED":           # ACK（沒帶 RESULT）照樣回 NEW／成交 0
+                        d = dict(d, avgPrice=str(fill), executedQty=str(qty), status="FILLED")
                 return st, d
         return super()._handle(method, path, params, signed, timeout)
 
@@ -408,3 +427,92 @@ def titled(alerts, title):
         if t == title:
             out.append({"title": t, "text": x or ""})
     return out
+
+
+class Ex42(Ex17):
+    """第 15 條（r42）：市價單「交易所收下了、但回應不是成交」。
+
+    market_new = {"open"|"close": 方式}，方式：
+      now      回應 NEW／成交 0，但其實已經成交（查單回 FILLED）——ACK 的樣子
+      later    回應 NEW／成交 0，再經過 later_after 個請求才成交
+      never    回應 NEW／成交 0，最後沒成交（查單回 EXPIRED、成交 0）
+      partial  回應 NEW／成交 0，最後只成交一半（查單回 EXPIRED、成交一半）
+      stuck    回應 NEW／成交 0，一直是 NEW（撤單後變 CANCELED、成交 0）
+    跟有沒有帶 newOrderRespType=RESULT 無關：帶了 RESULT 也可能回 NEW。
+    """
+
+    def __init__(self, mode="oneway"):
+        super().__init__(mode)
+        self.market_new = {}
+        self.drop_avg = False                # r42：回應與查單都沒有 avgPrice（gold-scalper 2026-09-22 實單的樣子）
+        self.later_after = 3
+        self.deferred = []                   # [剩幾個請求, 單號, 參數]
+
+    @staticmethod
+    def is_close(params):
+        if params.get("reduceOnly"):
+            return True
+        ps = params.get("positionSide")
+        return bool(ps) and ((ps == "LONG") == (params.get("side") == "SELL"))
+
+    def _apply(self, params):
+        """真的成交一次（走原本的模擬路徑），但不在 calls 裡多記一張送單。"""
+        n = len(self.calls)
+        st, d = super()._handle("POST", "/fapi/v1/order", dict(params), True, 15)
+        del self.calls[n:]
+        return st, d
+
+    def _tick(self):
+        for item in list(self.deferred):
+            item[0] -= 1
+            if item[0] <= 0:
+                self.deferred.remove(item)
+                _n, oid, params = item
+                st, d = self._apply(params)
+                o = self.orders[oid]
+                if st == 200:
+                    o.update(status="FILLED", executedQty=str(params["quantity"]),
+                             avgPrice=(self.orders.get(d.get("orderId")) or d).get("avgPrice"))
+                else:
+                    o.update(status="EXPIRED")
+
+    def _handle(self, method, path, params, signed, timeout):
+        st, d = self._handle42(method, path, dict(params or {}), signed, timeout)
+        if self.drop_avg and path == "/fapi/v1/order" and isinstance(d, dict) and "avgPrice" in d:
+            d = {k: v for k, v in d.items() if k != "avgPrice"}
+        return st, d
+
+    def _handle42(self, method, path, params, signed, timeout):
+        self._tick()
+        if path == "/fapi/v1/order" and method == "POST" and params.get("type") == "MARKET":
+            how = self.market_new.get("close" if self.is_close(params) else "open")
+            if how:
+                return self._market_new(how, method, path, params)
+        return super()._handle(method, path, params, signed, timeout)
+
+    def _market_new(self, how, method, path, params):
+        sym, qty = params["symbol"], float(params["quantity"])
+        ack = {"symbol": sym, "status": "NEW", "executedQty": "0", "origQty": str(qty), "avgPrice": "0.00", "cumQuote": "0"}
+        self._inject(f"市價單回 NEW（{how}）", path, params)
+        if how == "now":
+            n = len(self.calls)
+            st, d = super()._handle(method, path, dict(params, newOrderRespType="RESULT"), True, 15)
+            self.calls[n:] = [(method, path, params)]
+            if st != 200:
+                return st, d
+            return 200, dict(ack, orderId=d["orderId"])
+        self.calls.append((method, path, params))
+        self.next_order += 1
+        oid = self.next_order
+        o = dict(ack, orderId=oid)
+        if how == "later":
+            self.deferred.append([self.later_after, oid, dict(params, newOrderRespType="RESULT")])
+        elif how == "never":
+            o["status"] = "EXPIRED"
+        elif how == "partial":
+            half = round(int(qty / 2 * 10) / 10, 1)
+            st, d = self._apply(dict(params, quantity=half, newOrderRespType="RESULT"))
+            o.update(status="EXPIRED", executedQty=str(half),
+                     avgPrice=(self.orders.get(d.get("orderId")) or {}).get("avgPrice", "0"))
+        self.orders[oid] = o
+        return 200, dict(ack, orderId=oid)

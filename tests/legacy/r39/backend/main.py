@@ -519,8 +519,9 @@ def push_all(title, text):
     for fn in (notify_telegram, notify_discord, notify_email):
         try:
             fn(title, text)
-        except Exception:
-            pass
+        except Exception as e:
+            # 以前 except: pass——推播失敗完全沒有訊息。寫錯誤區（不再推播，避免遞迴；也不經過任何鎖）
+            sys.stderr.write(f"  ! 推播失敗（{getattr(fn, '__name__', fn)}）：{type(e).__name__}: {str(e)[:120]}\n")
 
 
 def mon_run_once():
@@ -820,6 +821,8 @@ def position_round(every_s=20):
     if not trader:
         return
     trader.CFG["positionPoll"] = every_s
+    if trader.STATE.get("loadError"):
+        _step("重試讀取狀態檔", trader.retry_load_state)      # 第 8 條 r38：讀不到時每輪重試
     try:
         if trader.STATE["positions"] or trader.STATE.get("pending"):
             before = len(trader.STATE["trades"])
