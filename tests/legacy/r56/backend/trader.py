@@ -1233,7 +1233,7 @@ FILLS_PAGE = 1000              # userTrades 一頁上限
 FILLS_MAX_PAGES = 10          # symbol → 我們自己平倉單的實際成交均價（_market_close 成功時寫入）
 
 
-def _close_fills(sym, pos, qty_needed=None):
+def _close_fills(sym, pos, qty_needed=None, zero_ok=False):
     """成交明細裡，這個部位開倉之後、平倉方向的成交：回傳 (數量, 均價, 最後一筆的成交 id)；查不到回 (None, None, None)。
     平倉成交用方向判斷（多單的平倉是 SELL），不看 realizedPnl——打平出場那筆的 realizedPnl 剛好是 0（r31）。
 
@@ -1274,7 +1274,8 @@ def _close_fills(sym, pos, qty_needed=None):
             and (x.get("positionSide") or "BOTH") in ("BOTH", pos.get("side"))]
     q = sum(float(x.get("qty") or 0) for x in rows)
     if q <= 0:
-        return None, None, None
+        # zero_ok：查得到、但沒有平倉成交（跟「查不到」分開，r54 判斷是不是重開要用）
+        return (0.0, None, None) if zero_ok else (None, None, None)
     if qty_needed is not None and q < float(qty_needed) * 0.99:
         return None, None, None                  # 湊不滿：有成交沒查到，不拿部分當全部
     px = sum(float(x.get("qty") or 0) * float(x.get("price") or 0) for x in rows) / q
@@ -1332,12 +1333,21 @@ def _market_close(symbol, side, qty, base=0.0, pos=None):
     - **HTTP 200 不等於平掉**（第 15 條）：True 只在「交易所說 FILLED 且成交量＝送出量」或「再查部位確認沒了」時回傳。
       呼叫端拿到 True 就會撤停損、結帳——把「交易所收下了」當成 True，部位還在、停損卻撤了。
     """
-    live = _live_qty(symbol, side)
+    live, avg = _live_row(symbol, side)
     if live is None:
         return False, "查不到部位，為安全起見不送平倉單"
     own = live - (base or 0)
     if own <= 1e-12:
         return "gone", "這一側已經沒有自己的部位"
+    if pos is not None:
+        # 第 8 條 r54、r55：每條平倉路徑送單前的確認都在這裡，均價比對也加在這裡
+        rc = reopen_check(pos, avg)
+        if rc == "reopened":
+            return "gone", (f"交易所這一側均價 {avg:g} 跟帳上成交價 {pos.get('entry'):g} 不同，而且查到這筆的平倉成交："
+                            f"原本那筆已經沒了，現在這一側是別人重開的，不送平倉單、交給對帳")
+        if rc == "unknown":
+            return False, (f"交易所這一側均價 {avg:g} 跟帳上成交價 {pos.get('entry'):g} 不同、成交明細又查不到，"
+                           f"判斷不了是不是同一筆，為安全起見不送平倉單")
     q = min(qty, own)
     close_side = "SELL" if side == "LONG" else "BUY"
     st, d = _request("POST", "/fapi/v1/order", {
@@ -1378,13 +1388,51 @@ def _market_close(symbol, side, qty, base=0.0, pos=None):
     return False, why
 
 
+def _avg_differs(pos, avg):
+    """交易所這一側的均價跟帳上成交價是否不同（第 8 條 r54）。比不出來時回 False：
+    有基準部位（均價是合併的）、帳上進場價是估的、任一邊讀不到。容許誤差：一個價格跳動或價格的百萬分之二，取大者。"""
+    if pos is None or float(pos.get("base") or 0) > 0 or pos.get("entryUnverified"):
+        return False
+    e = pos.get("entry")
+    if not isinstance(e, (int, float)) or e <= 0 or not isinstance(avg, (int, float)) or avg <= 0:
+        return False
+    tick = (_filters.get(pos.get("symbol")) or {}).get("tick") or 0
+    return abs(avg - e) > max(tick, abs(e) * 2e-6)
+
+
+def reopen_check(pos, avg):
+    """交易所這一側還有部位時，它還是不是原本那筆（第 8 條 r54：交易所端的「平掉後同檔重開」）。
+    回傳 same／reopened／unknown。
+
+    原本那筆在交易所端被平掉（停損觸發、在 App 上手動平），接著別的專案或 App 在同一檔同方向開了新部位：
+    交易所上這一側有部位，「送單前確認部位還在」會通過，舊部位的數量、進場價、停損單號就被拿去動別人的部位。
+    **要兩個證據才判定重開**：均價跟帳上成交價不同，**而且**成交明細裡查到這筆的平倉成交（湊滿帳上數量）。
+    只看均價的話，帳上成交價跟交易所記法有一點出入（舊版記的、分批成交）就會被當成「沒了」——對帳接著結帳、撤掉還在場部位的停損。
+    均價不同但沒有平倉成交 → 同一筆（從沒被平過）；成交明細查不到 → unknown（這輪不送任何單）。
+    限制：重開在同一個價格、或本來就有基準部位時比對不出來——根本的解法仍是每個專案一個子帳號（第 7 條）。"""
+    if not _avg_differs(pos, avg):
+        return "same"
+    q, _px, _id = _close_fills(pos["symbol"], pos, zero_ok=True)
+    if q is None:
+        return "unknown"
+    return "reopened" if q >= float(pos.get("qty") or 0) * 0.99 else "same"
+
+
 def _own_live(pos):
-    """逐幣確認自己在交易所上的數量（扣基準）。回傳 (數量, 狀態)：ok / unknown（查不到）/ gone（沒了）。"""
-    live = _live_qty(pos["symbol"], pos["side"])
+    """逐幣確認自己在交易所上的數量（扣基準）。回傳 (數量, 狀態)：ok / unknown（查不到）/ gone（沒了）。
+    r54：這一側還有部位、但確認是別人重開的 → gone；判斷不了 → unknown（這輪不送單）。"""
+    live, avg = _live_row(pos["symbol"], pos["side"])
     if live is None:
         return None, "unknown"
     own = live - float(pos.get("base") or 0)
-    return (own, "ok") if own > 1e-12 else (0.0, "gone")
+    if own <= 1e-12:
+        return 0.0, "gone"
+    rc = reopen_check(pos, avg)
+    if rc == "reopened":
+        return 0.0, "gone"
+    if rc == "unknown":
+        return None, "unknown"
+    return own, "ok"
 
 
 def place_stop(pos, price, own=None):
@@ -1842,14 +1890,25 @@ def sync_positions():
         own = (abs(float(row.get("positionAmt") or 0)) - base) if row else 0.0
         if own <= 1e-12:
             # 全量表裡沒有：逐幣再查一次再下結論（全量表可能偶發回空清單；查不到不等於沒有，第 2 條）
-            q = _live_qty(sym, pos["side"])
+            q, e = _live_row(sym, pos["side"])
             if q is None:
                 live[sym] = {"positionAmt": str(pos["qty"] + base), "_unverified": True}
                 continue
             own = q - base
             if own <= 1e-12:
                 continue
-            row = {"positionAmt": str(q)}
+            row = {"positionAmt": str(q), "entryPrice": str(e or 0)}
+        # 第 8 條 r54：這一側還有部位，但可能是原本那筆被平掉後、別人在同一檔同方向重開的
+        try:
+            avg_now = float(row.get("entryPrice") or 0)
+        except (TypeError, ValueError):
+            avg_now = 0.0
+        rc = reopen_check(pos, avg_now)
+        if rc == "reopened":
+            continue                          # 當成原本那筆已平倉：下面照成交明細結帳、撤剩下的條件單
+        if rc == "unknown":
+            live[sym] = dict(row, _unverified=True)
+            continue
         live[sym] = row
 
     # 部分出場：交易所數量比帳上少 → 停利單（2R 出一半）成交了。
@@ -2352,6 +2411,11 @@ def move_to_breakeven(pos, mark, force=False, reason=None):
     價格若已穿過想要的停損（-2021），直接市價出場，結果就是約略打平。
     回傳事件：ok / retry（first 表示第一次失敗）/ exited / naked。
     """
+    # 第 8 條 r51：部位是呼叫端在拿鎖**之前**讀出來的（main 的反向訊號收緊：讀出部位後還查交易所、查衍生數據才呼叫）。
+    # 拿到鎖之後先確認它還是帳上那一筆——這段期間被手動平掉的話，照舊移損會替不存在的部位重掛停損（孤兒單，第 13 條）
+    if STATE["positions"].get(pos.get("symbol")) is not pos:
+        return {"symbol": pos.get("symbol"), "ok": False, "skipped": "gone",
+                "error": "部位已不在帳上（剛被平倉或換成另一筆），不移損"}
     if pos.get("beMoved") or pos.get("pendingClose"):
         # 待平倉期間只讓「每輪重試」那條路動它（第 8 條 r14）
         return {"symbol": pos.get("symbol"), "ok": False,

@@ -190,6 +190,13 @@ def _():
         return "均價有出入就被當成已平倉（會撤掉還在場部位的停損）"
     n0 = len(ex.calls)
     r = T().close_position("XUSDT")
+    # 結果前提（第 16 種，r58 gold-scalper）：送單前真的比對了——逐幣查了部位、而且因為均價不同去查了成交明細。
+    # 沒有這項，「送出了」分不出是判定同一筆、還是比對根本沒跑
+    idx = next((i for i, c in enumerate(ex.calls[n0:]) if c[0] == "POST" and R.Ex42.is_close(c[2])), None)
+    before = ex.calls[n0:n0 + idx] if idx is not None else ex.calls[n0:]
+    need(any(c[1] == "/fapi/v2/positionRisk" and c[2].get("symbol") == "XUSDT" for c in before),
+         "送單前沒有逐幣查部位（結果前提）")
+    need(any(c[1] == "/fapi/v1/userTrades" for c in before), "均價不同卻沒去查成交明細（結果前提：比對沒跑）")
     if not market_posts(ex, n0, close=True) or not r.get("ok"):
         return f"手動平倉沒送出：{r}"
 

@@ -1,6 +1,6 @@
 """拿現在的測試跑舊版程式，失敗分成四類（BINANCE_LESSONS 用法第 5 點 r35、r36）。
 
-    python3 -m tests.run_on_legacy r53
+    python3 -m tests.run_on_legacy r56
 
 舊版程式存在 tests/legacy/<版本>/backend/（只放 .py）。每輪對照清單前，把這輪修改前的程式存一份進來。
 重點看「測試本身崩掉」要是 0——不是 0 就代表測試在舊程式上走不到斷言，前後比對失真。
@@ -13,7 +13,7 @@ import sys
 import tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SUITES = ["test_r11", "test_r14", "test_r17", "test_r20", "test_r23", "test_r26", "test_r29", "test_r32", "test_r35", "test_r38", "test_r42", "test_r46", "test_r49", "test_r52", "test_r55"]
+SUITES = ["test_r11", "test_r14", "test_r17", "test_r20", "test_r23", "test_r26", "test_r29", "test_r32", "test_r35", "test_r38", "test_r42", "test_r46", "test_r49", "test_r52", "test_r55", "test_r58"]
 
 
 def main(ver):
@@ -42,4 +42,4 @@ def main(ver):
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1] if len(sys.argv) > 1 else "r53"))
+    sys.exit(main(sys.argv[1] if len(sys.argv) > 1 else "r56"))
