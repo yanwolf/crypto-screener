@@ -7,8 +7,9 @@ apply()：一批修改（可跨多個檔、同一個檔多處依序套用）先�
 
     python3 scripts/patch.py        # 自我驗證
 
-改寫工具自己也會壞（r66 gold-scalper）：用 apply() 改這個檔之後，先跑 `python3 -m pyflakes scripts/patch.py`
-（寫入前的 compile() 只抓語法，抓不到沒匯入的名稱），再跑自我驗證。verify.sh 的 pyflakes 步驟掃 scripts/，排在自我驗證之前。
+改寫工具自己也會壞（r66 gold-scalper、r68 pump-dump-hunter）：寫入前的 compile() 只抓語法，抓不到沒匯入的名稱。
+所以 apply() 寫入前用 pyflakes 的 API 在記憶體裡掃每個改過的 .py，有 undefined name 就整批中止、一個檔都不寫（不靠改完記得跑）；
+pyflakes 沒裝時印警告、不擋。verify.sh 的 pyflakes 步驟另外掃整個 scripts/，排在自我驗證之前。
 """
 import hashlib
 import json
@@ -97,11 +98,27 @@ def _apply(edits):
                 compile(buf[path], path, "exec")          # r35：寫入前先編譯，語法錯就一個檔都不寫
             except SyntaxError as e:
                 raise SystemExit(f"✕ apply 中止（一個檔都沒寫）：{path} 改完後有語法錯（第 {e.lineno} 行）：{e.msg}")
+            undef = _undefined_names(buf[path], path)     # r68：compile() 抓不到沒匯入的名稱
+            if undef:
+                raise SystemExit(f"✕ apply 中止（一個檔都沒寫）：{path} 改完後有未定義的名稱：{'；'.join(undef[:5])}")
     for path in order:
         with open(path, "w", encoding="utf-8") as fh:
             fh.write(buf[path])
     clear_pending()
     return order
+
+
+def _undefined_names(src, path):
+    """用 pyflakes 的 API 在記憶體裡掃一段原始碼，回傳 undefined name 的訊息清單；pyflakes 沒裝時印警告、回空清單（不擋）。"""
+    try:
+        import io
+        from pyflakes import api as _pf_api, reporter as _pf_rep
+    except ImportError:
+        sys.stderr.write("  ! pyflakes 沒裝，apply() 無法檢查未定義的名稱（pip install pyflakes）\n")
+        return []
+    out = io.StringIO()
+    _pf_api.check(src, path, _pf_rep.Reporter(out, out))
+    return [l.strip() for l in out.getvalue().splitlines() if "undefined name" in l]
 
 
 def exact(path, start, n):
@@ -111,9 +128,22 @@ def exact(path, start, n):
 
 
 def selftest():
+    """自我驗證期間把待重跑檔改指到暫存目錄、結束還原；真的那份在前後比對，變了就拋錯（r68、r69）。"""
     global PENDING_FILE
+    real = PENDING_FILE
+    real_before = open(real, encoding="utf-8").read() if os.path.exists(real) else None
     d = tempfile.mkdtemp()
-    PENDING_FILE = os.path.join(d, ".pending.json")      # 自我驗證不碰真的待重跑檔
+    PENDING_FILE = os.path.join(d, ".pending.json")
+    try:
+        return _selftest(d)
+    finally:
+        PENDING_FILE = real
+        real_after = open(real, encoding="utf-8").read() if os.path.exists(real) else None
+        if real_after != real_before:
+            raise RuntimeError("自我驗證動到了真的待重跑檔")
+
+
+def _selftest(d):
     a, b = os.path.join(d, "a.txt"), os.path.join(d, "b.txt")
     open(a, "w", encoding="utf-8").write("甲乙丙")
     open(b, "w", encoding="utf-8").write("丁戊己")
@@ -127,6 +157,8 @@ def selftest():
     # r65、r66：中止後只重跑一部分要擋下；改了錨點但新字串相同的整批要放行；故意中止的案例之後要清掉待重跑批次
     if not os.path.exists(PENDING_FILE):
         return "中止後沒有記下待重跑批次"
+    if not PENDING_FILE.startswith(d):
+        return "自我驗證寫的不是暫存那份待重跑檔"
     try:
         apply([(b, "丁", "Y", 1, "只重跑第二處（改了錨點）")])
         return "中止後只重跑一部分卻沒有擋下"
@@ -139,6 +171,13 @@ def selftest():
         return "整批重跑沒有正確寫入"
     if os.path.exists(PENDING_FILE):
         return "整批成功後待重跑批次沒有清掉"
+    try:
+        apply([(b, "不存在", "Y", 1, "再故意中止一次")])
+    except SystemExit:
+        pass
+    clear_pending()
+    if os.path.exists(PENDING_FILE):
+        return "clear_pending() 之後待重跑批次還在"
     open(a, "w", encoding="utf-8").write("甲乙丙")
     open(b, "w", encoding="utf-8").write("丁戊己")
     try:
@@ -168,6 +207,17 @@ def selftest():
     except SystemExit:
         clear_pending()
     apply([(c, "        return 1\n", "        return 3\n", 1, "改裝飾過的函式內容（不是插在中間）")])
+    # r68：用了沒匯入的名稱——compile() 過得了，pyflakes 抓得到；中止、檔案沒被改動
+    open(c, "w", encoding="utf-8").write("x = 1\n")
+    if _undefined_names("import os\nzz_undefined_probe\n", "probe.py"):        # pyflakes 有裝才驗這項
+        try:
+            apply([(c, "x = 1\n", "x = 1\ny = os.getcwd()\n", 1, "用了沒匯入的 os")])
+            return "用了沒匯入的名稱卻沒有中止"
+        except SystemExit:
+            clear_pending()
+        if open(c, encoding="utf-8").read() != "x = 1\n":
+            return "未定義名稱中止了，但檔案已經被改了"
+        apply([(c, "x = 1\n", "import os\nx = 1\ny = os.getcwd()\n", 1, "有匯入就放行")])
     open(b, "w", encoding="utf-8").write("丁戊己")
     apply([(a, "乙", "X", 1, "一"), (a, "X丙", "XY", 1, "同檔第二處依序套用"), (b, "戊", "Z", 1, "二")])
     if open(a, encoding="utf-8").read() != "甲XY" or open(b, encoding="utf-8").read() != "丁Z己":
@@ -177,5 +227,5 @@ def selftest():
 
 if __name__ == "__main__":
     err = selftest()
-    print("✕ patch 自我驗證：" + err if err else "✓ patch 自我驗證：比對不到時一個檔都不寫、結尾換行不一致時中止（整段刪除除外）、改出語法錯時一個檔都不寫、錨點緊接裝飾器時中止、中止後只重跑一部分時擋下（整批重跑放行、成功後忘掉）、同檔多處依序套用、exact() 讀對行")
+    print("✕ patch 自我驗證：" + err if err else "✓ patch 自我驗證：比對不到時一個檔都不寫、結尾換行不一致時中止（整段刪除除外）、改出語法錯時一個檔都不寫、錨點緊接裝飾器時中止、中止後只重跑一部分時擋下（整批重跑放行、成功後忘掉）、自我驗證只碰暫存的待重跑檔、用了沒匯入的名稱時中止、同檔多處依序套用、exact() 讀對行")
     sys.exit(1 if err else 0)
