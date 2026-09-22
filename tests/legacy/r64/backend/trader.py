@@ -1338,7 +1338,8 @@ def _market_close(symbol, side, qty, base=0.0, pos=None):
         return False, "查不到部位，為安全起見不送平倉單"
     own = live - (base or 0)
     if own <= 1e-12:
-        return "gone", "這一側已經沒有自己的部位"
+        # r62：按平倉時帳上還在、送單前確認這一刻才發現沒了——多半是停損剛觸發；照實寫，出場價交給對帳查成交明細
+        return "gone", "送單前確認：交易所這一側已經沒有自己的部位（可能是停損剛觸發）"
     if pos is not None:
         # 第 8 條 r54、r55：每條平倉路徑送單前的確認都在這裡，均價比對也加在這裡
         rc = reopen_check(pos, avg)
@@ -1881,6 +1882,7 @@ def sync_positions():
     if st != 200 or not isinstance(d, list):
         return {"error": "對帳失敗"}
     by_side = _rows_by_side(d)
+    reopened = set()                          # r54、r60：原本那筆在交易所端平掉、這一側被別人重開的
     # 先認領，再算「還在場」：以前反過來，剛認領的部位不在清單裡，同一輪就被判成平倉、停損也被撤掉
     adopt_pending(by_side)
     live = {}
@@ -1905,6 +1907,7 @@ def sync_positions():
             avg_now = 0.0
         rc = reopen_check(pos, avg_now)
         if rc == "reopened":
+            reopened.add(sym)
             continue                          # 當成原本那筆已平倉：下面照成交明細結帳、撤剩下的條件單
         if rc == "unknown":
             live[sym] = dict(row, _unverified=True)
@@ -1967,7 +1970,13 @@ def sync_positions():
             if sym not in live:
                 pos = STATE["positions"][sym]
                 px = _exit_price(sym, pos)
-                record_close(pos, px, "交易所出場（停損或停利觸發）")
+                why = "交易所出場（停損或停利觸發）"
+                if sym in reopened:
+                    # r60：講明交易所上現在那張不是這筆、程式沒有動它（不然看起來像這筆還在、或別人的部位被處理了）
+                    why += "；交易所上現在同一側那張是別的部位（均價不同），沒有動它"
+                if px is None:
+                    why += "；出場價成交明細查不到，記未知"      # r60：不把「不知道」寫成「知道」
+                record_close(pos, px, why)
                 closed.append(sym)
         except Exception as e:
             _pos_step_error("平倉記帳", sym, e)

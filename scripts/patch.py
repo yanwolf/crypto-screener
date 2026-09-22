@@ -6,10 +6,50 @@ apply()：一批修改（可跨多個檔、同一個檔多處依序套用）先�
          版本號也放進同一批，避免「清單中止、版本號照改」的不一致。
 
     python3 scripts/patch.py        # 自我驗證
+
+改寫工具自己也會壞（r66 gold-scalper）：用 apply() 改這個檔之後，先跑 `python3 -m pyflakes scripts/patch.py`
+（寫入前的 compile() 只抓語法，抓不到沒匯入的名稱），再跑自我驗證。verify.sh 的 pyflakes 步驟掃 scripts/，排在自我驗證之前。
 """
+import hashlib
+import json
 import os
 import sys
 import tempfile
+
+# r65 pump-dump-hunter、r66：整批中止後「只重跑一部分」要擋下。中止時把這批每一處的指紋（路徑＋新字串）存成檔案；
+# 下一批沒涵蓋全部指紋就中止，整批成功寫入後刪掉。指紋用新字串不用舊字串：改錨點重跑時舊字串會不同、新字串不變。
+PENDING_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".patch_pending.json")
+
+
+def _fp(path, new):
+    return hashlib.sha1((os.path.abspath(path) + "\0" + new).encode("utf-8")).hexdigest()[:16]
+
+
+def clear_pending():
+    """放棄上一批（確定不重跑時），或自我驗證裡故意中止的案例之後清掉（r66：不清會擋到後面的案例）。"""
+    if os.path.exists(PENDING_FILE):
+        os.remove(PENDING_FILE)
+
+
+def _check_pending(edits):
+    if not os.path.exists(PENDING_FILE):
+        return
+    try:
+        pend = json.load(open(PENDING_FILE, encoding="utf-8"))
+    except Exception:
+        pend = {}
+    want = pend.get("fps") or []
+    have = {_fp(p, n) for p, _o, n, _c, _l in edits}
+    missing = [lbl for fp, lbl in zip(want, pend.get("labels") or [""] * len(want)) if fp not in have]
+    if missing:
+        raise SystemExit(f"✕ apply 中止（一個檔都沒寫）：上一批中止後只重跑了一部分——缺了 {len(missing)} 處：{'、'.join(missing)}。"
+                         f"要用原本的整批清單重跑；確定要放棄上一批就先呼叫 clear_pending()（或刪掉 {PENDING_FILE}）")
+
+
+def _save_pending(edits):
+    with open(PENDING_FILE, "w", encoding="utf-8") as fh:
+        json.dump({"fps": [_fp(p, n) for p, _o, n, _c, _l in edits],
+                   "labels": [str(l) for _p, _o, _n, _c, l in edits]}, fh, ensure_ascii=False)
 
 
 def sub(text, old, new, count=1, label=""):
@@ -20,7 +60,17 @@ def sub(text, old, new, count=1, label=""):
 
 
 def apply(edits):
-    """edits：[(路徑, 原文, 新文, 次數, 標籤), ...]。全部比對通過才寫入；回傳改了哪些檔。"""
+    """edits：[(路徑, 原文, 新文, 次數, 標籤), ...]。全部比對通過才寫入；回傳改了哪些檔。
+    中止（SystemExit）時記下這批的指紋，下一次只帶一部分就擋下（r65、r66）。"""
+    _check_pending(edits)
+    try:
+        return _apply(edits)
+    except SystemExit:
+        _save_pending(edits)
+        raise
+
+
+def _apply(edits):
     buf, order = {}, []
     for path, old, new, count, label in edits:
         if path not in buf:
@@ -50,6 +100,7 @@ def apply(edits):
     for path in order:
         with open(path, "w", encoding="utf-8") as fh:
             fh.write(buf[path])
+    clear_pending()
     return order
 
 
@@ -60,7 +111,9 @@ def exact(path, start, n):
 
 
 def selftest():
+    global PENDING_FILE
     d = tempfile.mkdtemp()
+    PENDING_FILE = os.path.join(d, ".pending.json")      # 自我驗證不碰真的待重跑檔
     a, b = os.path.join(d, "a.txt"), os.path.join(d, "b.txt")
     open(a, "w", encoding="utf-8").write("甲乙丙")
     open(b, "w", encoding="utf-8").write("丁戊己")
@@ -71,18 +124,35 @@ def selftest():
         pass
     if open(a, encoding="utf-8").read() != "甲乙丙":
         return "中止了，但第一個檔已經被改了"
+    # r65、r66：中止後只重跑一部分要擋下；改了錨點但新字串相同的整批要放行；故意中止的案例之後要清掉待重跑批次
+    if not os.path.exists(PENDING_FILE):
+        return "中止後沒有記下待重跑批次"
+    try:
+        apply([(b, "丁", "Y", 1, "只重跑第二處（改了錨點）")])
+        return "中止後只重跑一部分卻沒有擋下"
+    except SystemExit:
+        pass
+    if open(b, encoding="utf-8").read() != "丁戊己":
+        return "只重跑一部分被擋下了，但檔案已經被改了"
+    apply([(a, "乙", "X", 1, "第一處"), (b, "丁", "Y", 1, "第二處改了錨點、新字串相同")])
+    if open(a, encoding="utf-8").read() != "甲X丙" or open(b, encoding="utf-8").read() != "Y戊己":
+        return "整批重跑沒有正確寫入"
+    if os.path.exists(PENDING_FILE):
+        return "整批成功後待重跑批次沒有清掉"
+    open(a, "w", encoding="utf-8").write("甲乙丙")
+    open(b, "w", encoding="utf-8").write("丁戊己")
     try:
         apply([(a, "甲乙丙", "甲乙丙\n", 1, "結尾換行不一致")])
         return "結尾換行不一致卻沒有中止"
     except SystemExit:
-        pass
+        clear_pending()                                  # r66：故意中止的案例，之後要清掉，否則擋到後面的案例
     c = os.path.join(d, "c.py")
     open(c, "w", encoding="utf-8").write("x = 1\ny = 2\n")
     try:
         apply([(a, "甲", "甲2", 1, "先改一個非 py 檔"), (c, "y = 2", "y = (2", 1, "改出語法錯")])
         return "改出語法錯卻沒有中止"
     except SystemExit:
-        pass
+        clear_pending()
     if open(c, encoding="utf-8").read() != "x = 1\ny = 2\n" or open(a, encoding="utf-8").read() != "甲乙丙":
         return "改出語法錯中止了，但檔案已經被寫了"
     open(b, "w", encoding="utf-8").write("第一行\n要刪的\n第三行\n")
@@ -96,7 +166,7 @@ def selftest():
         apply([(c, "    def x(self):\n", "    def y(self):\n        return 2\n\n    def x(self):\n", 1, "插在裝飾器與 def 中間")])
         return "錨點緊接在裝飾器後面、插入新函式卻沒有中止"
     except SystemExit:
-        pass
+        clear_pending()
     apply([(c, "        return 1\n", "        return 3\n", 1, "改裝飾過的函式內容（不是插在中間）")])
     open(b, "w", encoding="utf-8").write("丁戊己")
     apply([(a, "乙", "X", 1, "一"), (a, "X丙", "XY", 1, "同檔第二處依序套用"), (b, "戊", "Z", 1, "二")])
@@ -107,5 +177,5 @@ def selftest():
 
 if __name__ == "__main__":
     err = selftest()
-    print("✕ patch 自我驗證：" + err if err else "✓ patch 自我驗證：比對不到時一個檔都不寫、結尾換行不一致時中止（整段刪除除外）、改出語法錯時一個檔都不寫、錨點緊接裝飾器時中止、同檔多處依序套用、exact() 讀對行")
+    print("✕ patch 自我驗證：" + err if err else "✓ patch 自我驗證：比對不到時一個檔都不寫、結尾換行不一致時中止（整段刪除除外）、改出語法錯時一個檔都不寫、錨點緊接裝飾器時中止、中止後只重跑一部分時擋下（整批重跑放行、成功後忘掉）、同檔多處依序套用、exact() 讀對行")
     sys.exit(1 if err else 0)

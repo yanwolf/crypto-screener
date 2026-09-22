@@ -9,6 +9,12 @@
 3. 第 26 種（r63 gold-scalper 的規則）：fresh() 把 save_state 換成不寫檔的假函式；案例若檢查狀態檔在磁碟上的結果
    （STATE_FILE、.unloaded、明確呼叫 save_state()），必須用 fresh(keep_save=True)，否則在檢查一個被 mock 掉的東西。
 
+靜態分不出、只能在執行期抓的（r65、r66：寫明，不假裝有擋）：
+- 「前提量到被測的結果」（第 13 種）、「前提只看有查沒看結果」（第 16 種）：need("真的送單了") 跟 need("結果是 X") 語法上一樣合法，
+  差別在斷言的是不是被測那一步的產物 → 靠 mutation_check（結果在被測步驟之前就存在時，突變下照樣通過會報空跑）與 run_on_legacy。
+- 「前提之後的動作讓測試本身崩掉」：靠 run_on_legacy 的「測試本身崩掉」計數（要是 0）與 mutation_check 的 CRASHES。
+- 「測試把被測的那一段 mock 掉」（r43 notify_telegram）：靠人看；第 26 種只擋得住框架自己 mock 的 save_state。
+
     python3 -m tests.check_tests
 """
 import ast
