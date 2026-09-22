@@ -83,6 +83,68 @@ PERSIST_CFG = ("riskPct", "maxPositions", "leverage", "stopAtrMult",
 _filters = {}                      # symbol → 精度與限制
 _filters_ts = 0
 _lock = threading.Lock()
+
+
+# ── 引擎鎖（BINANCE_LESSONS 第 8 條 r48、r49）──────────────────────
+# 背景的對帳／出場管理／守衛、自動下單、網頁的交易操作是不同執行緒。以前沒有任何鎖：
+# 背景那條查交易所的幾秒之間，網頁手動平倉照樣進得來——背景手上是舊的判斷，接著照舊判斷補掛停損、送單；
+# 自動下單與手動下單同一檔可能兩張都送出；存檔時另一條執行緒增刪部位，json.dump 直接丟例外。
+# 鎖加在**函式本身**（裝飾器），不是加在某一個呼叫端（r48：只加在背景迴圈那層，直接呼叫時照樣交錯）。
+# 可重入：平倉裡面再結帳、存檔不會卡住。網頁那條用 engine_wait(秒) 設等待上限，拿不到丟 EngineBusy。
+_engine_lock = threading.RLock()
+_engine_tl = threading.local()
+ENGINE_OPS = []
+
+
+class EngineBusy(Exception):
+    """網頁那條等引擎鎖超過上限：背景正在處理。"""
+
+
+def engine_op(fn):
+    import functools
+
+    @functools.wraps(fn)
+    def wrap(*a, **k):
+        t = getattr(_engine_tl, "timeout", None)
+        if not _engine_lock.acquire(timeout=-1 if t is None else t):
+            raise EngineBusy(fn.__name__)
+        try:
+            return fn(*a, **k)
+        finally:
+            _engine_lock.release()
+    wrap.engine_op = True
+    ENGINE_OPS.append(fn.__name__)
+    return wrap
+
+
+class engine_wait:
+    """with engine_wait(10): —— 這條執行緒接下來拿引擎鎖最多等幾秒（網頁請求用；背景不設＝一直等）。"""
+
+    def __init__(self, seconds):
+        self.s = seconds
+
+    def __enter__(self):
+        self.old = getattr(_engine_tl, "timeout", None)
+        _engine_tl.timeout = self.s
+        return self
+
+    def __exit__(self, *exc):
+        _engine_tl.timeout = self.old
+        return False
+
+
+class engine_section:
+    """整段拿引擎鎖（main 直接改 AUTO 之類不經過函式的地方）；等待上限照 engine_wait。"""
+
+    def __enter__(self):
+        t = getattr(_engine_tl, "timeout", None)
+        if not _engine_lock.acquire(timeout=-1 if t is None else t):
+            raise EngineBusy("engine_section")
+        return self
+
+    def __exit__(self, *exc):
+        _engine_lock.release()
+        return False
 _time_offset = [0]                 # 伺服器與幣安的時鐘差
 
 STATE = {
@@ -741,6 +803,7 @@ def _my_side_rows(rows, symbol, side):
     return out
 
 
+@engine_op
 def open_position(symbol_base, side, entry_hint, stop, info=None, note="", stop_pct=None):
     """進場：市價單 + 停損單 + 部分停利 + 移動停利。
 
@@ -754,6 +817,12 @@ def open_position(symbol_base, side, entry_hint, stop, info=None, note="", stop_
     if not ok:
         return {"ok": False, "error": msg}
     info = info or finfo
+    # r48 對照時發現：手動開倉不經過 auto_can_trade，同一檔已有部位或正在等確認時照樣送單，
+    # 記帳時直接蓋掉原本那筆（原本的停損、停利從此沒人管）。引擎鎖讓兩張單排隊，這裡擋第二張。
+    if sym in STATE["positions"]:
+        return {"ok": False, "error": f"{sym} 已有部位，不重複進場（要加碼請先平倉）"}
+    if sym in (STATE.get("pending") or {}):
+        return {"ok": False, "error": f"{sym} 剛送出進場單、還在等交易所確認，不重複下單"}
 
     equity, err = account_equity()
     if equity is None:
@@ -1088,13 +1157,17 @@ def auto_can_trade(symbol):
     # ── 全域額度 ──
     if AUTO["blocked"]:
         return False, AUTO["blocked"]
-    if AUTO["closedR"] <= AUTO["dailyLossR"]:
+    # 第 8 條 r49：讀不到出場成交價（損益未知）不能當成「沒虧」——成交明細查詢壞掉時每筆都是未知，
+    # 每日虧損上限就永遠不會觸發，而且正好是系統狀況不好的時候。統計照 r28～r30 記未知（r46 使用者決定），
+    # 但**斷路器**把每筆未知當成一次完整停損（-1R）來判斷：只會更早停，不會更晚。
+    unk = AUTO.get("unknownToday", 0) or 0
+    worst_r = AUTO["closedR"] - unk * 1.0
+    if worst_r <= AUTO["dailyLossR"]:
         AUTO["blockedAtR"] = AUTO["closedR"]
         AUTO["blockedAtUsd"] = AUTO.get("closedUsd", 0.0)
-        unk = AUTO.get("unknownToday", 0)
-        AUTO["blocked"] = (f"當日已虧損 {AUTO['closedR']:.2f}R（{AUTO.get('closedUsd', 0.0):+.0f} U），"
-                           f"達停損上限，今日停止新開倉；已有部位仍依停損出場"
-                           + (f"（另有 {unk} 筆損益未知，未計入）" if unk else ""))
+        AUTO["blocked"] = (f"當日已虧損 {AUTO['closedR']:.2f}R（{AUTO.get('closedUsd', 0.0):+.0f} U）"
+                           + (f"，另有 {unk} 筆損益未知、風控以每筆 -1R 計（合計 {worst_r:.2f}R）" if unk else "")
+                           + "，達停損上限，今日停止新開倉；已有部位仍依停損出場")
         save_state()
         return False, AUTO["blocked"]
     if AUTO["opened"] >= AUTO["maxPerDay"]:
@@ -1110,6 +1183,7 @@ def auto_can_trade(symbol):
     return True, None
 
 
+@engine_op
 def auto_open(symbol_base, side, entry, stop, note="", on_event=None, stop_pct=None):
     """自動開倉。通過風險閘門才會真的送單。"""
     sym = symbol_base.upper() + "USDT"
@@ -1355,6 +1429,7 @@ def _set_pending_close(pos, reason, why):
                 f"第 {n} 次平倉失敗：{why}\n每 {CFG.get('positionPoll', 20):g} 秒重試一次，平掉時會再通知。")
 
 
+@engine_op
 def retry_pending_closes():
     """每輪重試待平倉的部位。只有這條路會為待平倉的部位送平倉單（第 8 條 r14）。"""
     events = []
@@ -1383,6 +1458,7 @@ def retry_pending_closes():
     return events
 
 
+@engine_op
 def close_position(symbol, reason="手動平倉"):
     """手動平倉的外層保護（第 8 條 r23）：以「結帳」為界。
 
@@ -1427,6 +1503,7 @@ def _close_position_impl(symbol, reason="手動平倉"):
     return {"ok": True, "symbol": symbol, "exit": px}
 
 
+@engine_op
 def cancel_orphan(symbol, algo_id):
     """撤掉一張孤兒條件單（自檢列出的）。
 
@@ -1467,6 +1544,7 @@ def _leftover_failed(lf):
                   f"下次同幣進場時它可能讓新停損被拒。每 {CFG.get('positionPoll', 20):g} 秒重試一次，撤掉時會再通知。")
 
 
+@engine_op
 def retry_leftovers():
     """每輪重試待撤清單（第 13 條）。回傳事件，節奏同第 8 條。"""
     events = []
@@ -1505,6 +1583,7 @@ def retry_leftovers():
 PENDING_EXPIRE_SEC = 180
 
 
+@engine_op
 def adopt_pending(live):
     # live：{(symbol, side): positionRisk 列}，只認領方向相符的部位
     """把「送了單但沒記到帳」的部位認領回來（BINANCE_LESSONS 第 3 條）。
@@ -1590,6 +1669,7 @@ def adopt_pending(live):
 ADOPTED = []          # 本輪認領的部位，給 main.py 推播用
 
 
+@engine_op
 def record_close(pos, exit_px, reason):
     """記帳並撤掉這個部位剩下的條件單（BINANCE_LESSONS 第 13 條）。
 
@@ -1741,6 +1821,7 @@ def _rows_by_side(rows):
     return out
 
 
+@engine_op
 def sync_positions():
     """跟幣安對帳：本地記著但交易所已無部位的，代表被停損或停利成交了。"""
     if CFG["dryRun"]:
@@ -1924,6 +2005,7 @@ def enrich_positions():
 MISSED = []          # 每筆 {sym, cid, side, price, stopPct, score, ts, result, r}
 
 
+@engine_op
 def missed_record(sym, cid, side, price, stop_pct, score, why):
     MISSED.append({"sym": sym, "cid": cid, "side": side, "price": price,
                    "stopPct": stop_pct, "score": score, "why": why,
@@ -2004,6 +2086,7 @@ def missed_summary():
 CONFLICTS = []
 
 
+@engine_op
 def conflict_record(sym, held_side, held_r, sig_side, score, gate_ok):
     CONFLICTS.append({"sym": sym, "held": held_side, "rAtSignal": held_r, "sigSide": sig_side,
                       "score": score, "gateOk": gate_ok, "ts": int(time.time() * 1000),
@@ -2216,6 +2299,7 @@ def _guard_one(sym, pos, events):
     return "replace_failed"                   # 最後一句也要是 return，不能掉出函式（第 2 條 r26）
 
 
+@engine_op
 def guard_positions():
     """確認每個部位的停損還掛著。
 
@@ -2254,6 +2338,7 @@ def cancel_stop_orders(symbol, pos):
     return not failed
 
 
+@engine_op
 def move_to_breakeven(pos, mark, force=False, reason=None):
     """到達設定的 R 倍數後，把停損移到成本價（BINANCE_LESSONS 第 8 條）。
 
@@ -2365,6 +2450,7 @@ def move_to_breakeven(pos, mark, force=False, reason=None):
     return _fail(f"新停損掛不上且原停損也掛不回（{why}），守衛將補掛", naked=True)
 
 
+@engine_op
 def manage_positions():
     """主動管理：目前只有移損到成本。由部位監看執行緒每輪呼叫。"""
     if CFG["dryRun"] or not (CFG["key"] and CFG["secret"]):
@@ -2468,6 +2554,7 @@ def performance():
 
 # ── 狀態持久化 ──────────────────────────────────────────────
 
+@engine_op
 def set_excluded(trade_id, excluded):
     for t in STATE["trades"]:
         if t.get("id") == trade_id:
@@ -2477,6 +2564,7 @@ def set_excluded(trade_id, excluded):
     return False
 
 
+@engine_op
 def save_state():
     if not STATE_FILE:
         return
@@ -2521,6 +2609,7 @@ def state_path(cache_dir, live):
     return p
 
 
+@engine_op
 def load_state(path, _retry=False):
     """讀狀態檔。回傳 (ok, 錯誤)。第 8 條 r37、r38：「讀取失敗」與「沒有資料」不能是同一個結果。
 
@@ -2603,6 +2692,7 @@ def _load_failed(path, e, retry):
     return False, err
 
 
+@engine_op
 def retry_load_state():
     """讀取失敗期間每輪重試（例如人工把狀態檔修好或還原）。回傳原因。"""
     le = STATE.get("loadError")
@@ -2612,6 +2702,7 @@ def retry_load_state():
     return "loaded" if ok else "still_failed"
 
 
+@engine_op
 def configure(**kw):
     for k, v in kw.items():
         if k in CFG and v is not None:

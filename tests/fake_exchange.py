@@ -7,6 +7,7 @@ import atexit
 import json
 import os
 import sys
+import threading
 import time as _real_time
 
 import trader as T
@@ -445,6 +446,7 @@ class Ex42(Ex17):
     def __init__(self, mode="oneway"):
         super().__init__(mode)
         self.market_new = {}
+        self.pause = None                    # r48：{"path", "thread", "arrived": Event, "go": Event}——指定執行緒第一次打這個路徑時停住
         self.drop_avg = False                # r42：回應與查單都沒有 avgPrice（gold-scalper 2026-09-22 實單的樣子）
         self.later_after = 3
         self.deferred = []                   # [剩幾個請求, 單號, 參數]
@@ -478,6 +480,12 @@ class Ex42(Ex17):
                     o.update(status="EXPIRED")
 
     def _handle(self, method, path, params, signed, timeout):
+        pz = self.pause
+        if pz and not pz.get("done") and path == pz["path"] and threading.current_thread().name == pz["thread"]:
+            # 背景那條停在「查交易所」：另一條執行緒這時候做網頁操作（r48 的交錯）
+            pz["done"] = True
+            pz["arrived"].set()
+            pz["go"].wait(10)
         st, d = self._handle42(method, path, dict(params or {}), signed, timeout)
         if self.drop_avg and path == "/fapi/v1/order" and isinstance(d, dict) and "avgPrice" in d:
             d = {k: v for k, v in d.items() if k != "avgPrice"}

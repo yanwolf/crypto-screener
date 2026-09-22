@@ -97,6 +97,9 @@ python3 -m tests.test_r42
 echo "── 20b. r43→r46 逐段檢查項目 ──"
 python3 -m tests.test_r46
 
+echo "── 20c. r47→r49 逐段檢查項目（兩條執行緒交錯、風控讀不到）──"
+python3 -m tests.test_r49
+
 echo "── 21. 測試本身與工具的檢查（用法第 5 點、第 14 條）──"
 python3 -m tests.check_indexing        # 先索引、沒先確認有東西（r35）
 # 現在的測試跑 tests/legacy/ 下每一版舊程式：測試本身崩掉要是 0（r35、r36；r41 gold-scalper：自動跑每一版）
