@@ -213,6 +213,38 @@ def _():
         return f"虧 -1R、上限 -2R，不該擋：{why}"
 
 
+# ════ 績效分桶：標籤還沒有「險」段的舊 v2 併進同一桶（2026-09-22 使用者確認參數沒改過）═══
+
+@case("v-1", "載入時把沒有「險」段的舊 v2 標籤補上風險參數、併進目前的桶；v1、早期、持倉中的部位也照規則處理")
+def _():
+    ex, clock = fresh()
+    import json
+    import tempfile
+    cur = T().strategy_label()
+    seg = f"·險{T().CFG['riskPct']:g}%/{T().CFG['usablePct']:g}%"
+    need(seg in cur, f"目前的標籤沒有險段（前提）：{cur}")
+    old = cur.replace(seg, "")
+    p = os.path.join(tempfile.mkdtemp(), "s.json")
+    with open(p, "w", encoding="utf-8") as f:
+        json.dump({"state": {"trades": [{"id": "a", "version": old}, {"id": "b", "version": cur},
+                                        {"id": "c", "version": "v1·均線停損"},
+                                        {"id": "d", "version": "v2·早期（參數未記錄）"}],
+                             "positions": {"XUSDT": {"symbol": "XUSDT", "side": "LONG", "version": old}}},
+                   "cfg": {"riskPct": T().CFG["riskPct"], "usablePct": T().CFG["usablePct"]}}, f)
+    T().load_state(p)
+    vs = {t["id"]: t.get("version") for t in T().STATE["trades"]}
+    need(len(vs) == 4, f"載入後交易筆數不對（前提）：{vs}")
+    if vs["a"] != cur:
+        return f"舊標籤沒有併進目前的桶：{vs['a']}"
+    if vs["c"] != "v1·均線停損" or vs["d"] != "v2·早期（參數未記錄）":
+        return f"不該動的標籤被改了：{vs['c']}／{vs['d']}"
+    if (T().STATE["positions"].get("XUSDT") or {}).get("version") != cur:
+        return "持倉中的部位沒有一起併進去（平倉後又會落回舊桶）"
+    groups = {g for g in vs.values() if g.startswith("v2·取")}
+    if len(groups) != 1:
+        return f"v2 的參數桶還是分成 {len(groups)} 個"
+
+
 # ════ 用法 r49：框架重設涵蓋的模組改成自動列舉 ═══════════════════
 
 @case("u-5", "backend/ 底下每個模組自動列舉：fresh() 不重新載入的模組不能有模組層級的可變狀態")

@@ -2637,7 +2637,22 @@ def load_state(path, _retry=False):
     try:
         st = d.get("state", d)          # 相容舊格式
         trades = [dict(t) for t in (st.get("trades") or [])]
+        # 標籤還沒有「險」段的舊版 v2（PARAM_KEYS 加進 riskPct／usablePct 之前記的）：補上風險參數，併進同一桶。
+        # 使用者確認那段期間風險 % 與可用資金 % 沒改過（2026-09-22），所以用狀態檔裡現在的值補。
+        _c = d.get("cfg") or {}
+        _rp = _c.get("riskPct") if isinstance(_c.get("riskPct"), (int, float)) else CFG["riskPct"]
+        _up = _c.get("usablePct") if isinstance(_c.get("usablePct"), (int, float)) else CFG["usablePct"]
+
+        def _with_risk(v):
+            if isinstance(v, str) and v.startswith("v2·") and "·險" not in v and "·門檻" in v:
+                return v.replace("·門檻", f"·險{_rp:g}%/{_up:g}%·門檻", 1)
+            return v
+        for _p in (st.get("positions") or {}).values():
+            if isinstance(_p, dict) and _p.get("version"):
+                _p["version"] = _with_risk(_p["version"])
         for i, t in enumerate(trades):
+            if t.get("version"):
+                t["version"] = _with_risk(t["version"])
             if not t.get("id"):
                 t["id"] = f"{t.get('symbol', 'X')}-{t.get('closed') or i}"
             t.setdefault("excluded", False)
