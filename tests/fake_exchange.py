@@ -438,6 +438,7 @@ class Ex42(Ex17):
       never    回應 NEW／成交 0，最後沒成交（查單回 EXPIRED、成交 0）
       partial  回應 NEW／成交 0，最後只成交一半（查單回 EXPIRED、成交一半）
       stuck    回應 NEW／成交 0，一直是 NEW（撤單後變 CANCELED、成交 0）
+      partial_stuck  回應 NEW／成交 0，成交 40% 後卡在 PARTIALLY_FILLED（撤單後 CANCELED、成交 40%；r44 pump-dump-hunter）
     跟有沒有帶 newOrderRespType=RESULT 無關：帶了 RESULT 也可能回 NEW。
     """
 
@@ -509,6 +510,11 @@ class Ex42(Ex17):
             self.deferred.append([self.later_after, oid, dict(params, newOrderRespType="RESULT")])
         elif how == "never":
             o["status"] = "EXPIRED"
+        elif how == "partial_stuck":
+            part = round(int(qty * 0.4 * 10) / 10, 1)
+            st, d = self._apply(dict(params, quantity=part, newOrderRespType="RESULT"))
+            o.update(status="PARTIALLY_FILLED", executedQty=str(part),
+                     avgPrice=(self.orders.get(d.get("orderId")) or {}).get("avgPrice", "0"))
         elif how == "partial":
             half = round(int(qty / 2 * 10) / 10, 1)
             st, d = self._apply(dict(params, quantity=half, newOrderRespType="RESULT"))

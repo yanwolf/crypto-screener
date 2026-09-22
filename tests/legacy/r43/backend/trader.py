@@ -583,12 +583,14 @@ def set_leverage(symbol, lev):
 
 
 
-def wait_position(symbol, want_qty, tries=12, gap=0.5, side="LONG", base=0.0):
+def wait_position(symbol, want_qty, tries=12, gap=0.5, side="LONG", base=0.0, min_qty=None):
     """等部位出現在帳戶上，回傳 (實際數量, 進場均價)。
 
     市價單成交與 positionRisk 更新之間有延遲，直接掛條件單會被拒。
-    這裡輪詢到部位出現為止，最多約 6 秒。
+    這裡輪詢到部位出現為止，最多約 6 秒。min_qty：已知這張單成交了多少時，等到部位反映到這個數量
+    （到時間仍不足就回最後看到的數量）。
     """
+    seen = (0.0, None)
     for i in range(tries):
         st, d = _request("GET", "/fapi/v2/positionRisk", {"symbol": symbol}, signed=True)
         if st == 200 and isinstance(d, list):
@@ -602,9 +604,79 @@ def wait_position(symbol, want_qty, tries=12, gap=0.5, side="LONG", base=0.0):
                 except Exception:
                     continue
                 if amt - base > 1e-12:              # r14：扣掉送單前就有的
-                    return amt - base, (ep or None)
+                    seen = (amt - base, (ep or None))
+                    # 第 15 條：知道這張單成交了多少時，要等部位反映到那個數量——
+                    # 回應是 NEW 時部位可能只更新了一部分，第一次看到 >0 就回傳會把部分當全部
+                    if not min_qty or amt - base >= float(min_qty) * (1 - 1e-9) - 1e-12:
+                        return seen
         time.sleep(gap)
-    return 0.0, None
+    return seen
+
+
+# ── 市價單的成交確認（BINANCE_LESSONS 第 15 條）──────────────
+#
+# 幣安市價單的回應：沒帶 newOrderRespType=RESULT 時是 ACK——status NEW、executedQty 0、avgPrice 0；
+# 帶了 RESULT 通常是 FILLED，但也可能回 NEW（撮合還沒回報）、EXPIRED（流動性不夠，只成交一部分或 0）。
+# 「API 沒回錯誤」只代表交易所收下了這張單，不代表成交。平倉單把「收下」當成「成交」，
+# 就會接著撤停損、結帳——交易所上的部位還在，停損卻沒了。
+FINAL_STATUS = ("FILLED", "EXPIRED", "CANCELED", "REJECTED", "EXPIRED_IN_MATCH")
+
+
+def _fnum(v):
+    try:
+        x = float(v)
+    except (TypeError, ValueError):
+        return None
+    return x if math.isfinite(x) else None
+
+
+def order_outcome(resp):
+    """純函式：從下單／查單回應讀出成交結果（自檢也用它）。
+    回傳 {status, executed, avg, final, orderId}；executed 讀不到是 None（不是 0，也不是送出的數量）。"""
+    d = resp if isinstance(resp, dict) else {}
+    status = str(d.get("status") or "").upper()
+    avg = _fnum(d.get("avgPrice")) or 0.0
+    return {"status": status, "executed": _fnum(d.get("executedQty")), "avg": avg if avg > 0 else 0.0,
+            "final": status in FINAL_STATUS, "orderId": d.get("orderId")}
+
+
+def _order_fill_avg(sym, order_id):
+    """第 15 條 r42：回應沒有均價時，用那張單號在成交明細裡的成交算加權均價（實際成交價，不是估算）。
+    回傳 (成交量, 均價)；查不到回 (None, None)——記未知，不猜。"""
+    if order_id is None:
+        return None, None
+    st, d = _request("GET", "/fapi/v1/userTrades", {"symbol": sym, "orderId": order_id}, signed=True)
+    if st != 200 or not isinstance(d, list):
+        return None, None
+    rows = [x for x in d if str(x.get("orderId")) == str(order_id)]
+    q = sum(_fnum(x.get("qty")) or 0 for x in rows)
+    if q <= 0:
+        return None, None
+    return q, sum((_fnum(x.get("qty")) or 0) * (_fnum(x.get("price")) or 0) for x in rows) / q
+
+
+def _settle_market(sym, resp, tries=8, gap=0.5):
+    """市價單送出後確認最終成交（第 15 條）。回應不是最終狀態就用單號查，查到最終狀態為止；
+    查了 tries 次還不是最終狀態 → 撤掉這張單（不讓它之後才成交、變成沒人知道的數量），再查一次。
+    回傳 order_outcome 的格式，另加 note（過程說明）。final=False＝最後仍確定不了。"""
+    o = order_outcome(resp)
+    oid = o["orderId"]
+    notes = []
+    i = 0
+    while not o["final"] and oid is not None and i < tries:
+        time.sleep(gap)
+        i += 1
+        st, d = _request("GET", "/fapi/v1/order", {"symbol": sym, "orderId": oid}, signed=True)
+        if st == 200 and isinstance(d, dict) and d.get("status"):
+            o = dict(order_outcome(d), orderId=oid)
+    if not o["final"] and oid is not None:
+        st, d = _request("DELETE", "/fapi/v1/order", {"symbol": sym, "orderId": oid}, signed=True)
+        notes.append(f"{tries} 次查詢仍是 {o['status'] or '沒有狀態'}，已撤單（HTTP {st}）")
+        st, d = _request("GET", "/fapi/v1/order", {"symbol": sym, "orderId": oid}, signed=True)
+        if st == 200 and isinstance(d, dict) and d.get("status"):
+            o = dict(order_outcome(d), orderId=oid)
+    o["note"] = "；".join(notes)
+    return o
 
 
 
@@ -675,6 +747,9 @@ def open_position(symbol_base, side, entry_hint, stop, info=None, note="", stop_
     停損一定在進場後立刻掛出。如果掛停損失敗，會立刻market平掉剛進的倉，
     因為沒有停損的部位違反這套系統的前提。
     """
+    if STATE.get("loadError"):
+        # 手動開倉也不經過 auto_can_trade，這裡再擋一次（第 8 條 r38：讀不到持倉紀錄時不開新倉）
+        return {"ok": False, "error": "持倉紀錄還沒載入（狀態檔讀不到），暫停開新倉"}
     ok, sym, msg, finfo = check_tradable(symbol_base)
     if not ok:
         return {"ok": False, "error": msg}
@@ -750,6 +825,14 @@ def open_position(symbol_base, side, entry_hint, stop, info=None, note="", stop_
         save_state()
         return {"ok": False, "error": f"進場失敗：{entry_res.get('msg') or entry_res}"}
 
+    # 第 15 條：HTTP 200 只代表交易所收下了，不代表成交。看 status 與 executedQty；不是最終狀態就用單號查到最終狀態。
+    oc = _settle_market(sym, entry_res)
+    if oc["final"] and not (oc["executed"] or 0) > 0:
+        # 交易所明確說這張單最後沒有成交（EXPIRED／CANCELED 且成交 0）：不會有部位，pending 丟掉
+        STATE["pending"].pop(sym, None)
+        save_state()
+        return {"ok": False, "error": f"進場市價單沒有成交（{oc['status']}，成交 0）" + (f"；{oc['note']}" if oc["note"] else "")}
+
     # ── 市價單已成交，之後的步驟都包起來（BINANCE_LESSONS 第 8 條 r11）──
     # 送單成功就是「已成交」。後續任何一步（查部位、算位階、記帳、掛條件單）丟例外，
     # 都不能把整筆改寫成「下單失敗」：帳上若已記了部位就回報成功並附警告；
@@ -759,18 +842,34 @@ def open_position(symbol_base, side, entry_hint, stop, info=None, note="", stop_
         # 等部位真的出現在帳戶上再掛條件單。
         # 幣安的成交與部位更新之間有延遲，太早掛 closePosition=true 的單會被拒，
         # 錯誤訊息是「TIF GTE can only be used with open positions」。
-        actual_qty, actual_entry = wait_position(sym, qty, side=side, base=base)
-        if base > 0:
-            # 交易所的 entryPrice 是合併過的均價；這張單自己的成交價看回應
-            try:
-                avg = float((entry_res or {}).get("avgPrice") or 0)
-            except (TypeError, ValueError):
-                avg = 0.0
-            actual_entry = avg or None
+        exec_qty = oc["executed"] if (oc["final"] and (oc["executed"] or 0) > 0) else None
+        actual_qty, actual_entry = wait_position(sym, qty, side=side, base=base, min_qty=exec_qty)
+        entry_note = None
+        if oc["avg"] <= 0 and (oc["executed"] or 0) > 0:
+            _fq, favg = _order_fill_avg(sym, oc["orderId"])       # r42：均價缺漏時從成交明細算
+            if favg:
+                oc["avg"] = favg
+        if oc["avg"] > 0:
+            # 這張單自己的成交均價（第 15 條：RESULT、查單、或成交明細）；有基準時交易所的 entryPrice 是合併過的
+            actual_entry = oc["avg"]
+        elif base > 0:
+            actual_entry = None
+            entry_note = "進場成交價查不到（回應、查單、成交明細都沒有），出場位階暫用標記價估計；這筆損益記未知"
         if actual_qty <= 0:
             # pending 留著：之後部位若出現，對帳會認領並補掛停損
             return {"ok": False, "error": "進場單已送出，但 6 秒內查不到部位；已記為待認領，下一輪對帳會自動接手"}
-        qty = actual_qty
+        # 第 15 條：真實數量用成交的，不用送出的。交易所給了最終成交量就用它；
+        # 給不了（查不到最終狀態）才用部位增加的量，並記警告。
+        step_ = (info or {}).get("step") or 0
+        if exec_qty is not None:
+            if abs(actual_qty - exec_qty) > max(step_ * 0.5, 1e-9):
+                errs_pre = f"成交量 {exec_qty:g} 與部位增加量 {actual_qty:g} 不一致，以成交量為準"
+                base_warn = errs_pre
+            qty = exec_qty
+        else:
+            base_warn = f"進場單最終成交狀態確認不了（{oc['status'] or '沒有狀態'}），數量以部位增加量 {actual_qty:g} 為準" \
+                        + (f"；{oc['note']}" if oc["note"] else "")
+            qty = actual_qty
         if actual_entry:
             px = actual_entry            # 用實際成交均價重算出場位階
             exits = plan_exits(px, stop, side)
@@ -800,12 +899,16 @@ def open_position(symbol_base, side, entry_hint, stop, info=None, note="", stop_
                     "orders": [], "opened": int(time.time() * 1000), "note": note,
                     "warnings": [f"進場瞬間已穿過停損，市價平倉被拒：{cwhy}"], "base": base}
                 STATE["pending"].pop(sym, None)
+                if _close_partial.get(sym):
+                    STATE["positions"][sym]["closePartial"] = True    # 第 15 條：跨重啟也要知道出場價不能只看最後一張
                 _set_pending_close(STATE["positions"][sym], "進場瞬間已穿過停損", cwhy)
                 save_state()
                 _notify("⚠ 進場後平倉失敗，部位仍在", f"{sym} 下單瞬間已穿過預定停損 {stop_px:g}，市價平倉被拒：{cwhy}\n"
                                                   f"已記入帳上，守衛會嘗試補掛停損。")
                 return {"ok": False, "filled": True, "error": f"進場瞬間穿過停損，平倉被拒：{cwhy}"}
             STATE["pending"].pop(sym, None)
+            _last_close_fill.pop(sym, None)       # 沒有結帳，不留給下一筆同幣的部位用（第 15 條對照時發現）
+            _close_partial.pop(sym, None)
             save_state()
             return {"ok": False, "error": (
                 f"下單瞬間價格已越過預定停損（現價 {live:g}，停損 {stop_px:g}），"
@@ -820,8 +923,10 @@ def open_position(symbol_base, side, entry_hint, stop, info=None, note="", stop_
             "symbol": sym, "side": side, "qty": qty, "qty0": qty, "entry": px,
             "stop": stop_px, "exits": exits, "sizing": detail,
             "orders": sub, "opened": int(time.time() * 1000),
-            "note": note, "warnings": errs + ([base_warn] if base_warn else []),
+            "note": note, "warnings": errs + ([base_warn] if base_warn else []) + ([entry_note] if entry_note else []),
         }
+        if entry_note:
+            pos["entryUnverified"] = True             # r42：進場價是估的，結帳時損益記未知
         STATE["positions"][sym] = pos
         STATE["pending"].pop(sym, None)
         try:
@@ -835,7 +940,7 @@ def open_position(symbol_base, side, entry_hint, stop, info=None, note="", stop_
         if st2 != 200:
             errs.append(f"停損掛單失敗：{r2.get('msg') or r2}")
             # 沒有停損就不留倉
-            closed, cwhy = _market_close(sym, side, qty, base)
+            closed, cwhy = _market_close(sym, side, qty, base, pos=pos)
             if closed is not True:
                 pos["warnings"].append(f"停損掛不上，市價平倉也被拒：{cwhy}")
                 _set_pending_close(pos, "停損掛不上", cwhy)
@@ -844,6 +949,8 @@ def open_position(symbol_base, side, entry_hint, stop, info=None, note="", stop_
                                                 f"部位保留在帳上，守衛會繼續補掛停損。")
                 return {"ok": False, "filled": True, "error": "；".join(errs) + f"　平倉也被拒：{cwhy}"}
             STATE["positions"].pop(sym, None)     # 沒掛上停損就平掉，不列入績效（跟以前一致）
+            _last_close_fill.pop(sym, None)       # 沒有結帳，不留給下一筆同幣的部位用
+            _close_partial.pop(sym, None)
             save_state()
             return {"ok": False, "error": "；".join(errs) + "　已立即平倉，避免無停損部位"}
         sub.append({"type": "STOP_MARKET", "id": r2.get("algoId") or r2.get("orderId"),
@@ -992,6 +1099,8 @@ def auto_can_trade(symbol):
         return False, AUTO["blocked"]
     if AUTO["opened"] >= AUTO["maxPerDay"]:
         return False, f"今日已開 {AUTO['opened']} 筆，達上限"
+    if STATE.get("loadError"):
+        return False, "持倉紀錄還沒載入（狀態檔讀不到），暫停開新倉"
     # r13：pending 期間同幣不能再下單，持倉數也要算 pending
     if symbol in (STATE.get("pending") or {}):
         return False, "這檔剛送出進場單、還在等交易所確認，不重複下單"
@@ -1045,7 +1154,9 @@ def _live_qty(symbol, side):
     return _live_row(symbol, side)[0]
 
 
-_last_close_fill = {}          # symbol → 我們自己平倉單的實際成交均價（_market_close 成功時寫入）
+_last_close_fill = {}
+FILLS_PAGE = 1000              # userTrades 一頁上限
+FILLS_MAX_PAGES = 10          # symbol → 我們自己平倉單的實際成交均價（_market_close 成功時寫入）
 
 
 def _close_fills(sym, pos, qty_needed=None):
@@ -1067,9 +1178,23 @@ def _close_fills(sym, pos, qty_needed=None):
             # 0 或缺值不能當界線：從頭查起，這個幣歷史上所有的平倉成交都會被算進來——那是算錯，不是未知（r34）
             return None, None, None
         q_params = {"symbol": sym, "startTime": int(since), "limit": 100}
-    st, d = _request("GET", "/fapi/v1/userTrades", q_params, signed=True)
-    if st != 200 or not isinstance(d, list):
-        return None, None, None
+    # 分頁拿完（r37）：只拿一頁時，界線之後的平倉成交掉了幾筆，程式照樣用剩下的算出「確定的」錯數字。
+    # 第一頁之後一律改用 fromId（上一頁最後一筆 id＋1）往後查；超過頁數上限記未知。
+    q_params = dict(q_params, limit=FILLS_PAGE)
+    d = []
+    for _page in range(FILLS_MAX_PAGES):
+        st, page = _request("GET", "/fapi/v1/userTrades", q_params, signed=True)
+        if st != 200 or not isinstance(page, list):
+            return None, None, None
+        d += page
+        if len(page) < FILLS_PAGE:
+            break
+        ids_ = [x.get("id") for x in page if isinstance(x.get("id"), int)]
+        if not ids_:
+            return None, None, None
+        q_params = {"symbol": sym, "fromId": max(ids_) + 1, "limit": FILLS_PAGE}
+    else:
+        return None, None, None                      # 頁數上限內拿不完：記未知，不拿部分當全部
     close_side = "SELL" if pos.get("side") == "LONG" else "BUY"
     rows = [x for x in d if x.get("side") == close_side
             and (x.get("positionSide") or "BOTH") in ("BOTH", pos.get("side"))]
@@ -1113,19 +1238,25 @@ def _exit_price(sym, pos):
     """出場價：先用我們自己平倉單的成交均價，否則查成交明細；都沒有就回 None（損益記未知）。
     以前是「標記價，查不到再用進場價」——用進場價時損益剛好是 0，是把未知包裝成已知（第 8 條 r28）。"""
     avg = _last_close_fill.pop(sym, None)
-    if isinstance(avg, (int, float)) and avg > 0:
+    partial = bool(pos.get("closePartial")) or _close_partial.pop(sym, False)
+    if isinstance(avg, (int, float)) and avg > 0 and not partial:
         return avg
     _q, px, _t = _close_fills(sym, pos, qty_needed=pos.get("qty"))
     return px
 
 
-def _market_close(symbol, side, qty, base=0.0):
+_close_partial = {}           # symbol → 平倉單只成交一部分（出場價不能只用最後一張單的均價，第 15 條）
+
+
+def _market_close(symbol, side, qty, base=0.0, pos=None):
     """市價平倉，回傳 (結果, 說明)。結果：True 已確認平掉／False 沒平掉／"gone" 送單前那一側就已經不在。
 
     - 送單前先確認自己那一側還在（第 7 條 r13）：已經不在（例如剛被停損）就不送單、交給對帳；
       單向共用帳號裡同側還有別人的部位時，送出去會把別人的平掉。
     - 只平自己的數量：交易所這一側 − 送單前的基準（第 3 條 r14）。
     - 送單結果一定要看（第 8 條）：回應非成功時再查一次；查不到當成沒平掉，確認沒了才算平掉。
+    - **HTTP 200 不等於平掉**（第 15 條）：True 只在「交易所說 FILLED 且成交量＝送出量」或「再查部位確認沒了」時回傳。
+      呼叫端拿到 True 就會撤停損、結帳——把「交易所收下了」當成 True，部位還在、停損卻撤了。
     """
     live = _live_qty(symbol, side)
     if live is None:
@@ -1137,16 +1268,33 @@ def _market_close(symbol, side, qty, base=0.0):
     close_side = "SELL" if side == "LONG" else "BUY"
     st, d = _request("POST", "/fapi/v1/order", {
         "symbol": symbol, "side": close_side, "type": "MARKET",
-        "quantity": q, **_reduce(side),
+        "quantity": q, "newOrderRespType": "RESULT", **_reduce(side),
     }, signed=True)
     if st == 200:
-        try:
-            avg = float((d or {}).get("avgPrice") or 0) if isinstance(d, dict) else 0.0
-        except (TypeError, ValueError):
-            avg = 0.0
-        if avg > 0:
-            _last_close_fill[symbol] = avg            # 這張單的實際成交均價（r28：出場價只用實際成交價）
-        return True, (None if q == qty else f"帳上 {qty:g}、交易所自己的 {own:g}，以實際數量平倉")
+        oc = _settle_market(symbol, d)
+        ex_q = oc["executed"] or 0.0
+        step = (_filters.get(symbol) or {}).get("step") or 0
+        tol = max(step * 0.5, 1e-9)
+        partial_before = bool((pos or {}).get("closePartial")) or _close_partial.get(symbol)
+        if oc["status"] == "FILLED" and ex_q >= q - tol:
+            if oc["avg"] <= 0:
+                _fq, favg = _order_fill_avg(symbol, oc["orderId"])   # r42：均價缺漏時從成交明細算
+                oc["avg"] = favg or 0.0
+            if oc["avg"] > 0 and not partial_before:
+                _last_close_fill[symbol] = oc["avg"]      # 這張單的實際成交均價（r28：出場價只用實際成交價）
+            return True, (None if q == qty else f"帳上 {qty:g}、交易所自己的 {own:g}，以實際數量平倉")
+        # 交易所沒說「全部成交」：不能當成平掉。再查部位——確實沒了才算（例如同時被停損觸發）
+        desc = f"平倉單回 {oc['status'] or '沒有狀態'}、成交 {ex_q:g}／{q:g}" + (f"（{oc['note']}）" if oc["note"] else "")
+        if ex_q > 0:
+            _close_partial[symbol] = True
+            if pos is not None:
+                pos["closePartial"] = True
+        after = _live_qty(symbol, side)
+        if after is None:
+            return False, f"{desc}；再查部位也失敗，當成沒平掉"
+        if after - (base or 0) <= tol:
+            return True, f"{desc}，但交易所上已無自己的部位"
+        return False, f"{desc}，交易所上仍有自己的 {after - (base or 0):g}，當成沒平掉"
     why = str((d or {}).get("msg") or (d or {}).get("error") if isinstance(d, dict) else d)[:100]
     after = _live_qty(symbol, side)
     if after is None:
@@ -1215,7 +1363,7 @@ def retry_pending_closes():
             pc = pos.get("pendingClose")
             if not pc:
                 continue
-            closed, why = _market_close(sym, pos["side"], pos["qty"], pos.get("base") or 0)
+            closed, why = _market_close(sym, pos["side"], pos["qty"], pos.get("base") or 0, pos=pos)
             if closed == "gone":
                 events.append({"symbol": sym, "action": "gone"})     # 交給對帳記帳
                 continue
@@ -1266,7 +1414,7 @@ def _close_position_impl(symbol, reason="手動平倉"):
     if not CFG["dryRun"]:
         if pos.get("pendingClose"):
             return {"ok": False, "symbol": symbol, "error": "這筆已在待平倉、每輪重試中"}
-        closed, why = _market_close(symbol, pos["side"], pos["qty"], pos.get("base") or 0)
+        closed, why = _market_close(symbol, pos["side"], pos["qty"], pos.get("base") or 0, pos=pos)
         if closed == "gone":
             # 第 7 條 r13：那一側已經不在（多半剛被停損）→ 不送單、不動帳，交給對帳
             return {"ok": False, "symbol": symbol, "error": f"{why}，不送平倉單，交給對帳處理"}
@@ -1287,6 +1435,9 @@ def cancel_orphan(symbol, algo_id):
     """
     if not symbol or not algo_id:
         return {"ok": False, "error": "缺少 symbol 或 algoId"}
+    if STATE.get("loadError"):
+        # r40：帳沒載入時分不出哪些單是自己部位的，不能判定孤兒
+        return {"ok": False, "error": "持倉紀錄還沒載入，無法判斷是不是孤兒單，不撤"}
     for p in STATE["positions"].values():
         for o in p.get("orders") or []:
             if str(o.get("id")) == str(algo_id):
@@ -1461,7 +1612,7 @@ def record_close(pos, exit_px, reason):
         sgn = 1 if pos.get("side") == "LONG" else -1
         parts = pos.get("partials") or []
         qty0 = pos.get("qty0") or pos.get("qty") or 0
-        if exit_px is None or any(p.get("pnl") is None for p in parts):
+        if exit_px is None or pos.get("entryUnverified") or any(p.get("pnl") is None for p in parts):
             # 出場價或某一段部分出場的成交價查不到：整筆損益未知（第 8 條 r28）。
             # 這是正常的未知，不是程式出錯，不告警；以前未知那段會被 `or 0` 當成 0 加總。
             pnl_r, rmult = None, None
@@ -1594,6 +1745,9 @@ def sync_positions():
     """跟幣安對帳：本地記著但交易所已無部位的，代表被停損或停利成交了。"""
     if CFG["dryRun"]:
         return {"closed": []}
+    if STATE.get("loadError"):
+        # r40：帳還沒載入，不動帳，並講明（以前手動對帳回「無異動」，看起來像對過了）
+        return {"error": "持倉紀錄還沒載入（狀態檔讀不到），無法對帳"}
     st, d = _request("GET", "/fapi/v2/positionRisk", signed=True)
     if st != 200 or not isinstance(d, list):
         return {"error": "對帳失敗"}
@@ -2006,7 +2160,7 @@ def _guard_one(sym, pos, events):
         # 價格又在錯的那一邊。直接走平倉流程（看結果，失敗就待平倉）；不看 guardClose 設定。
         # 這條路徑送單時交易所上本來就沒有停損（正是不見了才要補），沒辦法先掛回去，只能盡快出場。
         _missing_streak[sym] = 0
-        closed, cwhy = _market_close(sym, pos["side"], pos["qty"], pos.get("base") or 0)
+        closed, cwhy = _market_close(sym, pos["side"], pos["qty"], pos.get("base") or 0, pos=pos)
         if closed is True:
             px = _exit_price(sym, pos)
             _replace_fails.pop(sym, None)
@@ -2041,7 +2195,7 @@ def _guard_one(sym, pos, events):
 
     # 到這裡：連續三輪確認不在、補掛失敗、且失敗原因不是「已存在」
     if CFG.get("guardClose") and not pos.get("pendingClose"):   # 原則 4；待平倉期間只讓重試路徑送單
-        closed, cwhy = _market_close(sym, pos["side"], pos["qty"], pos.get("base") or 0)
+        closed, cwhy = _market_close(sym, pos["side"], pos["qty"], pos.get("base") or 0, pos=pos)
         if closed is True:
             px = _exit_price(sym, pos)
             record_close(pos, px, "停損單遺失且無法補掛，強制平倉")
@@ -2193,7 +2347,7 @@ def move_to_breakeven(pos, mark, force=False, reason=None):
         pos["orders"].append({"type": "STOP_MARKET", "id": r2.get("algoId") or r2.get("orderId"),
                               "px": old, "via": ep2})
     if code == -2021:
-        closed, cwhy = _market_close(sym, pos["side"], pos["qty"], pos.get("base") or 0)
+        closed, cwhy = _market_close(sym, pos["side"], pos["qty"], pos.get("base") or 0, pos=pos)
         if closed is True:
             px = _exit_price(sym, pos)
             record_close(pos, px, "移損到成本時價格已穿過成本，直接出場")
@@ -2326,8 +2480,15 @@ def set_excluded(trade_id, excluded):
 def save_state():
     if not STATE_FILE:
         return
+    target = STATE_FILE
+    if STATE.get("loadError"):
+        # 讀取失敗期間不覆寫原檔：否則下一次重試會「成功」讀到一份空白的狀態（r37）。
+        # r40：這段期間的狀態（例如網頁改的設定）寫到旁邊的 .unloaded 留作對照，不是靜靜丟掉
+        target = f"{STATE_FILE}.unloaded"
+    tmp = f"{target}.tmp"
     try:
-        with open(STATE_FILE, "w") as f:
+        # 先寫暫存檔再換名：直接覆蓋寫，寫到一半當機就會留下壞檔（r37）
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump({"state": {k: STATE.get(k) for k in ("enabled", "pending", "positions", "trades",
                                                            "lastNet", "leftovers")},
                        "missed": MISSED, "conflicts": CONFLICTS,
@@ -2335,6 +2496,9 @@ def save_state():
                        # 金鑰與網路別刻意不存：金鑰只該在環境變數，
                        # 網路別只該由啟動參數決定，避免存檔把正式網狀態帶回來
                        "cfg": {k: CFG[k] for k in PERSIST_CFG}}, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, target)
     except Exception as e:
         # 以前是 except: pass——存檔失敗完全沒有訊息。狀態檔是成交界線、待平倉、pending 能跨重啟的唯一依據
         _pos_step_error("存檔", "狀態檔", e)
@@ -2357,20 +2521,34 @@ def state_path(cache_dir, live):
     return p
 
 
-def load_state(path):
+def load_state(path, _retry=False):
+    """讀狀態檔。回傳 (ok, 錯誤)。第 8 條 r37、r38：「讀取失敗」與「沒有資料」不能是同一個結果。
+
+    - 檔案不存在：全新開始，(True, None)。
+    - 其他讀取或解析失敗：壞檔另存一份、記錯誤、推播；這段期間**暫停開新倉**、**不覆寫原檔**，
+      每輪重試讀取（retry_load_state），讀到了發恢復通知。以前是 except: pass——靜靜回到空白，
+      持倉、成交界線、待平倉、pending 全部消失，第一次存檔就把壞檔蓋掉、連證據都沒了。
+    - 先全部解析到暫存，全部成功才一次換上，不留半套狀態。
+    """
     global STATE_FILE
     STATE_FILE = path
     try:
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             d = json.load(f)
+    except FileNotFoundError as e:
+        if STATE.get("loadError"):
+            # r40：讀取失敗期間原檔不見了（被搬走、改名），不能當成「全新開始」——那是假恢復，
+            # 交易所上的部位會被當成別人的、接著照常開新倉。要全新開始就放一份空白的 {} 進去。
+            return _load_failed(path, RuntimeError(f"讀取失敗期間狀態檔不見了（{type(e).__name__}）；"
+                                                    "確定要全新開始請放一份內容為 {} 的檔案"), True)
+        STATE["loadError"] = None
+        return True, None
+    except Exception as e:
+        return _load_failed(path, e, _retry)
+    try:
         st = d.get("state", d)          # 相容舊格式
-        STATE["enabled"] = st.get("enabled", False)
-        STATE["positions"] = st.get("positions", {})
-        STATE["trades"] = st.get("trades", [])
-        STATE["lastNet"] = st.get("lastNet")
-        STATE["pending"] = st.get("pending") or {}
-        STATE["leftovers"] = st.get("leftovers") or []
-        for i, t in enumerate(STATE["trades"]):
+        trades = [dict(t) for t in (st.get("trades") or [])]
+        for i, t in enumerate(trades):
             if not t.get("id"):
                 t["id"] = f"{t.get('symbol', 'X')}-{t.get('closed') or i}"
             t.setdefault("excluded", False)
@@ -2382,16 +2560,56 @@ def load_state(path):
                 t["rMultiple"] = round(float(t["rMultiple"]), 2)
             if t.get("pnl") is not None:
                 t["pnl"] = round(float(t["pnl"]), 4)
-        for k, v in (d.get("auto") or {}).items():
-            if k in AUTO:
-                AUTO[k] = v
-        for k, v in (d.get("cfg") or {}).items():
-            if k in PERSIST_CFG and v is not None:
-                CFG[k] = v
-        MISSED[:] = d.get("missed") or []
-        CONFLICTS[:] = d.get("conflicts") or []
-    except Exception:
-        pass
+        new_state = {"enabled": st.get("enabled", False), "positions": st.get("positions") or {},
+                     "trades": trades, "lastNet": st.get("lastNet"),
+                     "pending": st.get("pending") or {}, "leftovers": st.get("leftovers") or []}
+        new_auto = {k: v for k, v in (d.get("auto") or {}).items() if k in AUTO}
+        new_cfg = {k: v for k, v in (d.get("cfg") or {}).items() if k in PERSIST_CFG and v is not None}
+        missed, conflicts = list(d.get("missed") or []), list(d.get("conflicts") or [])
+    except Exception as e:
+        return _load_failed(path, e, _retry)
+    was = STATE.get("loadError")
+    STATE.update(new_state)
+    AUTO.update(new_auto)
+    CFG.update(new_cfg)
+    MISSED[:] = missed
+    CONFLICTS[:] = conflicts
+    STATE["loadError"] = None
+    if was:
+        _notify("狀態檔已讀到，恢復開新倉", f"{path}\n（已補上：先前讀取失敗 {was.get('attempts', 1)} 次）")
+    return True, None
+
+
+def _load_failed(path, e, retry):
+    err = f"{type(e).__name__}: {str(e)[:150]}"
+    le = STATE.get("loadError") or {}
+    if not retry or not le:
+        backup = None
+        try:
+            import shutil
+            backup = f"{path}.bad-{int(time.time())}"
+            shutil.copyfile(path, backup)          # 複製，不是改名：原檔留在原路徑（r40：改名後原路徑空了＝假恢復）
+        except Exception:
+            backup = None
+        le = {"path": path, "error": err, "backup": backup, "since": int(time.time() * 1000), "attempts": 0}
+    le["attempts"] = le.get("attempts", 0) + 1
+    le["error"] = err
+    STATE["loadError"] = le
+    sys.stderr.write(f"  ! 狀態檔讀取失敗（第 {le['attempts']} 次）：{err}\n")
+    if alert_due(le["attempts"]):
+        _notify(f"⚠ 狀態檔讀不到，暫停開新倉（第 {le['attempts']} 次）",
+                f"{path}\n{err}\n壞檔已另存：{le.get('backup') or '另存失敗'}\n"
+                f"持倉紀錄還沒載入：不開新倉、不覆寫原檔，交易所上的部位請先到幣安確認。每輪重試讀取。")
+    return False, err
+
+
+def retry_load_state():
+    """讀取失敗期間每輪重試（例如人工把狀態檔修好或還原）。回傳原因。"""
+    le = STATE.get("loadError")
+    if not le:
+        return "loaded"
+    ok, _err = load_state(le["path"], _retry=True)
+    return "loaded" if ok else "still_failed"
 
 
 def configure(**kw):

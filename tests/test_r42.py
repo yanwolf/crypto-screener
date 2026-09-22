@@ -164,7 +164,7 @@ def _():
     if "XUSDT" in T.STATE["positions"]:
         return "剩下的平掉了卻沒有結帳"
     sells = [f for f in ex.fills if f["side"] == "SELL"]
-    need(len(sells) == 2, f"平倉成交應為兩筆（前提），實際 {len(sells)}")
+    need(len(sells) >= 2, f"平倉成交應至少兩筆（前提），實際 {len(sells)}")
     want = sum(float(f["qty"]) * float(f["price"]) for f in sells) / sum(float(f["qty"]) for f in sells)
     if not T.STATE["trades"]:
         return "沒有平倉紀錄"

@@ -14,7 +14,7 @@ import os
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-FILES = ["test_r11.py", "test_r14.py", "test_r17.py", "test_r20.py", "test_r23.py", "test_r26.py", "test_r29.py", "test_r32.py", "test_r35.py", "test_r38.py", "test_r42.py"]
+FILES = ["test_r11.py", "test_r14.py", "test_r17.py", "test_r20.py", "test_r23.py", "test_r26.py", "test_r29.py", "test_r32.py", "test_r35.py", "test_r38.py", "test_r42.py", "test_r46.py"]
 STATEY = ("STATE", "positions", "pending", "leftovers", ".pos", "ex.algo")
 
 
@@ -34,6 +34,10 @@ def negative(cond, src):
         parts = [negative(v, src) for v in cond.values]
         return all(parts) if isinstance(cond.op, ast.Or) else any(parts)
     if isinstance(cond, ast.UnaryOp) and isinstance(cond.op, ast.Not):
+        # 第 25 種（r44 pump-dump-hunter）：if not all(…)——清單是空的時 all() 成立，這條永遠不失敗 → 藏起來的否定句
+        o = cond.operand
+        if isinstance(o, ast.Call) and isinstance(o.func, ast.Name) and o.func.id == "all":
+            return True
         return False                                  # if not X：要求 X 發生 → 正向
     if isinstance(cond, (ast.Call, ast.Name, ast.Attribute, ast.Subscript)):
         return True                                   # if X：要求 X 沒發生 → 否定
@@ -98,6 +102,8 @@ SELFTEST = [
     ("need(True, 'p')\n    if stops_sent(ex, n0):\n        return 'x'", False),  # 有前提
     ("if len(market_calls(ex)) != n0:\n        return 'x'", True),
     ("if len(booked) != 1:\n        return 'x'", False),
+    ("if not all(p['r'] for p in posts(ex)):\n        return 'x'", True),     # 第 25 種：空清單時 all() 成立
+    ("need(posts(ex), 'p')\n    if not all(p['r'] for p in posts(ex)):\n        return 'x'", False),  # 先確認非空
 ]
 
 

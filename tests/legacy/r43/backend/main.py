@@ -44,6 +44,7 @@ import hashlib
 import http.server
 import socket
 import json
+import math
 import os
 import socketserver
 import smtplib
@@ -192,6 +193,91 @@ NOTIFY = {"tg_token": "", "tg_chat": "", "discord": "",
 #  全程不需要使用者自己查 chat id，權杖也不會經過瀏覽器儲存
 # ════════════════════════════════════════════════════════════
 _tg = {"token": "", "bot": "", "chats": [], "offset": 0}
+
+
+# ── 推播錯誤區與設定檔錯誤（BINANCE_LESSONS 第 8 條 r39、r40、r41）──────
+# 推播失敗、沒有任何推播管道、設定檔讀寫失敗，都寫進這裡：只寫清單與日誌，不拿鎖、不再推播
+# （推播本身壞掉時再推播會遞迴；拿鎖可能死鎖，r37）。/api/trade/status 與自檢都列出來。
+NOTIFY_ERR = {"errors": [], "unconfigured": False}
+CONF_ERR = {}                 # 設定檔名 → {"error", "loadFailed", "backup", "saveFails"}
+
+
+def _notify_err(msg):
+    NOTIFY_ERR["errors"].append({"ts": int(time.time() * 1000), "msg": str(msg)[:200]})
+    del NOTIFY_ERR["errors"][:-50]
+    sys.stderr.write(f"  ! 推播失敗：{str(msg)[:160]}\n")
+
+
+def notify_channels():
+    """目前設定了哪些推播管道（名稱清單）。"""
+    out = []
+    if _tg["token"] and _tg["chats"]:
+        out.append("Telegram")
+    if NOTIFY["discord"]:
+        out.append("Discord")
+    if NOTIFY["smtp_host"] and NOTIFY["mail_to"]:
+        out.append("電子郵件")
+    return out
+
+
+def _conf_load(label, path, apply_fn):
+    """讀設定檔（telegram.json、monitor.json）。r40：讀取失敗不能靜靜回到預設——
+    Telegram 設定讀不到時，之後所有告警完全沒送出也沒有紀錄。檔案不存在才是「沒有設定」。
+    失敗時壞檔複製一份（原檔留著）、記錯誤區、之後存檔不覆寫原檔（寫到 .unloaded）。"""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        if not isinstance(d, dict):
+            raise ValueError(f"內容不是物件：{type(d).__name__}")
+    except FileNotFoundError:
+        CONF_ERR.pop(label, None)
+        return True
+    except Exception as e:
+        backup = None
+        try:
+            import shutil
+            backup = f"{path}.bad-{int(time.time())}"
+            shutil.copyfile(path, backup)
+        except Exception:
+            backup = None
+        CONF_ERR[label] = {"error": f"{type(e).__name__}: {str(e)[:150]}", "loadFailed": True,
+                           "backup": backup, "saveFails": 0}
+        _notify_err(f"{label} 讀不到（{type(e).__name__}: {str(e)[:100]}），壞檔另存 {backup or '失敗'}；"
+                    f"這段期間的變更寫到 .unloaded，不覆寫原檔")
+        return False
+    apply_fn(d)
+    CONF_ERR.pop(label, None)
+    return True
+
+
+def _conf_save(label, path, data):
+    """寫設定檔：先寫暫存檔再換名；讀取失敗期間寫 .unloaded。失敗照節奏推播、恢復時通知（r41）。"""
+    ce = CONF_ERR.get(label) or {}
+    target = f"{path}.unloaded" if ce.get("loadFailed") else path
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        tmp = f"{target}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        os.replace(tmp, target)
+    except Exception as e:
+        ce = CONF_ERR.setdefault(label, {"loadFailed": False, "saveFails": 0})
+        ce["saveFails"] = ce.get("saveFails", 0) + 1
+        ce["saveError"] = f"{type(e).__name__}: {str(e)[:150]}"
+        n = ce["saveFails"]
+        sys.stderr.write(f"  ! {label} 存檔失敗（第 {n} 次）：{ce['saveError']}\n")
+        due = trader.alert_due(n) if trader else n in (1, 5, 30)
+        if due:
+            push_all(f"⚠ 設定存檔失敗（第 {n} 次）", f"{label}：{ce['saveError']}\n網頁上的變更目前只在記憶體裡，重啟就會不見。")
+        return False
+    n = ce.get("saveFails", 0)
+    if n:
+        ce["saveFails"] = 0
+        ce.pop("saveError", None)
+        if not ce.get("loadFailed"):
+            CONF_ERR.pop(label, None)
+        push_all("設定存檔恢復", f"{label}（已補上：先前存檔失敗 {n} 次）")
+    return True
 _tg_lock = threading.Lock()
 _pending = {}          # code -> {"ts": float, "chat": dict|None}
 
@@ -201,11 +287,7 @@ def tg_file():
 
 
 def tg_load():
-    try:
-        with open(tg_file(), "r") as f:
-            _tg.update(json.load(f))
-    except Exception:
-        pass
+    _conf_load("telegram.json", tg_file(), _tg.update)
     if not _tg["token"] and NOTIFY["tg_token"]:
         _tg["token"] = NOTIFY["tg_token"]          # 環境變數設定的權杖
     if NOTIFY["tg_chat"] and not any(c["id"] == NOTIFY["tg_chat"] for c in _tg["chats"]):
@@ -213,12 +295,7 @@ def tg_load():
 
 
 def tg_save():
-    try:
-        os.makedirs(CACHE_DIR, exist_ok=True)
-        with open(tg_file(), "w") as f:
-            json.dump(_tg, f)
-    except Exception:
-        pass
+    return _conf_save("telegram.json", tg_file(), dict(_tg))
 
 
 def tg_api(method, params=None, timeout=30):
@@ -354,6 +431,31 @@ except Exception:
     trader = None
     preflight = None
 
+
+def _preflight_notify(add):
+    """自檢項目（第 8 條 r40、r41）：推播管道沒設定、推播失敗、設定檔讀寫失敗都要列出來。"""
+    ch = notify_channels()
+    errs = NOTIFY_ERR["errors"]
+    if not ch:
+        add("推播管道", "fail", "沒有設定任何推播管道（Telegram／Discord／電子郵件）：所有告警只寫在日誌", 8)
+    elif errs:
+        last = errs[-1]
+        add("推播管道", "warn", f"{'、'.join(ch)}；最近 {len(errs)} 筆推播失敗，最後一筆：{last['msg'][:120]}", 8)
+    else:
+        add("推播管道", "ok", "、".join(ch), 8)
+    for label, ce in CONF_ERR.items():
+        if ce.get("loadFailed"):
+            add(f"設定檔 {label}", "fail", f"讀不到：{ce.get('error')}；壞檔另存 {ce.get('backup') or '—'}，"
+                                           f"這段期間的變更寫到 .unloaded", 8)
+        if ce.get("saveFails"):
+            add(f"設定檔 {label}", "warn", f"存檔連續失敗 {ce['saveFails']} 次：{ce.get('saveError')}", 8)
+
+
+if preflight is not None:
+    # 重新載入模組（測試）時不重複登記
+    preflight.EXTRA[:] = [f for f in preflight.EXTRA if getattr(f, "__name__", "") != "_preflight_notify"]
+    preflight.EXTRA.append(_preflight_notify)
+
 MON = {"on": False, "watch": [], "cfg": None, "states": {}, "scope": "watch", "topN": 100,
        "history": [], "lastRun": None, "lastCount": 0, "lastError": None,
        "histTTL": 12, "maxRefresh": 8, "lastRefreshed": 0, "callsToday": 0}
@@ -365,22 +467,14 @@ def mon_file():
 
 
 def mon_load():
-    try:
-        with open(mon_file(), "r") as f:
-            MON.update(json.load(f))
-    except Exception:
-        pass
+    _conf_load("monitor.json", mon_file(), MON.update)
 
 
 def mon_save():
-    try:
-        os.makedirs(CACHE_DIR, exist_ok=True)
-        with open(mon_file(), "w") as f:
-            json.dump({k: MON[k] for k in ("on", "watch", "cfg", "states", "history",
+    return _conf_save("monitor.json", mon_file(),
+                      {k: MON[k] for k in ("on", "watch", "cfg", "states", "history",
                                            "lastRun", "lastCount", "scope", "topN",
-                                           "histTTL", "maxRefresh", "callsToday")}, f)
-    except Exception:
-        pass
+                                           "histTTL", "maxRefresh", "callsToday")})
 
 
 def mon_fetch_json(path):
@@ -519,8 +613,15 @@ def push_all(title, text):
     for fn in (notify_telegram, notify_discord, notify_email):
         try:
             fn(title, text)
-        except Exception:
-            pass
+        except Exception as e:
+            # 以前 except: pass——推播失敗完全沒有訊息。寫錯誤區（不再推播，避免遞迴；也不經過任何鎖）
+            _notify_err(f"{getattr(fn, '__name__', fn)}：{type(e).__name__}: {str(e)[:120]}")
+    # r40：一個管道都沒設定時，以前每則告警都靜靜消失。記一次（恢復設定後重新計）
+    if notify_channels():
+        NOTIFY_ERR["unconfigured"] = False
+    elif not NOTIFY_ERR["unconfigured"]:
+        NOTIFY_ERR["unconfigured"] = True
+        _notify_err(f"沒有設定任何推播管道（Telegram／Discord／電子郵件），告警只寫在日誌：{title}")
 
 
 def mon_run_once():
@@ -820,6 +921,8 @@ def position_round(every_s=20):
     if not trader:
         return
     trader.CFG["positionPoll"] = every_s
+    if trader.STATE.get("loadError"):
+        _step("重試讀取狀態檔", trader.retry_load_state)      # 第 8 條 r38：讀不到時每輪重試
     try:
         if trader.STATE["positions"] or trader.STATE.get("pending"):
             before = len(trader.STATE["trades"])
@@ -946,6 +1049,76 @@ def monitor_worker(interval_min):
 
 
 
+def validate_fields(payload, spec, meta=("adminKey", "admin")):
+    """整批驗證（BINANCE_LESSONS 第 8 條 r40、r41）：回傳 (要套用的值, 不合法的欄位說明)。
+    有任何一個不合法，呼叫端就整批不套用、回報是哪幾個欄位。以前一邊迴圈一邊套用：
+    值轉型失敗就 continue 跳過、超出範圍就悄悄夾到邊界，其他欄位照套、畫面顯示成功。
+    spec：欄位 → (類型, 下限或選項, 上限)；類型 float／int／bool／enum。欄位名稱與值都要驗。"""
+    kw, bad = {}, []
+    for k, v in (payload or {}).items():
+        if k in meta:
+            continue
+        if k not in spec:
+            bad.append(f"{k}（不認得的欄位）")
+            continue
+        kind, lo, hi = spec[k]
+        if kind == "enum":
+            if isinstance(v, str) and v in lo:
+                kw[k] = v
+            else:
+                bad.append(f"{k}={v!r}（只能是 {'／'.join(lo)}）")
+            continue
+        if kind == "bool":
+            if v in (True, False, 0, 1, "0", "1", "true", "false"):
+                kw[k] = v in (True, 1, "1", "true")
+            else:
+                bad.append(f"{k}={v!r}（只能是 0／1）")
+            continue
+        if isinstance(v, bool) or v is None:
+            bad.append(f"{k}={v!r}（要是數字）")
+            continue
+        try:
+            x = float(v)
+        except (TypeError, ValueError):
+            bad.append(f"{k}={v!r}（要是數字）")
+            continue
+        if not math.isfinite(x):
+            bad.append(f"{k}={v!r}（要是有限的數字）")
+            continue
+        if kind == "int" and x != int(x):
+            bad.append(f"{k}={v!r}（要是整數）")
+            continue
+        if not (lo <= x <= hi):
+            bad.append(f"{k}={v!r}（範圍 {lo:g}～{hi:g}）")
+            continue
+        kw[k] = int(x) if kind == "int" else x
+    return kw, bad
+
+
+TRADE_CFG_SPEC = {
+    "riskPct": ("float", 0.1, 5.0), "maxPositions": ("int", 1, 20), "leverage": ("int", 1, 20),
+    "stopAtrMult": ("float", 0.5, 5.0), "tp1R": ("float", 1.0, 10.0), "tp1Portion": ("float", 0.0, 1.0),
+    "trailCallback": ("float", 0.1, 10.0), "trailActivateR": ("float", 0.5, 10.0),
+    "trailR": ("float", 0.0, 3.0), "breakevenR": ("float", 0.0, 5.0), "guardClose": ("bool", 0, 1),
+    "maxStopPct": ("float", 3.0, 25.0), "minStopPct": ("float", 0.5, 5.0), "conflictTighten": ("bool", 0, 1),
+    "usablePct": ("float", 20.0, 100.0), "useTier": ("bool", 0, 1),
+    "stopMode": ("enum", ("ma", "atr", "tighter"), None),
+}
+AUTO_SPEC = {
+    "on": ("bool", 0, 1), "maxPerDay": ("int", 1, 50), "cooldownMin": ("int", 0, 1440),
+    "cooldownWinMin": ("int", 0, 1440), "minScore": ("int", 0, 100), "dailyLossR": ("float", -20.0, 20.0),
+}
+MON_SPEC = {
+    "watch": ("list", None, None), "scope": ("enum", ("top", "watch"), None), "topN": ("int", 10, 250),
+    "histTTL": ("float", 2, 72), "maxRefresh": ("int", 0, 50), "cfg": ("dict", None, None), "on": ("bool", 0, 1),
+}
+
+
+def _invalid(bad):
+    return 400, {"ok": False, "invalid": bad,
+                 "error": "設定沒有套用（有不合法的值，整批不套用）：" + "、".join(bad)}
+
+
 def trade_handle_safe(path, payload):
     """網頁交易操作（手動開倉、平倉、撤孤兒單…）的外層：第 8 條 r23。
     請求處理也是另一條執行緒，例外穿出去時網頁只看到連線中斷、沒有推播。"""
@@ -976,6 +1149,8 @@ def trade_handle(path, payload):
         }
         st["poll"] = float(os.environ.get("POSITION_POLL", 20))
         st["readiness"] = live_readiness()
+        st["notify"] = {"channels": notify_channels(), "errors": NOTIFY_ERR["errors"][-10:],
+                        "confErrors": {k: dict(v) for k, v in CONF_ERR.items()}}
         return 200, st
 
     if path == "/api/trade/check":
@@ -1012,24 +1187,14 @@ def trade_handle(path, payload):
         return (200 if r.get("ok") else 400), r
 
     if path == "/api/trade/config":
-        limits = {"riskPct": (0.1, 5.0), "maxPositions": (1, 20), "leverage": (1, 20),
-                  "stopAtrMult": (0.5, 5.0), "tp1R": (1.0, 10.0), "tp1Portion": (0.0, 1.0),
-                  "trailCallback": (0.1, 10.0), "trailActivateR": (0.5, 10.0),
-                  "trailR": (0.0, 3.0), "breakevenR": (0.0, 5.0), "guardClose": (0, 1),
-                  "maxStopPct": (3.0, 25.0), "minStopPct": (0.5, 5.0), "conflictTighten": (0, 1),
-                  "usablePct": (20.0, 100.0), "useTier": (0, 1)}
-        kw = {}
-        for k, (lo, hi) in limits.items():
-            if k in payload:
-                try:
-                    v = float(payload[k])
-                except (TypeError, ValueError):
-                    continue
-                v = max(lo, min(hi, v))
-                kw[k] = bool(v) if k in ("guardClose", "conflictTighten", "useTier") else int(v) if k in ("maxPositions", "leverage") else v
-        if payload.get("stopMode") in ("ma", "atr", "tighter"):
-            kw["stopMode"] = payload["stopMode"]
-        return 200, {"cfg": trader.configure(**kw)}
+        kw, bad = validate_fields(payload, TRADE_CFG_SPEC)
+        if bad:
+            return _invalid(bad)
+        out = {"ok": True, "cfg": trader.configure(**kw)}
+        if trader.STATE.get("loadError"):
+            out["warning"] = ("持倉紀錄還沒載入：這次的設定只寫到旁邊的 .unloaded，"
+                              "狀態檔讀到之後會以狀態檔裡的設定為準")
+        return 200, out
 
     if path == "/api/trade/exclude":
         tid = str(payload.get("id", ""))
@@ -1049,17 +1214,21 @@ def trade_handle(path, payload):
         return 200, st
 
     if path == "/api/trade/auto":
-        if "on" in payload:
-            trader.AUTO["on"] = bool(payload["on"])
+        # r40：以前 on 先套用、後面的 int() 丟例外——自動下單已經打開，其他欄位沒套用，網頁看到 500
+        kw, bad = validate_fields(payload, AUTO_SPEC)
+        if "dailyLossR" in kw and kw["dailyLossR"] == 0:
+            bad.append("dailyLossR=0（當日停損上限不能是 0）")
+        if bad:
+            return _invalid(bad)
+        if "on" in kw:
+            trader.AUTO["on"] = kw.pop("on")
             if trader.AUTO["on"]:
                 trader.AUTO["blocked"] = None      # 手動重啟時解除當日封鎖
-        for k in ("maxPerDay", "cooldownMin", "cooldownWinMin", "minScore"):
-            if k in payload:
-                trader.AUTO[k] = int(payload[k])
-        if "dailyLossR" in payload:
-            trader.AUTO["dailyLossR"] = -abs(float(payload["dailyLossR"]))
+        if "dailyLossR" in kw:
+            kw["dailyLossR"] = -abs(kw["dailyLossR"])
+        trader.AUTO.update(kw)
         trader.save_state()
-        return 200, {"auto": trader.status()["auto"]}
+        return 200, {"ok": True, "auto": trader.status()["auto"]}
 
     if path == "/api/trade/enable":
         trader.STATE["enabled"] = bool(payload.get("on"))
@@ -1103,24 +1272,29 @@ def mon_handle(path, payload):
     if path == "/api/monitor/config":
         if not tg_admin_ok(payload):
             return 403, {"error": "admin_key_required"}
+        # r40、r41：先整批驗證，全部合法才一次套用（以前一邊套用一邊轉型，中途出錯留下半套）
+        spec = {k: v for k, v in MON_SPEC.items() if v[0] not in ("list", "dict")}
+        kw, bad = validate_fields({k: v for k, v in payload.items() if k not in ("watch", "cfg")}, spec)
+        if "watch" in payload:
+            if isinstance(payload["watch"], list):
+                kw["watch"] = [str(x) for x in payload["watch"]][:250]
+            else:
+                bad.append(f"watch（要是清單，收到 {type(payload['watch']).__name__}）")
+        if "cfg" in payload:
+            if isinstance(payload["cfg"], dict):
+                kw["cfg"] = payload["cfg"]
+            else:
+                bad.append(f"cfg（要是物件，收到 {type(payload['cfg']).__name__}）")
+        if bad:
+            return _invalid(bad)
         with _mon_lock:
-            if "watch" in payload:
-                MON["watch"] = [str(x) for x in payload["watch"]][:250]
-            if "scope" in payload:
-                MON["scope"] = "top" if payload["scope"] == "top" else "watch"
-            if "topN" in payload:
-                MON["topN"] = max(10, min(250, int(payload["topN"])))
-            if "histTTL" in payload:
-                MON["histTTL"] = max(2, min(72, float(payload["histTTL"])))
-            if "maxRefresh" in payload:
-                MON["maxRefresh"] = max(0, min(50, int(payload["maxRefresh"])))
-            if "cfg" in payload:
-                MON["cfg"] = payload["cfg"]
-            if "on" in payload:
-                MON["on"] = bool(payload["on"])
-            mon_save()
-        return 200, {"ok": True, "on": MON["on"], "watch": len(MON["watch"]),
-                     "scope": MON["scope"], "topN": MON["topN"]}
+            MON.update(kw)
+            saved = mon_save()
+        out = {"ok": True, "on": MON["on"], "watch": len(MON["watch"]),
+               "scope": MON["scope"], "topN": MON["topN"]}
+        if not saved:
+            out["warning"] = "設定已套用，但存檔失敗，重啟後會不見（已記錄並推播）"
+        return 200, out
     if path == "/api/monitor/history":
         return 200, {"history": MON["history"][:200]}
     if path == "/api/monitor/run":
@@ -1411,14 +1585,16 @@ def cleanup_worker(every_h=6):
 
 def notify_telegram(title, text):
     if not (_tg["token"] and _tg["chats"]):
-        return None
+        return None                       # 沒設定：push_all 會記一次「沒有任何推播管道」
     sent = 0
     for c in list(_tg["chats"]):
         try:
             tg_api("sendMessage", {"chat_id": c["id"], "text": f"{title}\n{text}"}, timeout=20)
             sent += 1
-        except Exception:
-            pass
+        except Exception as e:
+            # r41 對照時發現：r39 只在 push_all 外層接例外，這裡每個聊天室各自 except: pass——
+            # Telegram 權杖錯、網路斷時錯誤根本傳不出去（r39 的測試把整個 notify_telegram 換掉，測不到這層）
+            _notify_err(f"Telegram 聊天室 {c.get('id')}：{type(e).__name__}: {str(e)[:120]}")
     return f"Telegram×{sent}" if sent else None
 
 

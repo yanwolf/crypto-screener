@@ -15,7 +15,22 @@ import time
 
 import trader as T
 
-VERSION = "2026-09-21r36"        # 與 BINANCE_LESSONS.md 最上面的版本一致
+VERSION = "2026-09-22r43"        # 與 BINANCE_LESSONS.md 最上面的版本一致
+EXTRA = []                         # 其他模組登記的本機檢查：fn(add)（main 的推播管道、設定檔，第 8 條 r40）
+
+
+def check_order_outcome():
+    """第 15 條：市價單「收下 ≠ 成交」。這項沒辦法向交易所驗證（要真的送單），
+    這裡只驗程式的判讀本身：用固定的人造回應確認 NEW／成交 0 不會被當成成交。回傳錯誤說明或 None。"""
+    cases = [({"status": "NEW", "executedQty": "0", "avgPrice": "0.00", "orderId": 1}, False, 0.0),
+             ({"status": "FILLED", "executedQty": "5", "avgPrice": "1.2", "orderId": 2}, True, 5.0),
+             ({"status": "EXPIRED", "executedQty": "2", "avgPrice": "1.2", "orderId": 3}, True, 2.0),
+             ({"orderId": 4}, False, None)]
+    for resp, final, ex in cases:
+        o = T.order_outcome(resp)
+        if o["final"] != final or o["executed"] != ex:
+            return f"{resp} 判讀成 final={o['final']}、成交 {o['executed']}（應為 {final}、{ex}）"
+    return None
 
 
 def _msg(d):
@@ -31,6 +46,19 @@ def check():
     def add(item, st, msg="", lesson=None):
         out.append({"item": item, "status": st, "msg": str(msg)[:220], "lesson": lesson})
         return st
+
+    # 第 15 條：市價單回應的判讀（本機、不送單；送單行為靠 tests/test_r42.py）
+    try:
+        e15 = check_order_outcome()
+        add("市價單成交判讀", "fail" if e15 else "ok",
+            e15 or "NEW／成交 0 不當成成交；平倉只在 FILLED 且成交量足夠、或確認部位沒了才撤停損", 15)
+    except Exception as e:
+        add("市價單成交判讀", "fail", f"{type(e).__name__}: {e}", 15)
+    for fn in EXTRA:
+        try:
+            fn(add)
+        except Exception as e:
+            add("本機檢查", "fail", f"{getattr(fn, '__name__', fn)}：{type(e).__name__}: {e}")
 
     # 第 4 條：精度過濾器拿不到，下單會噴 -1111
     try:
@@ -101,6 +129,9 @@ def check():
         "無" if not stale else f"{'、'.join(stale)} 送單超過 2 分鐘仍未記帳", 3)
 
     # 帳上有、交易所沒有；交易所有、帳上沒有
+    if T.STATE.get("loadError"):
+        le = T.STATE["loadError"]
+        add("持倉紀錄", "fail", f"持倉紀錄還沒載入，無法對帳（{le.get('error')}；壞檔另存於 {le.get('backup') or '—'}）", 8)
     mine = set(T.STATE.get("positions") or {})
     ghost = mine - live_syms if st == 200 else set()
     extra = live_syms - mine if st == 200 else set()
