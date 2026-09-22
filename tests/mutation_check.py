@@ -18,10 +18,16 @@ import sys
 import tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SUITES = ["test_r11", "test_r14", "test_r17", "test_r20", "test_r23", "test_r26", "test_r29", "test_r32", "test_r35", "test_r38", "test_r42", "test_r46", "test_r49", "test_r52", "test_r55", "test_r58"]
-# (測試檔, 項目) → (類別, 引用的項目, 理由)。目前沒有需要人工豁免的項目：
-# 突變下仍通過的全部是命中 0 次（自動判定無關）。
-EXEMPT = {}
+SUITES = ["test_r11", "test_r14", "test_r17", "test_r20", "test_r23", "test_r26", "test_r29", "test_r32", "test_r35", "test_r38", "test_r42", "test_r46", "test_r49", "test_r52", "test_r55", "test_r58", "test_r60"]
+# (測試檔, 項目) → (類別, 引用的項目, 理由)。
+EXEMPT = {
+    # r60：「某一步查不到」的直接測試——突變本身就是「逐幣查不到」，跟注入的情況相同，預期結果一樣（不送、不撤）。
+    # 引用同一步「查得到時照常運作」的那一項，它在突變下必須失敗（證明突變確實打到這一步）。
+    ("test_r60", "q-8"): ("對照組", ("test_r42", "15-1"),
+                          "開倉前查基準部位查不到 → 不送；突變就是查不到。引用「開倉照常送單」"),
+    ("test_r60", "q-14"): ("對照組", ("test_r60", "q-14b"),
+                           "撤孤兒單前查部位查不到 → 不撤；突變就是查不到。引用「查得到、沒部位 → 撤掉」"),
+}
 CRASHES = {}                        # 突變下測試本身崩掉的項目（r35）
 
 
@@ -96,6 +102,9 @@ def selftest():
     return wrong
 
 
+WHERE = {}                     # (suite, tag) → 突變下失敗在「前提」或「行為」
+
+
 def run(suite, mutate):
     env = dict(os.environ)
     log = None
@@ -108,6 +117,10 @@ def run(suite, mutate):
     out = subprocess.run([sys.executable, "-m", f"tests.{suite}"], cwd=ROOT, env=env,
                          capture_output=True, text=True, encoding="utf-8", errors="replace").stdout
     res = {(suite, m.group(2)): m.group(1) == "✓" for m in re.finditer(r"^([✓✕]) \[([^\]]+)\]", out, re.M)}
+    if mutate:
+        # r60 gold-scalper：失敗分兩類——失敗在前提（只證明對被突變的查詢敏感）與失敗在要測的行為
+        for m in re.finditer(r"^✕ \[([^\]]+)\][^\n]*\n\s+→ (.*)$", out, re.M):
+            WHERE[(suite, m.group(1))] = "前提" if m.group(2).startswith("前提不成立") else "行為"
     if mutate:
         for tag, why in parse_crashes(out):
             CRASHES[(suite, tag)] = why
@@ -140,7 +153,8 @@ def main():
         mutated.update(m)
         hits.update(h)
         failed = sum(1 for k, ok in m.items() if not ok)
-        print(f"  {s}：突變下 {failed} 項明確失敗、{len(m) - failed} 項通過")
+        pre = sum(1 for k, ok in m.items() if not ok and WHERE.get(k) == "前提")
+        print(f"  {s}：突變下 {failed} 項明確失敗（失敗在前提 {pre}、失敗在行為 {failed - pre}）、{len(m) - failed} 項通過")
     bad, auto = evaluate(normal, mutated, hits, EXEMPT)
     # r35：突變下「測試本身崩掉」＝那一項後面的斷言全部沒檢查，要補前提讓它如實報失敗
     for key, why in sorted(CRASHES.items()):

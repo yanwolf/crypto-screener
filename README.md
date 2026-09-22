@@ -19,7 +19,7 @@ frontend/   Vite + React，建置輸出單一 index.html
     App.jsx      狀態擁有者，分頁透過狀態袋 s 取用
   scripts/   smoke.js（jsdom 掛載並走訪全部分頁）、xval.js（交叉驗證）
 scripts/    check_fields.py、check_locals.py、xval.py、patch.py（找不到就報錯的取代、整批 apply）、check_returns.py（回傳原因的語法樹檢查）
-tests/      test_parity.py（出場位階一致性，第 11 條）、test_lessons.py（第 2、7、8、13 條情境）、test_r11.py、test_r14.py、test_r17.py、test_r20.py、test_r23.py、test_r26.py、test_r29.py、test_r32.py、test_r35.py、test_r38.py、test_r42.py、test_r46.py、test_r49.py、test_r52.py、test_r55.py、test_r58.py（逐段檢查項目）、check_indexing.py（先索引沒先確認）、run_on_legacy.py 與 legacy/（舊版程式，只留最近兩版，比對用）、harness.py（共用案例框架）、check_tests.py、mutation_check.py（測試本身的檢查）、fake_exchange.py（共用模擬交易所）
+tests/      test_parity.py（出場位階一致性，第 11 條）、test_lessons.py（第 2、7、8、13 條情境）、test_r11.py、test_r14.py、test_r17.py、test_r20.py、test_r23.py、test_r26.py、test_r29.py、test_r32.py、test_r35.py、test_r38.py、test_r42.py、test_r46.py、test_r49.py、test_r52.py、test_r55.py、test_r58.py、test_r60.py（逐段檢查項目）、check_indexing.py（先索引沒先確認）、run_on_legacy.py 與 legacy/（舊版程式，只留最近兩版，比對用）、harness.py（共用案例框架）、check_tests.py、mutation_check.py（測試本身的檢查）、fake_exchange.py（共用模擬交易所）
 BINANCE_LESSONS.md  三個幣安專案共用的踩坑清單，版本日期必須一致
 Dockerfile  多階段：node 建前端 → python:slim 只帶建好的 HTML
 verify.sh   打包前完整驗證

@@ -446,6 +446,7 @@ class Ex42(Ex17):
     def __init__(self, mode="oneway"):
         super().__init__(mode)
         self.market_new = {}
+        self.fail_when = None                # r60：只讓某一步查不到——fn(method, path, params) 回 True 就回 500（只在那一刻）
         self.pause = None                    # r48：{"path", "thread", "arrived": Event, "go": Event}——指定執行緒第一次打這個路徑時停住
         self.drop_avg = False                # r42：回應與查單都沒有 avgPrice（gold-scalper 2026-09-22 實單的樣子）
         self.later_after = 3
@@ -480,6 +481,11 @@ class Ex42(Ex17):
                     o.update(status="EXPIRED")
 
     def _handle(self, method, path, params, signed, timeout):
+        fw = self.fail_when
+        if fw and method == "GET" and fw(method, path, dict(params or {})):
+            self.calls.append((method, path, dict(params or {})))
+            self._inject(f"查不到（{path}）", path, params or {})
+            return 500, {"code": -1000, "msg": "注入：查不到"}
         pz = self.pause
         if pz and not pz.get("done") and path == pz["path"] and threading.current_thread().name == pz["thread"]:
             # 背景那條停在「查交易所」：另一條執行緒這時候做網頁操作（r48 的交錯）
