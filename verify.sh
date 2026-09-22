@@ -103,6 +103,9 @@ python3 -m tests.test_r49
 echo "── 20d. r50→r52 逐段檢查項目（交錯測試的對照組、拿鎖前讀的部位）──"
 python3 -m tests.test_r52
 
+echo "── 20e. r53→r55 逐段檢查項目（交易所端重開、平倉送單前確認）──"
+python3 -m tests.test_r55
+
 echo "── 21. 測試本身與工具的檢查（用法第 5 點、第 14 條）──"
 python3 -m tests.check_indexing        # 先索引、沒先確認有東西（r35）
 # 現在的測試跑 tests/legacy/ 下每一版舊程式：測試本身崩掉要是 0（r35、r36；r41 gold-scalper：自動跑每一版）

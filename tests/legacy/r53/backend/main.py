@@ -403,7 +403,11 @@ def tg_handle(path, payload):
     if path == "/api/tg/unpair":
         if not tg_admin_ok(payload):
             return 403, {"error": "admin_key_required"}
-        cid = str(payload.get("id", ""))
+        cid = str(payload.get("id", "")).strip()
+        if not cid:
+            return 400, {"error": "沒有指定要解除的聊天室，什麼都沒改"}        # r47、r48：空的不回成功
+        if cid not in [str(c.get("id")) for c in _tg["chats"]]:
+            return 404, {"error": f"沒有這個聊天室：{cid}"}
         with _tg_lock:
             _tg["chats"] = [c for c in _tg["chats"] if c["id"] != cid]
             tg_save()
@@ -1126,11 +1130,40 @@ def _invalid(bad):
                  "error": "設定沒有套用（有不合法的值，整批不套用）：" + "、".join(bad)}
 
 
+ENGINE_WAIT = 10.0          # 網頁交易操作等引擎鎖的上限（秒），拿不到就回「背景正在處理」（第 8 條 r48）
+TRADE_UNLOCKED = ("/api/trade/check", "/api/trade/preflight")   # 只查交易所、不動帳本，不必等背景那輪
+
+
+def _trade_locked(path, payload):
+    """網頁交易操作拿引擎鎖再做（第 8 條 r48）：背景的對帳／出場管理／守衛正在查交易所時，
+    手動平倉、改設定不能插進去。等 ENGINE_WAIT 秒拿不到就回 503，不讓請求一直掛著。
+    狀態頁只等 2 秒，拿不到就不拿鎖讀一份（讀的途中帳本被改動就重讀），並標記 engineBusy。"""
+    if trader is None or path in TRADE_UNLOCKED:
+        return trade_handle(path, payload)
+    status = path == "/api/trade/status"
+    try:
+        with trader.engine_wait(2.0 if status else ENGINE_WAIT), trader.engine_section():
+            return trade_handle(path, payload)
+    except trader.EngineBusy:
+        if not status:
+            return 503, {"ok": False, "busy": True,
+                         "error": "背景正在處理部位（對帳、移損或守衛），這次操作沒有執行，請稍後再試"}
+    for i in range(3):
+        try:
+            code, body = trade_handle(path, payload)
+            if isinstance(body, dict):
+                body["engineBusy"] = True
+            return code, body
+        except RuntimeError:                  # 讀的途中帳本被背景改動（dictionary changed size…）
+            time.sleep(0.2)
+    return 503, {"ok": False, "busy": True, "error": "背景正在處理部位，狀態稍後更新"}
+
+
 def trade_handle_safe(path, payload):
     """網頁交易操作（手動開倉、平倉、撤孤兒單…）的外層：第 8 條 r23。
     請求處理也是另一條執行緒，例外穿出去時網頁只看到連線中斷、沒有推播。"""
     try:
-        return trade_handle(path, payload)
+        return _trade_locked(path, payload)
     except Exception as e:
         sys.stderr.write(f"  ! 網頁交易操作 {path} 出錯：{type(e).__name__}: {e}\n")
         push_all("⚠ 網頁交易操作出錯", f"{path}\n{type(e).__name__}: {str(e)[:150]}")
@@ -1294,10 +1327,15 @@ def mon_handle(path, payload):
             else:
                 bad.append(f"watch（要是清單，收到 {type(payload['watch']).__name__}）")
         if "cfg" in payload:
-            if isinstance(payload["cfg"], dict):
-                kw["cfg"] = payload["cfg"]
+            c = payload["cfg"]
+            # r48：空的 cfg 會讓背景監控靜靜停掉（mon_run_once 看到空設定就不跑）、缺 bull／bear 會讓評分整輪丟例外——
+            # 任何 bug 讓設定沒帶到都等於「清空全部」。要清掉監控用 on=0，不是送空的 cfg
+            if not isinstance(c, dict):
+                bad.append(f"cfg（要是物件，收到 {type(c).__name__}）")
+            elif not all(isinstance(c.get(s), dict) and c.get(s) for s in ("bull", "bear")):
+                bad.append("cfg（要有非空的 bull 與 bear 兩組條件；要停用監控請關閉開關）")
             else:
-                bad.append(f"cfg（要是物件，收到 {type(payload['cfg']).__name__}）")
+                kw["cfg"] = c
         if bad:
             return _invalid(bad)
         with _mon_lock:
