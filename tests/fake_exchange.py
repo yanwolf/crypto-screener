@@ -446,6 +446,7 @@ class Ex42(Ex17):
     def __init__(self, mode="oneway"):
         super().__init__(mode)
         self.market_new = {}
+        self.before = None                   # r62：每個請求處理前先呼叫 fn(method, path, params)（模擬「查詢那一刻交易所端發生了事」）
         self.fail_when = None                # r60：只讓某一步查不到——fn(method, path, params) 回 True 就回 500（只在那一刻）
         self.pause = None                    # r48：{"path", "thread", "arrived": Event, "go": Event}——指定執行緒第一次打這個路徑時停住
         self.drop_avg = False                # r42：回應與查單都沒有 avgPrice（gold-scalper 2026-09-22 實單的樣子）
@@ -481,6 +482,8 @@ class Ex42(Ex17):
                     o.update(status="EXPIRED")
 
     def _handle(self, method, path, params, signed, timeout):
+        if self.before:
+            self.before(method, path, dict(params or {}))
         fw = self.fail_when
         if fw and method == "GET" and fw(method, path, dict(params or {})):
             self.calls.append((method, path, dict(params or {})))

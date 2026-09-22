@@ -1338,7 +1338,8 @@ def _market_close(symbol, side, qty, base=0.0, pos=None):
         return False, "查不到部位，為安全起見不送平倉單"
     own = live - (base or 0)
     if own <= 1e-12:
-        return "gone", "這一側已經沒有自己的部位"
+        # r62：按平倉時帳上還在、送單前確認這一刻才發現沒了——多半是停損剛觸發；照實寫，出場價交給對帳查成交明細
+        return "gone", "送單前確認：交易所這一側已經沒有自己的部位（可能是停損剛觸發）"
     if pos is not None:
         # 第 8 條 r54、r55：每條平倉路徑送單前的確認都在這裡，均價比對也加在這裡
         rc = reopen_check(pos, avg)

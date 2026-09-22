@@ -6,6 +6,8 @@
    「程式什麼都沒做時條件也不成立」的斷言就是否定句（例如 `if stops_sent(...)`：沒送才通過）。
    一個案例裡**所有**失敗分支都是否定句時，程式什麼都沒做整個案例就會通過 → 必須有 need(...) 前提。
    組合條件：`if A or B` 要求 A、B 都不成立，全部否定才算否定；`if A and B` 任一否定就算。
+3. 第 26 種（r63 gold-scalper 的規則）：fresh() 把 save_state 換成不寫檔的假函式；案例若檢查狀態檔在磁碟上的結果
+   （STATE_FILE、.unloaded、明確呼叫 save_state()），必須用 fresh(keep_save=True)，否則在檢查一個被 mock 掉的東西。
 
     python3 -m tests.check_tests
 """
@@ -14,7 +16,7 @@ import os
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-FILES = ["test_r11.py", "test_r14.py", "test_r17.py", "test_r20.py", "test_r23.py", "test_r26.py", "test_r29.py", "test_r32.py", "test_r35.py", "test_r38.py", "test_r42.py", "test_r46.py", "test_r49.py", "test_r52.py", "test_r55.py", "test_r58.py", "test_r60.py"]
+FILES = ["test_r11.py", "test_r14.py", "test_r17.py", "test_r20.py", "test_r23.py", "test_r26.py", "test_r29.py", "test_r32.py", "test_r35.py", "test_r38.py", "test_r42.py", "test_r46.py", "test_r49.py", "test_r52.py", "test_r55.py", "test_r58.py", "test_r60.py", "test_r63.py"]
 STATEY = ("STATE", "positions", "pending", "leftovers", ".pos", "ex.algo")
 
 
@@ -107,8 +109,34 @@ SELFTEST = [
 ]
 
 
+DISK_MARKS = ("STATE_FILE", ".unloaded", "save_state()", "state_path(")
+
+
+def needs_keep_save(fn, src):
+    """第 26 種：案例檢查狀態檔在磁碟上的結果，卻沒有 keep_save=True（save_state 被框架 mock 掉）。"""
+    seg = ast.get_source_segment(src, fn) or ""
+    if not any(m in seg for m in DISK_MARKS):
+        return False
+    for node in ast.walk(fn):
+        if isinstance(node, ast.Call) and getattr(node.func, "id", "") == "fresh":
+            if any(k.arg == "keep_save" and isinstance(k.value, ast.Constant) and k.value.value is True for k in node.keywords):
+                return False
+    return True
+
+
+SELFTEST_26 = [
+    ("@case('t', 'd')\ndef _():\n    ex = fresh()\n    T.save_state()\n    if not os.path.exists(T.STATE_FILE):\n        return 'x'\n", True),
+    ("@case('t', 'd')\ndef _():\n    ex = fresh(keep_save=True)\n    T.save_state()\n    if not os.path.exists(T.STATE_FILE):\n        return 'x'\n", False),
+    ("@case('t', 'd')\ndef _():\n    ex = fresh()\n    T.load_state(p)\n    if T.CFG['x'] != 1:\n        return 'x'\n", False),   # 只讀、不看磁碟
+]
+
+
 def selftest():
     wrong = []
+    for src, want in SELFTEST_26:
+        fn = next(c[2] for c in cases(src))
+        if needs_keep_save(fn, src) != want:
+            wrong.append(f"第 26 種判錯：{src.splitlines()[2].strip()} / {src.splitlines()[3].strip()}")
     for body, want in SELFTEST:
         src = f"@case('t', 'd')\ndef _():\n    ex = fresh()\n    {body}\n"
         fn = next(c[2] for c in cases(src))
@@ -133,7 +161,7 @@ def main():
         if bool(infra_touches_program(fn)) != want:
             print("✕ 檢查器自我驗證失敗：infra 規則判錯")
             return 1
-    print(f"✓ 檢查器自我驗證：{len(SELFTEST)} 組否定句＋2 組 infra 固定人造資料全部判對")
+    print(f"✓ 檢查器自我驗證：{len(SELFTEST)} 組否定句＋2 組 infra＋{len(SELFTEST_26)} 組 keep_save 固定人造資料全部判對")
     bad, total, neg = [], 0, 0
     for f in FILES:
         src = open(os.path.join(HERE, f), encoding="utf-8").read()
@@ -151,6 +179,8 @@ def main():
                 touched = infra_touches_program(fn)
                 if touched:
                     bad.append(f"{f} [{tag}] 標成 infra 卻碰了程式：{'、'.join(touched)}（不能拿這個標記繞過突變檢查）")
+            if needs_keep_save(fn, src):
+                bad.append(f"{f} [{tag}] 檢查狀態檔在磁碟上的結果，卻沒有 fresh(keep_save=True)：save_state 被框架換掉了（第 26 種）")
             br = fail_branches(fn)
             if br and all(negative(c, src) for c in br):
                 neg += 1

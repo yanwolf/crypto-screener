@@ -15,7 +15,7 @@ import time
 
 import trader as T
 
-VERSION = "2026-09-22r56"        # 與 BINANCE_LESSONS.md 最上面的版本一致
+VERSION = "2026-09-22r61"        # 與 BINANCE_LESSONS.md 最上面的版本一致
 EXTRA = []                         # 其他模組登記的本機檢查：fn(add)（main 的推播管道、設定檔，第 8 條 r40）
 
 
@@ -188,6 +188,34 @@ def check():
                                    "ours": str(o.get("algoId")) in ours} for o in orphan]
     else:
         add("孤兒條件單", "warn", f"查不到全部掛單（HTTP {st}）", 13)
+
+    # 第 8 條 r54、r56、r57：帳上成交價 vs 交易所均價。均價有出入的持倉列出來，並說明程式會怎麼處理——
+    # 兩個證據（均價不同、而且查到這筆的平倉成交）才判定重開；只有均價不同＝同一筆，照常管理。
+    rows_ = []
+    for sym, pos in sorted((T.STATE.get("positions") or {}).items()):
+        if float(pos.get("base") or 0) > 0 or pos.get("entryUnverified"):
+            rows_.append(f"{sym} 不比對（{'有基準部位，均價是合併的' if float(pos.get('base') or 0) > 0 else '帳上進場價是估的'}）")
+            continue
+        q, avg = T._live_row(sym, pos["side"])
+        if q is None:
+            rows_.append(f"{sym} 查不到部位")
+            continue
+        if q - float(pos.get("base") or 0) <= 1e-12 or not T._avg_differs(pos, avg):
+            continue
+        rc = T.reopen_check(pos, avg)
+        how = {"same": "同一筆（無平倉成交），照常管理",
+               "reopened": "別人重開（查到平倉成交），下輪對帳結帳",
+               "unknown": "判斷不了（成交明細查不到），不送單"}[rc]
+        rows_.append(f"{sym} 帳上 {pos.get('entry'):g}／交易所 {avg:g}：{how}")
+    n_pos = len(T.STATE.get("positions") or {})
+    flagged = [r for r in rows_ if "交易所" in r or "查不到部位" in r]     # 有出入、或查不到
+    if flagged:
+        add("帳上成交價與交易所均價", "warn", f"{n_pos} 筆持倉，{len(flagged)} 筆要看：" + "；".join(rows_[:8]), 8)
+        out[-1]["rows"] = rows_                  # 完整清單（訊息會被截在 220 字）
+    else:
+        add("帳上成交價與交易所均價", "ok",
+            f"{n_pos} 筆持倉都一致" + (f"（{'；'.join(rows_[:8])}）" if rows_ else ""), 8)
+        out[-1]["rows"] = rows_
 
     return out
 
