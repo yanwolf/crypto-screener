@@ -33,15 +33,18 @@ export default function TradePage({ s }) {
                   未設定 BN_KEY／BN_SECRET，只能檢查合約、無法下單
                 </span>
               )}
-              <button onClick={refreshTrade} disabled={tradeBusy} className="ml-auto px-2.5 py-1 rounded"
-                style={{ background: C.panel, border: `1px solid ${C.line}`, color: C.muted, fontSize: 11.5 }}>
-                {tradeBusy ? "…" : "重新整理"}
-              </button>
-              <button onClick={async () => { const j = await tradeCall("sync", {}); if (j && j.error) { setTradeMsg(["err", j.error]); } else if (j) { setTradeMsg(["ok", `對帳完成${j.closed?.length ? "，平倉 " + j.closed.join("、") : "，無異動"}`]); refreshTrade(); } }}
-                disabled={tradeBusy} className="px-2.5 py-1 rounded"
-                style={{ background: C.panel, border: `1px solid ${C.line}`, color: C.muted, fontSize: 11.5 }}>
-                與交易所對帳
-              </button>
+              {/* 兩顆按鈕固定成一組放第二行（手機上第一行放不下時會拆散：重新整理在第一行、對帳掉到第二行） */}
+              <div className="flex gap-2" style={{ flexBasis: "100%" }}>
+                <button onClick={refreshTrade} disabled={tradeBusy} className="px-2.5 py-1 rounded"
+                  style={{ background: C.panel, border: `1px solid ${C.line}`, color: C.muted, fontSize: 11.5 }}>
+                  {tradeBusy ? "…" : "重新整理"}
+                </button>
+                <button onClick={async () => { const j = await tradeCall("sync", {}); if (j && j.error) { setTradeMsg(["err", j.error]); } else if (j) { setTradeMsg(["ok", `對帳完成${j.closed?.length ? "，平倉 " + j.closed.join("、") : "，無異動"}`]); refreshTrade(); } }}
+                  disabled={tradeBusy} className="px-2.5 py-1 rounded"
+                  style={{ background: C.panel, border: `1px solid ${C.line}`, color: C.muted, fontSize: 11.5 }}>
+                  與交易所對帳
+                </button>
+              </div>
             </div>
 
             {/* 管理金鑰：與提醒設定共用同一組，填一次兩邊都生效 */}
