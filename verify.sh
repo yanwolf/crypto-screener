@@ -115,6 +115,9 @@ python3 -m tests.test_r60
 echo "── 20h. r61→r63 逐段檢查項目（停損剛觸發的回應、通知欄位）──"
 python3 -m tests.test_r63
 
+echo "── 20i. CoinGecko 429 讓路、行情榜不等上游 ──"
+python3 -m tests.test_cg_cooldown
+
 echo "── 21. 測試本身與工具的檢查（用法第 5 點、第 14 條）──"
 python3 -m tests.check_indexing        # 先索引、沒先確認有東西（r35）
 # 現在的測試跑 tests/legacy/ 下每一版舊程式：測試本身崩掉要是 0（r35、r36；r41 gold-scalper：自動跑每一版）
