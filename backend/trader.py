@@ -465,6 +465,8 @@ def size_position(equity, entry, stop, info, risk_pct=None, lev=None, margin_cap
 
     # 風險基準用階梯本金，不是實際餘額：同一級距內每筆的 1R 金額固定
     base = tier_capital(equity) if CFG.get("useTier", True) else equity
+    if not CFG.get("useTier", True) and (CFG.get("capitalCap") or 0) > 0:
+        base = min(float(equity), float(CFG["capitalCap"]))   # 關掉階梯時本金上限照樣生效
     out["tier"] = base
     risk_amt = base * risk_pct / 100.0
     out["riskAmt"] = risk_amt

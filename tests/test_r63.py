@@ -163,6 +163,11 @@ def _():
     q, info = T().size_position(3873, 100.0, 95.0, {"step": 0.1})
     if info.get("tier") != 1500 or abs(info.get("riskAmt") - 1500 * T().CFG["riskPct"] / 100) > 1e-6:
         return f"單筆風險基準應為 1500 U，實際 {info.get('tier')}／{info.get('riskAmt')}"
+    T().CFG["useTier"] = False
+    q2, info2 = T().size_position(3873, 100.0, 95.0, {"step": 0.1})
+    T().CFG["useTier"] = True
+    if abs(info2.get("riskAmt") - 1500 * T().CFG["riskPct"] / 100) > 1e-6:
+        return f"關掉階梯時本金上限沒生效：風險基準 {info2.get('riskAmt')}"
     if "capitalCap" not in T().PERSIST_CFG:
         return "本金上限沒有存進狀態檔（重啟就不見）"
 
