@@ -1113,7 +1113,7 @@ TRADE_CFG_SPEC = {
     "trailCallback": ("float", 0.1, 10.0), "trailActivateR": ("float", 0.5, 10.0),
     "trailR": ("float", 0.0, 3.0), "breakevenR": ("float", 0.0, 5.0), "guardClose": ("bool", 0, 1),
     "maxStopPct": ("float", 3.0, 25.0), "minStopPct": ("float", 0.5, 5.0), "conflictTighten": ("bool", 0, 1),
-    "usablePct": ("float", 20.0, 100.0), "useTier": ("bool", 0, 1),
+    "usablePct": ("float", 20.0, 100.0), "useTier": ("bool", 0, 1), "capitalCap": ("float", 0.0, 10000000.0),
     "stopMode": ("enum", ("ma", "atr", "tighter"), None),
 }
 AUTO_SPEC = {

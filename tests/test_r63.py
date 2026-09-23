@@ -143,6 +143,30 @@ def _():
         return f"正常出場的原因多寫了東西：{reason}"
 
 
+# ════ 本金上限（2026-09-23：模擬網把 3873 U 當 1500 U 跑，虧慢一點、少重置）═══
+
+@case("cap-1", "設了本金上限：階梯、可動用保證金、單筆風險都以上限為基準；設 0 回到實際餘額的階梯；設定可存可載")
+def _():
+    ex, clock = fresh()
+    need(hasattr(T(), "tier_capital") and "capitalCap" in T().CFG, "程式沒有本金上限（前提：2026-09-23 起才有）")
+    T().CFG["capitalCap"] = 0
+    need(T().tier_capital(3873) == 3000, "沒設上限時 3873 U 應落在 3000 階梯（前提）")
+    T().CFG["capitalCap"] = 1500
+    if T().tier_capital(3873) != 1500:
+        return f"設 1500 上限，階梯應為 1500，實際 {T().tier_capital(3873)}"
+    T().CFG["capitalCap"] = 500                                 # 模擬交易所錢包 1000 U：上限 500 要壓得下去
+    cs, err = T().capital_state()
+    need(cs is not None and cs["wallet"] == 1000, f"取不到本金狀態或錢包不是 1000（前提）：{cs}、{err}")
+    if cs["tier"] != 500 or abs(cs["usable"] - 375) > 1e-6:
+        return f"可動用應為 500 × 75% = 375，實際階梯 {cs['tier']}、可動用 {cs['usable']}"
+    T().CFG["capitalCap"] = 1500
+    q, info = T().size_position(3873, 100.0, 95.0, {"step": 0.1})
+    if info.get("tier") != 1500 or abs(info.get("riskAmt") - 1500 * T().CFG["riskPct"] / 100) > 1e-6:
+        return f"單筆風險基準應為 1500 U，實際 {info.get('tier')}／{info.get('riskAmt')}"
+    if "capitalCap" not in T().PERSIST_CFG:
+        return "本金上限沒有存進狀態檔（重啟就不見）"
+
+
 if __name__ == "__main__":
     fails = [r for r in RESULTS if r[2]]
     for tag, desc, err in RESULTS:

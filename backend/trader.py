@@ -69,6 +69,7 @@ CFG = {
     "conflictTighten": False,      # 反向訊號通過閘門時，把持有部位的停損拉到成本
     "useTier": True,               # 風險基準用本金階梯而非實際餘額
     "usablePct": 75,               # 保證金總額上限＝階梯本金 × 此比例
+    "capitalCap": 0,               # 本金上限（U，0 = 不設）：階梯不超過這個數。模擬網用：餘額再多也只當 1500 U 在跑，虧慢一點、少重置
     "trailActivateR": 2.0,         # 到 2R 才啟動移動停利
     "minNotional": 5.0,
     "dryRun": False,               # True 時只計算不送單，供離線驗證
@@ -78,7 +79,7 @@ CFG = {
 PERSIST_CFG = ("riskPct", "maxPositions", "leverage", "stopAtrMult",
                "tp1R", "tp1Portion", "trailCallback", "trailActivateR",
                "trailR", "breakevenR", "guardClose", "stopMode", "maxStopPct", "minStopPct",
-               "conflictTighten", "useTier", "usablePct")
+               "conflictTighten", "useTier", "usablePct", "capitalCap")
 
 _filters = {}                      # symbol → 精度與限制
 _filters_ts = 0
@@ -423,9 +424,12 @@ CAPITAL_TIERS = [500, 1000, 1500, 2000, 3000, 5000, 8000, 12000, 20000, 30000, 5
 
 
 def tier_capital(wallet):
-    """取不超過錢包餘額的最大級距；低於最小級距就用實際餘額。"""
+    """取不超過錢包餘額的最大級距；低於最小級距就用實際餘額。設了本金上限（capitalCap）就不超過它。"""
     if not wallet:
         return None
+    cap = CFG.get("capitalCap") or 0
+    if cap > 0:
+        wallet = min(float(wallet), float(cap))
     ok = [x for x in CAPITAL_TIERS if x <= wallet]
     return float(ok[-1]) if ok else float(wallet)
 
@@ -437,7 +441,7 @@ def capital_state():
         return None, err
     base = tier_capital(b["wallet"])
     usable = base * CFG.get("usablePct", 75) / 100.0
-    return {"wallet": b["wallet"], "tier": base, "usablePct": CFG.get("usablePct", 75),
+    return {"wallet": b["wallet"], "tier": base, "usablePct": CFG.get("usablePct", 75), "cap": CFG.get("capitalCap") or 0,
             "usable": round(usable, 2), "used": b["used"],
             "free": round(usable - b["used"], 2),
             "perPosCap": round(usable / max(1, CFG["maxPositions"]), 2)}, None

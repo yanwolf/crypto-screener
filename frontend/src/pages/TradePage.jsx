@@ -79,7 +79,7 @@ export default function TradePage({ s }) {
                 )}
                 {trade.capital && (
                   <span style={{ color: C.muted, fontSize: 10.5, marginLeft: "auto" }}>
-                    階梯 {trade.capital.tier.toFixed(0)} U × {trade.capital.usablePct}% ＝ 可動用 {trade.capital.usable.toFixed(0)} U，
+                    階梯 {trade.capital.tier.toFixed(0)} U{trade.capital.cap ? `（上限 ${trade.capital.cap} U）` : ""} × {trade.capital.usablePct}% ＝ 可動用 {trade.capital.usable.toFixed(0)} U，
                     剩 <span style={{ color: trade.capital.free < trade.capital.perPosCap ? C.gold : C.muted }}>{trade.capital.free.toFixed(0)} U</span>
                     　每筆上限 {trade.capital.perPosCap.toFixed(0)} U
                   </span>
@@ -474,6 +474,7 @@ export default function TradePage({ s }) {
                           ["maxPositions", "同時持倉上限", [1, 2, 3, 5, 8], "筆", trade.cfg?.maxPositions],
                           ["riskPct", "單筆風險", [0.25, 0.5, 1, 1.5, 2], "%", trade.cfg?.riskPct],
                           ["usablePct", "可動用保證金比例", [50, 60, 75, 90, 100], "%", trade.cfg?.usablePct],
+                          ["capitalCap", "本金上限（0 = 不設；模擬網用）", [0, 500, 1000, 1500, 2000, 3000], "U", trade.cfg?.capitalCap ?? 0],
                           ["stopAtrMult", "ATR 停損倍數", [1, 1.5, 2, 2.5, 3], "×ATR", trade.cfg?.stopAtrMult],
                           ["maxStopPct", "停損距離上限", [6, 8, 10, 12, 15], "%", trade.cfg?.maxStopPct],
                           ["breakevenR", "移損到成本（0 = 關閉）", [0, 0.8, 1, 1.5, 2], "R", trade.cfg?.breakevenR],
