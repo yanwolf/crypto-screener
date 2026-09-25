@@ -118,6 +118,9 @@ python3 -m tests.test_r63
 echo "── 20i. CoinGecko 429 讓路、行情榜不等上游 ──"
 python3 -m tests.test_cg_cooldown
 
+echo "── 20j. 第 15 條 r71：FILLED 沒均價、成交明細稍後才出現、背景補登 ──"
+python3 -m tests.test_r71
+
 echo "── 21. 測試本身與工具的檢查（用法第 5 點、第 14 條）──"
 python3 -m tests.check_indexing        # 先索引、沒先確認有東西（r35）
 # 現在的測試跑 tests/legacy/ 下每一版舊程式：測試本身崩掉要是 0（r35、r36；r41 gold-scalper：自動跑每一版）

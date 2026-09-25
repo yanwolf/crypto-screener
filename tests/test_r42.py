@@ -21,6 +21,7 @@ import trader as T                                              # noqa: E402
 from tests.fake_exchange import Ex42, Clock, need, entry_sent   # noqa: E402
 
 RESULTS = []
+BACKFILLS = []                                                  # fresh() 收下的背景補登工作（r71）
 from tests.harness import make_case                             # noqa: E402
 case = make_case(RESULTS)
 
@@ -29,6 +30,8 @@ def fresh(mode="oneway", keep_save=False, ex=None):
     importlib.reload(T)
     clock = Clock()
     T.time = clock
+    BACKFILLS[:] = []
+    T._start_backfill_thread = lambda fn: BACKFILLS.append(fn)     # r71：背景補登不真的開執行緒，收下來由測試自己跑
     if not keep_save:
         T.save_state = lambda: None
     T.CFG.update({"key": "k", "secret": "s", "dryRun": False, "leverage": 3, "riskPct": 0.5,

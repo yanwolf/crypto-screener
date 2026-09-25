@@ -700,17 +700,25 @@ def _fnum(v):
 
 def order_outcome(resp):
     """純函式：從下單／查單回應讀出成交結果（自檢也用它）。
-    回傳 {status, executed, avg, final, orderId}；executed 讀不到是 None（不是 0，也不是送出的數量）。"""
+    回傳 {status, executed, avg, final, orderId}；executed 讀不到是 None（不是 0，也不是送出的數量）。
+    第 15 條 r71：avgPrice 缺或是 0 時，成交額 ÷ 成交量（cumQuote ÷ executedQty）就是實際均價，不是估算。"""
     d = resp if isinstance(resp, dict) else {}
     status = str(d.get("status") or "").upper()
+    ex = _fnum(d.get("executedQty"))
     avg = _fnum(d.get("avgPrice")) or 0.0
-    return {"status": status, "executed": _fnum(d.get("executedQty")), "avg": avg if avg > 0 else 0.0,
+    if avg <= 0 and ex and ex > 0:
+        cq = _fnum(d.get("cumQuote"))
+        if cq and cq > 0:
+            avg = cq / ex
+    return {"status": status, "executed": ex, "avg": avg if avg > 0 else 0.0,
             "final": status in FINAL_STATUS, "orderId": d.get("orderId")}
 
 
-def _order_fill_avg(sym, order_id):
+def _order_fill_avg(sym, order_id, qty_needed=None):
     """第 15 條 r42：回應沒有均價時，用那張單號在成交明細裡的成交算加權均價（實際成交價，不是估算）。
-    回傳 (成交量, 均價)；查不到回 (None, None)——記未知，不猜。"""
+    回傳 (成交量, 均價)；查不到回 (None, None)——記未知，不猜。
+    r71：成交明細是非同步寫入的，剛成交時可能只出現前幾筆——qty_needed 給了就要湊滿，沒湊滿當成還查不到
+    （只出現前幾筆就拿來算，得到的是前半段的價格，還會被當成真實成交價，比未知更糟）。"""
     if order_id is None:
         return None, None
     st, d = _request("GET", "/fapi/v1/userTrades", {"symbol": sym, "orderId": order_id}, signed=True)
@@ -720,7 +728,33 @@ def _order_fill_avg(sym, order_id):
     q = sum(_fnum(x.get("qty")) or 0 for x in rows)
     if q <= 0:
         return None, None
+    if qty_needed is not None and q < float(qty_needed) * 0.99:
+        sys.stderr.write(f"  ! {sym} 單號 {order_id} 成交明細只出現 {q:g}／{qty_needed:g}，還沒湊滿，先當成查不到\n")
+        return None, None
     return q, sum((_fnum(x.get("qty")) or 0) * (_fnum(x.get("price")) or 0) for x in rows) / q
+
+
+def _requery_avg(sym, oc, tries=3, gap=0.5):
+    """FILLED 但沒有均價（r71：帶了 RESULT 也會發生、時有時無）：用單號再查訂單幾次，每次結果寫日誌；
+    仍沒有就查成交明細（要湊滿成交量）。回傳均價或 0。次數有上限——單已經成交，不能為了一個價格卡住流程。"""
+    oid = oc.get("orderId")
+    ex = oc.get("executed") or 0
+    if oid is None or ex <= 0:
+        return 0.0
+    for i in range(tries):
+        time.sleep(gap)
+        st, d = _request("GET", "/fapi/v1/order", {"symbol": sym, "orderId": oid}, signed=True)
+        o = order_outcome(d) if st == 200 else {"avg": 0.0}
+        if o["avg"] > 0:
+            sys.stderr.write(f"  · {sym} 單號 {oid} 第 {i + 1} 次重查訂單拿到均價 {o['avg']:g}\n")
+            return o["avg"]
+        sys.stderr.write(f"  ! {sym} 單號 {oid} 第 {i + 1} 次重查訂單仍沒有均價（HTTP {st}，{str(d)[:120]}）\n")
+    _q, favg = _order_fill_avg(sym, oid, qty_needed=ex)
+    if favg:
+        sys.stderr.write(f"  · {sym} 單號 {oid} 成交明細算出均價 {favg:g}\n")
+        return favg
+    sys.stderr.write(f"  ! {sym} 單號 {oid} 成交明細也查不到（或沒湊滿）：先記未知，排背景補登\n")
+    return 0.0
 
 
 def _settle_market(sym, resp, tries=8, gap=0.5):
@@ -921,15 +955,14 @@ def open_position(symbol_base, side, entry_hint, stop, info=None, note="", stop_
         actual_qty, actual_entry = wait_position(sym, qty, side=side, base=base, min_qty=exec_qty)
         entry_note = None
         if oc["avg"] <= 0 and (oc["executed"] or 0) > 0:
-            _fq, favg = _order_fill_avg(sym, oc["orderId"])       # r42：均價缺漏時從成交明細算
-            if favg:
-                oc["avg"] = favg
+            oc["avg"] = _requery_avg(sym, oc)                     # r42、r71：重查訂單幾次、再查成交明細（要湊滿）
         if oc["avg"] > 0:
             # 這張單自己的成交均價（第 15 條：RESULT、查單、或成交明細）；有基準時交易所的 entryPrice 是合併過的
             actual_entry = oc["avg"]
         elif base > 0:
             actual_entry = None
-            entry_note = "進場成交價查不到（回應、查單、成交明細都沒有），出場位階暫用標記價估計；這筆損益記未知"
+            entry_note = (f"進場成交價查不到（回應、查單、成交明細都沒有；單號 {oc['orderId']}），"
+                          f"出場位階暫用標記價估計；這筆損益記未知，背景會再查幾次補登")
         if actual_qty <= 0:
             # pending 留著：之後部位若出現，對帳會認領並補掛停損
             return {"ok": False, "error": "進場單已送出，但 6 秒內查不到部位；已記為待認領，下一輪對帳會自動接手"}
@@ -1002,6 +1035,8 @@ def open_position(symbol_base, side, entry_hint, stop, info=None, note="", stop_
         }
         if entry_note:
             pos["entryUnverified"] = True             # r42：進場價是估的，結帳時損益記未知
+            schedule_backfill({"kind": "open", "symbol": sym, "orderId": oc["orderId"], "qty": qty,
+                               "opened": pos.get("opened"), "side": side})
         STATE["positions"][sym] = pos
         STATE["pending"].pop(sym, None)
         try:
@@ -1327,6 +1362,7 @@ def _exit_price(sym, pos):
 
 
 _close_partial = {}           # symbol → 平倉單只成交一部分（出場價不能只用最後一張單的均價，第 15 條）
+_last_close_order = {}        # symbol → (單號, 數量)：平倉單 FILLED 但均價當下查不到，結帳後背景補登用（r71）
 
 
 def _market_close(symbol, side, qty, base=0.0, pos=None):
@@ -1369,8 +1405,9 @@ def _market_close(symbol, side, qty, base=0.0, pos=None):
         partial_before = bool((pos or {}).get("closePartial")) or _close_partial.get(symbol)
         if oc["status"] == "FILLED" and ex_q >= q - tol:
             if oc["avg"] <= 0:
-                _fq, favg = _order_fill_avg(symbol, oc["orderId"])   # r42：均價缺漏時從成交明細算
-                oc["avg"] = favg or 0.0
+                oc["avg"] = _requery_avg(symbol, oc)                  # r42、r71
+                if oc["avg"] <= 0:
+                    _last_close_order[symbol] = (oc["orderId"], q)    # 結帳時記未知，背景用單號補登
             if oc["avg"] > 0 and not partial_before:
                 _last_close_fill[symbol] = oc["avg"]      # 這張單的實際成交均價（r28：出場價只用實際成交價）
             return True, (None if q == qty else f"帳上 {qty:g}、交易所自己的 {own:g}，以實際數量平倉")
@@ -1777,6 +1814,16 @@ def record_close(pos, exit_px, reason):
     STATE["trades"].append(trade)
     STATE["positions"].pop(sym_, None)
     save_state()
+    # r71：出場價當下查不到 → 先記未知，背景隔幾秒到兩分鐘再查幾次補登（補的是實際成交價，跟「未知不估算」不衝突）
+    oid_q = _last_close_order.pop(sym_, None)
+    if exit_px is None and not pos.get("entryUnverified"):
+        snap = {k: pos.get(k) for k in ("symbol", "side", "qty", "base", "opened", "fillsSince", "fillsFromId", "closePartial")}
+        try:
+            r_unit = float((pos.get("exits") or {}).get("R") or 0) * float(qty0 or 0)
+        except (TypeError, ValueError):
+            r_unit = 0.0
+        schedule_backfill({"kind": "close", "symbol": sym_, "tradeId": trade["id"], "rUnit": r_unit,
+                           "orderId": oid_q[0] if oid_q else None, "qty": pos.get("qty"), "snap": snap})
 
     # ── 3. 界線之後：各自 try，出錯只推播 ──
     def after(step, fn):
@@ -1845,6 +1892,106 @@ def record_close(pos, exit_px, reason):
     after("每日統計", _stats)
     after("存檔", save_state)
 
+
+
+# ── 背景補登（BINANCE_LESSONS 第 15 條 r71）──────────────────────
+# 成交明細是非同步寫入的：剛成交的一兩秒內常查不到。當下查不到先記未知、發通知，之後再查幾次；
+# 查到就補寫紀錄（出場價／進場價、損益、每日統計）並補發通知，一直查不到推「補登失敗」附單號。
+# 執行緒自己接住例外並推播（第 14 條）；需要的東西在排程當下抄下來（snap），不讀之後會變的部位。
+BACKFILL_DELAYS = (3, 10, 30, 90)
+BACKFILL = {"scheduled": 0, "done": 0, "failed": 0, "log": []}
+
+
+def _start_backfill_thread(fn):
+    """開執行緒跑 fn（測試把這個換掉、收下 fn 自己跑，不會在測試結束後還去打網路）。"""
+    threading.Thread(target=fn, name="backfill", daemon=True).start()
+
+
+def schedule_backfill(job):
+    BACKFILL["scheduled"] += 1
+    _start_backfill_thread(lambda: _run_backfill(job))
+
+
+def _backfill_query(job):
+    """回 (均價, 說明)；查不到回 (None, 說明)。單號優先；沒有單號（交易所端停損觸發）用界線之後的平倉成交。"""
+    sym = job["symbol"]
+    if job.get("orderId") is not None:
+        _q, avg = _order_fill_avg(sym, job["orderId"], qty_needed=job.get("qty"))
+        return avg, f"單號 {job['orderId']}"
+    if job.get("kind") == "close" and job.get("snap"):
+        _q, avg, _t = _close_fills(sym, job["snap"], qty_needed=job.get("qty"))
+        return avg, "界線之後的平倉成交"
+    return None, "沒有單號也沒有界線"
+
+
+def _run_backfill(job):
+    sym = job.get("symbol")
+    try:
+        for delay in BACKFILL_DELAYS:
+            time.sleep(delay)
+            avg, how = _backfill_query(job)
+            BACKFILL["log"].append({"ts": int(time.time() * 1000), "symbol": sym, "kind": job.get("kind"),
+                                    "delay": delay, "avg": avg})
+            del BACKFILL["log"][:-50]
+            if avg:
+                applied = _apply_backfill(job, avg)
+                BACKFILL["done"] += 1
+                _notify("成交價補登", f"{sym} {'進場' if job.get('kind') == 'open' else '出場'}價補登 {avg:g}（{how}，"
+                                    f"成交後約 {sum(BACKFILL_DELAYS[:BACKFILL_DELAYS.index(delay) + 1])} 秒查到）。{applied}")
+                return
+        BACKFILL["failed"] += 1
+        _notify("成交價補登失敗", f"{sym} {'進場' if job.get('kind') == 'open' else '出場'}價背景查了 {len(BACKFILL_DELAYS)} 次仍查不到，"
+                                  f"維持未知；單號 {job.get('orderId')}，請到幣安核對。")
+    except Exception as e:
+        BACKFILL["failed"] += 1
+        _notify("成交價補登出錯", f"{sym}：{type(e).__name__}: {str(e)[:160]}（單號 {job.get('orderId')}）")
+
+
+def _apply_backfill(job, avg):
+    """拿引擎鎖寫回帳本：出場補到平倉紀錄（重算損益、每日統計），進場補到還開著的部位（重算出場位階）。"""
+    with engine_section():
+        if job.get("kind") == "close":
+            t = next((x for x in STATE["trades"] if x.get("id") == job.get("tradeId")), None)
+            if t is None:
+                return "但找不到那筆平倉紀錄，沒有改動"
+            old = t.get("exit")
+            t["exit"] = avg
+            t["backfilled"] = True
+            note = "出場價原本未知"
+            try:
+                parts = t.get("partials") or []
+                entry, q = t.get("entry"), float(t.get("qty") or 0)
+                if entry and not any(p.get("pnl") is None for p in parts):
+                    sgn = 1 if t.get("side") == "LONG" else -1
+                    q_last = q - sum(float(p.get("qty") or 0) for p in parts)
+                    pnl = sum(float(p["pnl"]) for p in parts) + (avg - float(entry)) * sgn * q_last
+                    r_unit = float(job.get("rUnit") or 0)
+                    t["pnl"] = round(pnl, 4)
+                    t["rMultiple"] = round(pnl / r_unit, 2) if r_unit else None
+                    if AUTO.get("day") == _today() and t.get("closed") and t["closed"] >= int(time.time() * 1000) - 86400000:
+                        AUTO["unknownToday"] = max(0, AUTO.get("unknownToday", 0) - 1)
+                        if t["rMultiple"] is not None:
+                            AUTO["closedR"] += t["rMultiple"]
+                            AUTO["closedUsd"] = AUTO.get("closedUsd", 0.0) + t["pnl"]
+                        AUTO.setdefault("lastCloseWin", {})[job["symbol"]] = pnl > 0
+                    note += f"，損益補算 {t['pnl']:+.2f} U" + (f"（{t['rMultiple']:+.2f}R）" if t["rMultiple"] is not None else "")
+            except Exception as e:
+                note += f"；損益補算出錯 {type(e).__name__}"
+            save_state()
+            return note + ("" if old is None else f"（原值 {old}）")
+        pos = STATE["positions"].get(job.get("symbol"))
+        if pos is None or pos.get("opened") != job.get("opened"):
+            return "但那筆部位已不在帳上，沒有改動"
+        old = pos.get("entry")
+        pos["entry"] = avg
+        pos["entryUnverified"] = False
+        try:
+            pos["exits"] = plan_exits(avg, pos.get("stop"), pos.get("side"))
+        except Exception:
+            pass
+        pos.setdefault("warnings", []).append(f"進場價補登 {avg:g}（原估 {old}）")
+        save_state()
+        return f"進場價原估 {old}，出場位階已重算"
 
 
 def _row_side(p):

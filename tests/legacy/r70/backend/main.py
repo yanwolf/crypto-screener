@@ -81,6 +81,14 @@ OHLC_TTL = 1800.0         # 90 日 K 線快取半小時，這種資料不會秒�
 START_TS = time.time()
 LIVE_BLOCKED = []          # 正式網被拒絕啟動的原因；空代表正常
 QUOTA = {"exhausted": False, "ts": 0}
+# CoinGecko 回 429 之後的讓路（2026-09-23）：背景工作（滾動補抓、監控補歷史、瀏覽器深掃）在冷卻期間直接讓開、不打上游，
+# 把每分鐘額度留給行情榜與監控這種前景請求；以前補掃在 429 後原地重試，前景請求排在後面一起被 429，一等就是二三十秒。
+CG_COOL = {"until": 0.0, "hits": 0}
+CG_COOL_SEC = 60.0
+
+
+def cg_cooling():
+    return time.time() < CG_COOL["until"]
 _cache = {}
 _cache_lock = threading.Lock()
 # 快取預設放在專案資料夾外，避免執行時在原始碼目錄長出上百 MB 檔案，
@@ -658,7 +666,7 @@ def mon_run_once():
         if body is None:
             if refreshed[0] >= MON.get("maxRefresh", 8):
                 continue                      # 單輪補抓上限，避免一次把額度用光
-            st, body = fetch_upstream(path)
+            st, body = fetch_upstream(path, background=True)      # 補歷史是背景工作，冷卻期間讓路
             if st != 200:
                 continue
             cache_put(key, body)
@@ -1105,7 +1113,7 @@ TRADE_CFG_SPEC = {
     "trailCallback": ("float", 0.1, 10.0), "trailActivateR": ("float", 0.5, 10.0),
     "trailR": ("float", 0.0, 3.0), "breakevenR": ("float", 0.0, 5.0), "guardClose": ("bool", 0, 1),
     "maxStopPct": ("float", 3.0, 25.0), "minStopPct": ("float", 0.5, 5.0), "conflictTighten": ("bool", 0, 1),
-    "usablePct": ("float", 20.0, 100.0), "useTier": ("bool", 0, 1),
+    "usablePct": ("float", 20.0, 100.0), "useTier": ("bool", 0, 1), "capitalCap": ("float", 0.0, 10000000.0),
     "stopMode": ("enum", ("ma", "atr", "tighter"), None),
 }
 AUTO_SPEC = {
@@ -1187,6 +1195,7 @@ def trade_handle(path, payload):
             "scope": MON.get("scope"),
             "lastPush": MON.get("lastPushTs"),
         }
+        st["cgCooldown"] = {"active": cg_cooling(), "until": int(CG_COOL["until"] * 1000), "hits": CG_COOL["hits"]}
         st["poll"] = float(os.environ.get("POSITION_POLL", 20))
         st["readiness"] = live_readiness()
         st["notify"] = {"channels": notify_channels(), "errors": NOTIFY_ERR["errors"][-10:],
@@ -1720,8 +1729,12 @@ def ttl_for(path_qs: str) -> float:
     return OHLC_TTL if "/ohlc" in path_qs or "market_chart" in path_qs else CACHE_TTL
 
 
-def fetch_upstream(path_qs: str, prefix: str = "/api/v3"):
-    """回傳 (status, body_bytes)。含節流與 429 退避。"""
+def fetch_upstream(path_qs: str, prefix: str = "/api/v3", background: bool = False):
+    """回傳 (status, body_bytes)。含節流與 429 退避。
+    background=True：背景工作——CoinGecko 冷卻期間不打上游、直接回 429（不重試、不佔節流閘）。"""
+    if background and prefix == "/api/v3" and cg_cooling():
+        return 429, json.dumps({"error": "cg_cooldown", "detail": "CoinGecko 剛回 429，背景請求讓路中"},
+                               ensure_ascii=False).encode()
     url = upstream_url(path_qs) if prefix == "/api/v3" else UPSTREAMS[prefix] + path_qs
     req = urllib.request.Request(url, headers={
         "User-Agent": "local-crypto-screener/1.0",
@@ -1749,6 +1762,11 @@ def fetch_upstream(path_qs: str, prefix: str = "/api/v3"):
                 QUOTA["exhausted"] = True
                 QUOTA["ts"] = time.time()
                 return e.code, body
+            if e.code == 429 and prefix == "/api/v3":
+                CG_COOL["until"] = time.time() + CG_COOL_SEC        # 背景工作讓路一分鐘
+                CG_COOL["hits"] += 1
+                if background:
+                    return e.code, body                             # 背景不重試
             if e.code == 429 and attempt < 2:
                 time.sleep(6 * (attempt + 1))
                 continue
@@ -1928,12 +1946,16 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         # 快取過期但還在寬限期內：先把舊資料送出去，背景再更新。
         # 節流閘與重試會讓同步等待長達十幾秒，這段等待對使用者沒有價值——
         # 行情差幾十秒不影響量能倍數的判讀，畫面卡住才是問題。
+        # 行情榜（/coins/markets）不設寬限上限：只要快取裡有舊的就先送、背景更新——畫面永遠不等上游（回應帶 X-Stale-Age，網頁會標「快取」）。
         stale, age = cache_peek(key)
-        if stale is not None and age is not None and age < ttl + STALE_GRACE:
+        markets = prefix == "/api/v3" and "/coins/markets" in path_qs
+        if stale is not None and age is not None and (markets or age < ttl + STALE_GRACE):
             revalidate_async(path_qs, prefix, key)
             return self.send_json(200, stale, cached=True, stale=int(age), data_ts=time.time() - age)
 
-        status, body = fetch_upstream(path_qs, prefix)
+        # 深度資料（瀏覽器的背景深掃）是背景工作：冷卻期間直接讓路
+        background = prefix == "/api/v3" and ("market_chart" in path_qs or "/ohlc" in path_qs)
+        status, body = fetch_upstream(path_qs, prefix, background=background)
         if status == 200:
             cache_put(key, body)
             # 網頁抓行情榜時順便更新宇宙清單，這樣即使沒開補抓，
@@ -2086,12 +2108,15 @@ def prefetch_worker(count: int, ttl_h: float):
                 time.sleep(600)          # 今日預算用完，等跨日
                 continue
 
+            if cg_cooling():
+                time.sleep(max(1.0, CG_COOL["until"] - time.time()))   # 剛被 429：讓路，把額度留給前景請求
+                continue
             cid, why = pick_next(count, ttl_h)
             if cid is None:
                 time.sleep(interval)
                 continue
 
-            st, b = fetch_upstream(f"/coins/{cid}/market_chart?vs_currency=usd&days=90")
+            st, b = fetch_upstream(f"/coins/{cid}/market_chart?vs_currency=usd&days=90", background=True)
             REFRESH["callsToday"] += 1
             if st == 200:
                 cache_put(_deep_key(cid), b)

@@ -55,6 +55,8 @@ class FakeEx:
         self.fills = []                  # 成交明細（userTrades）
         self.slip = 0.001                # 市價單滑價
         self.trades_fail = False         # 成交明細查詢失敗
+        self.trades_visible_at = None    # r71：成交明細「稍後才出現」——模擬時鐘到這個時間前回空清單（非同步寫入）
+        self.trades_filter = None        # r71：fn(rows) → rows，模擬只出現一部分
         self.same_ms = False             # 所有成交落在同一毫秒
         self.clock_lag_ms = 0            # 交易所時鐘比本機慢幾毫秒（成交時間戳往前）
         self.next_order = 70000          # 市價單單號（每張不同）
@@ -154,6 +156,8 @@ class FakeEx:
                               "sides": sorted({f["side"] for f in self.fills if f["symbol"] == params.get("symbol")})})
             if self.trades_fail:
                 return 500, {"msg": "Internal error"}
+            if self.trades_visible_at is not None and T.time.time() < self.trades_visible_at:
+                return 200, []
             rows = [dict(f) for f in self.fills if f["symbol"] == params.get("symbol")]
             if params.get("orderId") is not None:
                 rows = [f for f in rows if f["orderId"] == int(params["orderId"])]
@@ -162,6 +166,8 @@ class FakeEx:
             else:
                 since = params.get("startTime")
                 rows = [f for f in rows if since is None or f["time"] >= int(since)]
+            if self.trades_filter:
+                rows = self.trades_filter(rows)                    # r71：在單號／界線篩選之後套，模擬只出現一部分
             # 照 limit 截斷（沒給時 500，跟幣安一樣）。以前一律回全部——「只查一頁」的錯永遠測不出來（r31 退化值）
             return 200, rows[:int(params.get("limit") or 500)]
         if path == "/fapi/v1/openAlgoOrders":
