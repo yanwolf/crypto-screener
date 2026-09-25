@@ -15,7 +15,7 @@ import time
 
 import trader as T
 
-VERSION = "2026-09-23r67"        # 與 BINANCE_LESSONS.md 最上面的版本一致
+VERSION = "2026-09-25r71"        # 與 BINANCE_LESSONS.md 最上面的版本一致
 EXTRA = []                         # 其他模組登記的本機檢查：fn(add)（main 的推播管道、設定檔，第 8 條 r40）
 
 
