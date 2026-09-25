@@ -124,6 +124,12 @@ python3 -m tests.test_r71
 echo "── 20k. 第 15 條 r72、r73：界線之後的平倉成交要湊滿、部分出場未知那段要跳過 ──"
 python3 -m tests.test_r73
 
+echo "── 20l. 第 15 條 r74、r75：記號存檔、重啟重排補登、框架不真的開執行緒 ──"
+python3 -m tests.test_r75
+# 每支測試結束時都會數「真的開了幾個補登執行緒」（不是 0 就以 ✕ 結束）；金絲雀確認數得到
+BACKFILL_CANARY=1 python3 -m tests.test_r32 > /dev/null || { echo "  ✕ 補登執行緒金絲雀沒數到"; exit 1; }
+echo "✓ 補登執行緒金絲雀：數得到（每支測試結束時的計數可信）"
+
 echo "── 21. 測試本身與工具的檢查（用法第 5 點、第 14 條）──"
 python3 -m tests.check_indexing        # 先索引、沒先確認有東西（r35）
 # 現在的測試跑 tests/legacy/ 下每一版舊程式：測試本身崩掉要是 0（r35、r36；r41 gold-scalper：自動跑每一版）

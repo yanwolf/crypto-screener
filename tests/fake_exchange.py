@@ -12,6 +12,70 @@ import time as _real_time
 
 import trader as T
 
+# ── 背景補登不真的開執行緒（第 15 條 r74、r75）──────────────────────────
+# 框架預設把排程換成收集器：任何測試（包括沒用 fresh() 的舊測試）都不會在背景打網路、把「未知」補成已知。
+# 要跑的測試自己從 BACKFILL_COLLECTED 拿出來跑。真的那個另存成 real_start_backfill，只給驗證正式路徑的那一項用。
+# 全套跑完數「真的開了的補登執行緒」必須是 0：勾住 Thread.__init__ 數名稱是 backfill 的；BACKFILL_CANARY=1 時故意開一個，確認數得到。
+BACKFILL_COLLECTED = []
+BACKFILL_REAL_STARTED = []
+_REAL_START = getattr(T, "_start_backfill_thread", None)
+
+
+def real_start_backfill(fn):
+    if _REAL_START is None:
+        raise RuntimeError("程式沒有 _start_backfill_thread")
+    _REAL_START(fn)
+
+
+def _collect_backfill(fn):
+    BACKFILL_COLLECTED.append(fn)
+
+
+if _REAL_START is not None:
+    T._start_backfill_thread = _collect_backfill
+
+# 每個情境都 importlib.reload(trader)，重載後屬性又變回真的——勾住 reload，重載完再裝回收集器（r74 那個坑就是這樣來的）
+import importlib as _importlib
+_orig_reload = _importlib.reload
+
+
+def _reload_keep_collector(mod):
+    global _REAL_START
+    r = _orig_reload(mod)
+    if getattr(mod, "__name__", "") == "trader" and hasattr(r, "_start_backfill_thread"):
+        _REAL_START = r._start_backfill_thread
+        r._start_backfill_thread = _collect_backfill
+    return r
+
+
+_importlib.reload = _reload_keep_collector
+
+_orig_thread_init = threading.Thread.__init__
+
+
+def _counting_thread_init(self, *a, **k):
+    _orig_thread_init(self, *a, **k)
+    if getattr(self, "name", "") == "backfill":
+        BACKFILL_REAL_STARTED.append(1)
+
+
+threading.Thread.__init__ = _counting_thread_init
+if os.environ.get("BACKFILL_CANARY"):
+    threading.Thread(target=lambda: None, name="backfill", daemon=True).start()
+
+
+def _report_backfill_threads():
+    n = len(BACKFILL_REAL_STARTED)
+    if os.environ.get("BACKFILL_CANARY"):
+        ok = n == 1
+        print(f"{'✓' if ok else '✕'} 補登執行緒金絲雀：數到 {n} 個（應為 1）")
+        if not ok:
+            os._exit(1)
+        return
+    if n:
+        print(f"✕ 這支測試真的開了 {n} 個補登執行緒（框架預設應換成收集器，測試結束後不能還在背景打網路）")
+        os._exit(1)
+
 # 突變命中紀錄：每一項測試裡，被突變的查詢實際被呼叫幾次（0 次＝這項與突變無關，r23）
 CURRENT = ["?"]
 HITS = {}
@@ -35,6 +99,7 @@ def _dump_hits():
 
 
 atexit.register(_dump_hits)
+atexit.register(_report_backfill_threads)
 
 
 class FakeEx:

@@ -1033,6 +1033,7 @@ def open_position(symbol_base, side, entry_hint, stop, info=None, note="", stop_
             "orders": sub, "opened": int(time.time() * 1000),
             "note": note, "warnings": errs + ([base_warn] if base_warn else []) + ([entry_note] if entry_note else []),
         }
+        pos["entryOrderId"] = oc["orderId"]           # r75：重啟後重排進場補登要用
         if entry_note:
             pos["entryUnverified"] = True             # r42：進場價是估的，結帳時損益記未知
             schedule_backfill({"kind": "open", "symbol": sym, "orderId": oc["orderId"], "qty": qty,
@@ -1837,6 +1838,9 @@ def record_close(pos, exit_px, reason):
             r_unit = float((pos.get("exits") or {}).get("R") or 0) * float(qty0 or 0)
         except (TypeError, ValueError):
             r_unit = 0.0
+        # r75：補登要用到的東西跟著紀錄存進狀態檔，重啟後才重排得出來
+        trade.update({"backfillPending": True, "closeOrderId": oid_q[0] if oid_q else None,
+                      "closeQty": pos.get("qty"), "closeSnap": snap, "rUnit": r_unit})
         schedule_backfill({"kind": "close", "symbol": sym_, "tradeId": trade["id"], "rUnit": r_unit,
                            "orderId": oid_q[0] if oid_q else None, "qty": pos.get("qty"), "snap": snap})
 
@@ -1975,6 +1979,7 @@ def _apply_backfill(job, avg):
             old = t.get("exit")
             t["exit"] = avg
             t["backfilled"] = True
+            t.pop("backfillPending", None)
             note = "出場價原本未知"
             try:
                 parts = t.get("partials") or []
@@ -2000,6 +2005,9 @@ def _apply_backfill(job, avg):
         pos = STATE["positions"].get(job.get("symbol"))
         if pos is None or pos.get("opened") != job.get("opened"):
             return "但那筆部位已不在帳上，沒有改動"           # 結帳時已經跳過那段（unclaimedQty），不用再做
+        if job.get("kind") == "partial" and any(p.get("px") is None and p.get("ts", 0) < (job.get("partTs") or 0)
+                                                for p in pos.get("partials") or []):
+            return "但前面還有更早的段沒補到，界線只能依序推進，這段先不動"
         if job.get("kind") == "partial":
             part = next((p for p in pos.get("partials") or [] if p.get("ts") == job.get("partTs")), None)
             if part is None:
@@ -2944,7 +2952,46 @@ def load_state(path, _retry=False):
     STATE["loadError"] = None
     if was:
         _notify("狀態檔已讀到，恢復開新倉", f"{path}\n（已補上：先前讀取失敗 {was.get('attempts', 1)} 次）")
+    try:
+        reschedule_backfills()                 # r75：排好的背景補登是執行緒，重啟就沒了——照狀態重新排
+    except Exception as e:
+        _pos_step_error("重排背景補登", "", e)
     return True, None
+
+
+def reschedule_backfills():
+    """重啟後照狀態重新排背景補登（第 15 條 r75）：記號存進狀態檔還不夠，補登本身是執行緒。
+    - 還開著的部位：進場成交價還沒驗證、有開倉單號 → 進場補登；部分出場某段成交價未知 → 那段的補登（依序，前面的段先）。
+    - 已平倉紀錄：出場價未知、還標著待補登（有平倉單號或界線）→ 出場補登。每筆重啟後最多再排 2 次，避免永遠查不到的一直重排。
+    回傳排了幾個。"""
+    n = 0
+    for sym, pos in list(STATE["positions"].items()):
+        if pos.get("entryUnverified") and pos.get("entryOrderId") is not None and pos.get("entryRetries", 0) < 2:
+            pos["entryRetries"] = pos.get("entryRetries", 0) + 1
+            schedule_backfill({"kind": "open", "symbol": sym, "orderId": pos["entryOrderId"], "qty": pos.get("qty0") or pos.get("qty"),
+                               "opened": pos.get("opened"), "side": pos.get("side")})
+            n += 1
+        skip_before = 0.0
+        for p in pos.get("partials") or []:
+            if p.get("px") is not None:
+                continue
+            if p.get("retries", 0) < 2 and float(pos.get("base") or 0) <= 0:
+                p["retries"] = p.get("retries", 0) + 1
+                snap = {k: pos.get(k) for k in ("symbol", "side", "base", "opened", "fillsSince", "fillsFromId")}
+                snap["unclaimedQty"] = skip_before          # 前面還沒認領的段先跳過（界線只能依序推進）
+                schedule_backfill({"kind": "partial", "symbol": sym, "opened": pos.get("opened"),
+                                   "qty": p.get("qty"), "partTs": p.get("ts"), "snap": snap})
+                n += 1
+            skip_before += float(p.get("qty") or 0)
+    for t in STATE["trades"][-50:]:
+        if t.get("exit") is None and t.get("backfillPending") and t.get("backfillRetries", 0) < 2:
+            t["backfillRetries"] = t.get("backfillRetries", 0) + 1
+            schedule_backfill({"kind": "close", "symbol": t.get("symbol"), "tradeId": t.get("id"), "rUnit": t.get("rUnit") or 0,
+                               "orderId": t.get("closeOrderId"), "qty": t.get("closeQty") or t.get("qty"), "snap": t.get("closeSnap") or {}})
+            n += 1
+    if n:
+        save_state()
+    return n
 
 
 def _load_failed(path, e, retry):
