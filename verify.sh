@@ -129,6 +129,9 @@ python3 -m tests.test_r75
 
 echo "── 20m. 第 15 條 r76、r77：補登記號在結帳前寫、完成或放棄清掉、平倉後的進場補登 ──"
 python3 -m tests.test_r77
+
+echo "── 20n. 自動下單狀態重啟後讀得回來（冷卻的獲利／虧損、當日未知筆數）──"
+python3 -m tests.test_auto_persist
 # 每支測試結束時都會數「真的開了幾個補登執行緒」（不是 0 就以 ✕ 結束）；金絲雀確認數得到
 BACKFILL_CANARY=1 python3 -m tests.test_r32 > /dev/null || { echo "  ✕ 補登執行緒金絲雀沒數到"; exit 1; }
 echo "✓ 補登執行緒金絲雀：數得到（每支測試結束時的計數可信）"

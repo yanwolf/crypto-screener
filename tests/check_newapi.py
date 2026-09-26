@@ -16,7 +16,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MODULE_BASES = {"T": "trader", "M": "main", "FX": "fake_exchange", "R": "test_r42", "R55": "test_r55", "R71": "test_r71",
                 "R73": "test_r73", "R75": "test_r75"}
 SUITES = ["test_r42.py", "test_r46.py", "test_r49.py", "test_r52.py", "test_r55.py", "test_r58.py", "test_r60.py",
-          "test_r63.py", "test_cg_cooldown.py", "test_r71.py", "test_r73.py", "test_r75.py", "test_r77.py"]
+          "test_r63.py", "test_cg_cooldown.py", "test_r71.py", "test_r73.py", "test_r75.py", "test_r77.py", "test_auto_persist.py"]
 
 
 def legacy_names():
