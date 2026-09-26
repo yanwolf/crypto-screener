@@ -105,54 +105,106 @@ def _guard_keys(node):
     return out
 
 
-def _positive_guard(test, key):
-    """條件成立時一定守住了 key：條件本身含守護，而且不在 not 底下、不在 or 裡（r81：else 那邊、or 的後段不算）。"""
+def _is_guard(n, key):
+    return (isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in ("hasattr", "getattr")
+            and len(n.args) >= 2 and _root_of(n.args[0]) == key[0]
+            and isinstance(n.args[1], ast.Constant) and n.args[1].value == key[1])
+
+
+def _implies(test, key, truth):
+    """條件的值是 truth 時，能不能確定 key 存在（r83：看正負，不是看有沒有出現過）。
+    hasattr／getattr 為真 ⇒ 在；not 反向；and 為真 ⇒ 任一；and 為假 ⇒ 推不出；or 為真 ⇒ 全部；or 為假 ⇒ 任一為假就推得出。"""
+    if _is_guard(test, key):
+        return truth
     if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
-        return False
-    if isinstance(test, ast.BoolOp) and isinstance(test.op, ast.Or):
-        return all(_positive_guard(v, key) for v in test.values)
+        return _implies(test.operand, key, not truth)
     if isinstance(test, ast.BoolOp) and isinstance(test.op, ast.And):
-        return any(_positive_guard(v, key) for v in test.values)
-    return key in _guard_keys(test)
+        return truth and any(_implies(v, key, True) for v in test.values)
+    if isinstance(test, ast.BoolOp) and isinstance(test.op, ast.Or):
+        return all(_implies(v, key, True) for v in test.values) if truth else any(_implies(v, key, False) for v in test.values)
+    if isinstance(test, ast.Call) and isinstance(test.func, ast.Name) and test.func.id == "callable" and test.args:
+        return truth and _implies(test.args[0], key, True)
+    return False
 
 
-def _helper_guards(stmt, helpers):
-    """敘述裡呼叫的同檔輔助函式（模組層級定義的）帶進來的守護。"""
-    out = set()
+EXITS = (ast.Return, ast.Raise, ast.Continue, ast.Break)
+
+
+def _exits(block):
+    """這個區塊一定離開（最後一句是 return／raise／continue／break）。"""
+    return bool(block) and isinstance(block[-1], EXITS)
+
+
+def _stops(stmt, key, helpers):
+    """這一句執行完之後，key 一定存在——只認擋得住的寫法（r83：只是出現過守護不算，前提失敗不會停下來就擋不住）：
+    need(守護)（本專案的 need 失敗會丟例外）、assert 守護、`if 反向守護: 離開`、`if 守護: … else: 離開`、
+    with／try（沒有 except）區塊裡的這些、先呼叫的同檔輔助函式最上層有這些。"""
+    if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call):
+        c = stmt.value
+        if isinstance(c.func, ast.Name) and c.func.id == "need" and c.args and _implies(c.args[0], key, True):
+            return True
+    if isinstance(stmt, ast.Assert) and _implies(stmt.test, key, True):
+        return True
+    if isinstance(stmt, ast.If):
+        if _exits(stmt.body) and _implies(stmt.test, key, False):
+            return True
+        if stmt.orelse and _exits(stmt.orelse) and _implies(stmt.test, key, True):
+            return True
+    if isinstance(stmt, ast.With):
+        return any(_stops(s, key, helpers) for s in stmt.body)
+    if isinstance(stmt, ast.Try) and not stmt.handlers:
+        return any(_stops(s, key, helpers) for s in stmt.body)
     for n in _walk_no_nested(stmt):
-        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in helpers:
-            out |= helpers[n.func.id]
-    return out
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and key in helpers.get(n.func.id, set()):
+            return True
+    return False
 
 
 def _protected(use, key, scope, parents, helpers):
     """照執行順序判斷：往上走到自己的範圍為止（不越過函式邊界，r81：前一個情境的守護不算）。"""
     child, node = use, parents.get(use)
     while node is not None:
-        if isinstance(node, ast.IfExp) and child is node.body and _positive_guard(node.test, key):
-            return True
-        if isinstance(node, ast.If) and child in node.body and _positive_guard(node.test, key):
-            return True
-        if isinstance(node, ast.BoolOp) and isinstance(node.op, ast.And) and child in node.values:
-            i = node.values.index(child)
-            if any(_positive_guard(v, key) for v in node.values[:i]):
+        if isinstance(node, ast.IfExp):
+            if child is node.body and _implies(node.test, key, True):
+                return True
+            if child is node.orelse and _implies(node.test, key, False):
+                return True
+        if isinstance(node, ast.If):
+            if child in node.body and _implies(node.test, key, True):
+                return True
+            if child in node.orelse and _implies(node.test, key, False):
+                return True
+        if isinstance(node, ast.BoolOp) and child in node.values:
+            before = node.values[:node.values.index(child)]
+            if isinstance(node.op, ast.And) and any(_implies(v, key, True) for v in before):
+                return True
+            if isinstance(node.op, ast.Or) and any(_implies(v, key, False) for v in before):
                 return True
         for field in ("body", "orelse", "finalbody"):
             block = getattr(node, field, None)
             if isinstance(block, list) and child in block:
-                for prev in block[:block.index(child)]:
-                    if key in _guard_keys(prev) or key in _helper_guards(prev, helpers):
-                        return True
+                if any(_stops(prev, key, helpers) for prev in block[:block.index(child)]):
+                    return True
         if node is scope:
             return False
         child, node = node, parents.get(node)
     return False
 
 
+def _helper_stops(fn):
+    """輔助函式最上層擋得住的守護：{(根, 屬性)}（呼叫它之後就一定在）。"""
+    keys = set()
+    for s in fn.body:
+        for k in _guard_keys(s):
+            if _stops(s, k, {}):
+                keys.add(k)
+    return keys
+
+
 def check_file(path, legacy):
     src = open(path, encoding="utf-8").read()
     tree = ast.parse(src)
-    helpers = {n.name: set().union(*[_guard_keys(s) for s in n.body]) for n in tree.body if isinstance(n, ast.FunctionDef)}
+    helpers = {n.name: _helper_stops(n) for n in tree.body if isinstance(n, ast.FunctionDef)}
     parents = {}
     for n in ast.walk(tree):
         for c in ast.iter_child_nodes(n):
@@ -214,6 +266,22 @@ SELFTEST = [
     ("def _():\n    def inner():\n        need(hasattr(T(), 'newfn'), 'p')\n    x = T().newfn\n", 1),  # 巢狀定義裡的守護不算
     ("def _():\n    for M in []:\n        x = M.newobj\n", 0),                               # 跟別名同名的區域變數
     ("x = T().newfn\n", 1),                                                                  # 模組最上層也檢查
+    # r83：寫在前面的敘述只認擋得住的；條件看正負
+    ("def _():\n    hasattr(T(), 'newfn')\n    x = T().newfn\n", 1),                      # 光寫、沒停
+    ("def _():\n    ok = hasattr(T(), 'newfn')\n    x = T().newfn\n", 1),                 # 存進變數沒用
+    ("def _():\n    if not hasattr(T(), 'newfn'):\n        print('x')\n    x = T().newfn\n", 1),   # 沒離開
+    ("def _():\n    check('p', hasattr(T(), 'newfn'))\n    x = T().newfn\n", 1),         # 不會停的前提
+    ("def _():\n    assert hasattr(T(), 'newfn')\n    x = T().newfn\n", 0),
+    ("def _():\n    if hasattr(T(), 'newfn'):\n        pass\n    else:\n        return 'x'\n    x = T().newfn\n", 0),
+    ("def _():\n    if not hasattr(T(), 'newfn'):\n        pass\n    else:\n        x = T().newfn\n", 0),   # else 那邊、條件是反向
+    ("def _():\n    x = None if not hasattr(T(), 'newfn') else T().newfn\n", 0),
+    ("def _():\n    x = not hasattr(T(), 'newfn') or T().newfn\n", 0),
+    ("def _():\n    x = T().newfn if not hasattr(T(), 'newfn') else None\n", 1),
+    ("def _():\n    x = not hasattr(T(), 'newfn') and T().newfn\n", 1),
+    ("def _():\n    with open('x') as f:\n        need(hasattr(T(), 'newfn'), 'p')\n    x = T().newfn\n", 0),
+    ("def h():\n    ok = hasattr(T(), 'newfn')\n\ndef _():\n    h()\n    x = T().newfn\n", 1),   # 輔助函式裡只是出現過
+    ("def _():\n    need(hasattr(T(), 'a') and hasattr(T(), 'newfn'), 'p')\n    x = T().newfn\n", 0),
+    ("def _():\n    need(hasattr(T(), 'a') or hasattr(T(), 'newfn'), 'p')\n    x = T().newfn\n", 1),   # or 為真推不出
 ]
 
 

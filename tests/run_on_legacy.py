@@ -1,6 +1,6 @@
 """拿現在的測試跑舊版程式，失敗分成四類（BINANCE_LESSONS 用法第 5 點 r35、r36）。
 
-    python3 -m tests.run_on_legacy r79
+    python3 -m tests.run_on_legacy r82
 
 舊版程式存在 tests/legacy/<版本>/backend/（只放 .py）。每輪對照清單前，把這輪修改前的程式存一份進來。
 重點看「測試本身崩掉」要是 0——不是 0 就代表測試在舊程式上走不到斷言，前後比對失真。
@@ -42,4 +42,4 @@ def main(ver):
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1] if len(sys.argv) > 1 else "r79"))
+    sys.exit(main(sys.argv[1] if len(sys.argv) > 1 else "r82"))
