@@ -115,6 +115,62 @@ SELFTEST = [
 ]
 
 
+RESETS = {"fresh", "main_mod", "reload", "restart"}
+
+
+def _attr_root(node):
+    """`T().X`／`T.X`／`M.X` → (根, 屬性)；其他 → None。"""
+    if not isinstance(node, ast.Attribute):
+        return None
+    cur = node.value
+    root = cur.func.id if isinstance(cur, ast.Call) and isinstance(cur.func, ast.Name) else (cur.id if isinstance(cur, ast.Name) else None)
+    return (root, node.attr) if root in ("T", "M", "T2") else None
+
+
+def restore_order_problems(fn):
+    """第 27 種（r81 gold-scalper）：先在模組上裝了東西、之後又重設（fresh／main_mod／reload／restart），
+    重設後卻還在用那個屬性、中間沒有重新裝——重設把它悄悄拿掉了，測試照樣通過、不會有失敗訊號。
+    回傳 [(裝的行號, 屬性, 重設的行號, 之後用到的行號)]。"""
+    events = []
+    for n in ast.walk(fn):
+        if isinstance(n, ast.Assign):
+            for t in n.targets:
+                k = _attr_root(t)
+                if k:
+                    events.append((n.lineno, 0, "store", k))
+        elif isinstance(n, ast.Attribute) and isinstance(n.ctx, ast.Load):
+            k = _attr_root(n)
+            if k:
+                events.append((n.lineno, 2, "load", k))
+        elif isinstance(n, ast.Call):
+            f = n.func
+            name = f.id if isinstance(f, ast.Name) else (f.attr if isinstance(f, ast.Attribute) else None)
+            if name in RESETS:
+                events.append((n.lineno, 1, "reset", name))
+    events.sort()
+    installed, wiped, out = {}, {}, []
+    for line, _o, kind, k in events:
+        if kind == "store":
+            installed[k] = line
+            wiped.pop(k, None)
+        elif kind == "reset":
+            for kk, sl in installed.items():
+                wiped[kk] = (sl, line)
+            installed = {}
+        elif kind == "load" and k in wiped:
+            sl, rl = wiped.pop(k)
+            out.append((sl, f"{k[0]}.{k[1]}", rl, line))
+    return out
+
+
+SELFTEST_27 = [
+    ("@case('t', 'd')\ndef _():\n    ex = fresh()\n    T.X = 1\n    fresh()\n    if T.X != 1:\n        return 'x'\n", 1),   # 裝了、重設、還在用
+    ("@case('t', 'd')\ndef _():\n    ex = fresh()\n    T.X = 1\n    fresh()\n    T.X = 1\n    if T.X != 1:\n        return 'x'\n", 0),  # 重設後重新裝
+    ("@case('t', 'd')\ndef _():\n    ex = fresh()\n    T.X = 1\n    fresh()\n    if T.Y != 1:\n        return 'x'\n", 0),   # 重設後用別的
+    ("@case('t', 'd')\ndef _():\n    ex = fresh()\n    T.X = 1\n    if T.X != 1:\n        return 'x'\n", 0),              # 沒重設
+]
+
+
 DISK_MARKS = ("STATE_FILE", ".unloaded", "save_state()", "state_path(")
 
 
@@ -139,6 +195,10 @@ SELFTEST_26 = [
 
 def selftest():
     wrong = []
+    for src, want in SELFTEST_27:
+        fn = next(c[2] for c in cases(src))
+        if len(restore_order_problems(fn)) != want:
+            wrong.append(f"第 27 種判錯：{src.splitlines()[3].strip()} …")
     for src, want in SELFTEST_26:
         fn = next(c[2] for c in cases(src))
         if needs_keep_save(fn, src) != want:
@@ -167,7 +227,7 @@ def main():
         if bool(infra_touches_program(fn)) != want:
             print("✕ 檢查器自我驗證失敗：infra 規則判錯")
             return 1
-    print(f"✓ 檢查器自我驗證：{len(SELFTEST)} 組否定句＋2 組 infra＋{len(SELFTEST_26)} 組 keep_save 固定人造資料全部判對")
+    print(f"✓ 檢查器自我驗證：{len(SELFTEST)} 組否定句＋2 組 infra＋{len(SELFTEST_26)} 組 keep_save＋{len(SELFTEST_27)} 組重設順序固定人造資料全部判對")
     bad, total, neg = [], 0, 0
     for f in FILES:
         src = open(os.path.join(HERE, f), encoding="utf-8").read()
@@ -185,6 +245,8 @@ def main():
                 touched = infra_touches_program(fn)
                 if touched:
                     bad.append(f"{f} [{tag}] 標成 infra 卻碰了程式：{'、'.join(touched)}（不能拿這個標記繞過突變檢查）")
+            for sl, what, rl, ul in restore_order_problems(fn):
+                bad.append(f"{f} [{tag}] 第 {sl} 行裝了 {what}，第 {rl} 行重設把它拿掉，第 {ul} 行還在用（第 27 種：重設要在裝之前）")
             if needs_keep_save(fn, src):
                 bad.append(f"{f} [{tag}] 檢查狀態檔在磁碟上的結果，卻沒有 fresh(keep_save=True)：save_state 被框架換掉了（第 26 種）")
             br = fail_branches(fn)

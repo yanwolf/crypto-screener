@@ -70,62 +70,122 @@ def base_of(node):
     return root, chain[-1]
 
 
-def guards_in(fn):
-    """函式裡的守護：{(根, 屬性): 行號}（hasattr／getattr 的第一個參數是模組根、第二個是字串）。"""
-    g = {}
-    for n in ast.walk(fn):
+NESTED = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)
+
+
+def _walk_no_nested(node):
+    """走訪但不進巢狀的函式／lambda／類別（定義不等於執行，r81）。"""
+    stack = [node]
+    while stack:
+        n = stack.pop()
+        yield n
+        for c in ast.iter_child_nodes(n):
+            if not isinstance(c, NESTED):
+                stack.append(c)
+
+
+def _root_of(expr):
+    if isinstance(expr, ast.Call) and isinstance(expr.func, ast.Name):
+        return expr.func.id
+    if isinstance(expr, ast.Name):
+        return expr.id
+    return None
+
+
+def _guard_keys(node):
+    """這段運算式／敘述裡（不含巢狀定義）出現的守護：{(根, 屬性)}。"""
+    out = set()
+    if isinstance(node, NESTED):
+        return out                                  # 定義一個函式不等於執行它
+    for n in _walk_no_nested(node):
         if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in ("hasattr", "getattr") and len(n.args) >= 2:
-            b = base_of(ast.Attribute(value=n.args[0], attr="_", ctx=ast.Load())) if not isinstance(n.args[0], (ast.Name, ast.Call)) else None
-            root = None
-            a0 = n.args[0]
-            if isinstance(a0, ast.Call) and isinstance(a0.func, ast.Name):
-                root = a0.func.id
-            elif isinstance(a0, ast.Name):
-                root = a0.id
-            elif b:
-                root = b[0]
+            root = _root_of(n.args[0])
             if root in MODULE_BASES and isinstance(n.args[1], ast.Constant) and isinstance(n.args[1].value, str):
-                key = (root, n.args[1].value)
-                g[key] = min(g.get(key, n.lineno), n.lineno)
-    return g
+                out.add((root, n.args[1].value))
+    return out
+
+
+def _positive_guard(test, key):
+    """條件成立時一定守住了 key：條件本身含守護，而且不在 not 底下、不在 or 裡（r81：else 那邊、or 的後段不算）。"""
+    if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
+        return False
+    if isinstance(test, ast.BoolOp) and isinstance(test.op, ast.Or):
+        return all(_positive_guard(v, key) for v in test.values)
+    if isinstance(test, ast.BoolOp) and isinstance(test.op, ast.And):
+        return any(_positive_guard(v, key) for v in test.values)
+    return key in _guard_keys(test)
+
+
+def _helper_guards(stmt, helpers):
+    """敘述裡呼叫的同檔輔助函式（模組層級定義的）帶進來的守護。"""
+    out = set()
+    for n in _walk_no_nested(stmt):
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in helpers:
+            out |= helpers[n.func.id]
+    return out
+
+
+def _protected(use, key, scope, parents, helpers):
+    """照執行順序判斷：往上走到自己的範圍為止（不越過函式邊界，r81：前一個情境的守護不算）。"""
+    child, node = use, parents.get(use)
+    while node is not None:
+        if isinstance(node, ast.IfExp) and child is node.body and _positive_guard(node.test, key):
+            return True
+        if isinstance(node, ast.If) and child in node.body and _positive_guard(node.test, key):
+            return True
+        if isinstance(node, ast.BoolOp) and isinstance(node.op, ast.And) and child in node.values:
+            i = node.values.index(child)
+            if any(_positive_guard(v, key) for v in node.values[:i]):
+                return True
+        for field in ("body", "orelse", "finalbody"):
+            block = getattr(node, field, None)
+            if isinstance(block, list) and child in block:
+                for prev in block[:block.index(child)]:
+                    if key in _guard_keys(prev) or key in _helper_guards(prev, helpers):
+                        return True
+        if node is scope:
+            return False
+        child, node = node, parents.get(node)
+    return False
 
 
 def check_file(path, legacy):
     src = open(path, encoding="utf-8").read()
     tree = ast.parse(src)
-    funcs = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
-    guards = {name: guards_in(fn) for name, fn in funcs.items()}
-    # 同名的案例函式（都叫 _）：逐一處理，不用名稱查
-    all_fns = [n for n in tree.body if isinstance(n, ast.FunctionDef)]
-    bad = []
-    for fn in all_fns:
-        own = guards_in(fn)
-        # 先呼叫的輔助函式帶進來的守護（一層）：以呼叫那一行當守護的行號
-        inherited = {}
-        seen = set()
-        for n in ast.walk(fn):
-            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in guards and n.func.id != fn.name:
-                for key in guards[n.func.id]:
-                    inherited[key] = min(inherited.get(key, n.lineno), n.lineno)
-        for n in ast.walk(fn):
+    helpers = {n.name: set().union(*[_guard_keys(s) for s in n.body]) for n in tree.body if isinstance(n, ast.FunctionDef)}
+    parents = {}
+    for n in ast.walk(tree):
+        for c in ast.iter_child_nodes(n):
+            parents[c] = n
+    bad, seen = [], set()
+    top_level = [n for n in tree.body if not isinstance(n, NESTED)]
+    scopes = [(n, n) for n in tree.body if isinstance(n, ast.FunctionDef)]
+    scopes += [(tree, s) for s in top_level]                   # 模組最上層也是一個範圍（r81）
+    for scope, root_node in scopes:
+        local = set()
+        if isinstance(root_node, ast.FunctionDef):
+            local = {a.arg for a in root_node.args.args}
+            for n in _walk_no_nested(root_node):
+                if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store):
+                    local.add(n.id)                            # 跟別名同名的區域變數不是那個模組（r81）
+        for n in _walk_no_nested(root_node):
             if not isinstance(n, ast.Attribute) or isinstance(n.ctx, ast.Store):
                 continue                          # 指定屬性（M.push_all = …）是在換掉，不是在用
             b = base_of(n)
             if not b:
                 continue
             root, attr = b
+            if root in local:
+                continue
             mod = MODULE_BASES[root]
             if mod not in legacy or attr in legacy[mod] or attr.startswith("__"):
                 continue                          # 舊介面，或不是被測程式的模組（測試模組自己的名稱不管）
-            line = n.lineno
-            if (line, root, attr) in seen:
+            if (n.lineno, root, attr) in seen:
                 continue                          # 同一鏈的每一層都會走到，只報一次
-            seen.add((line, root, attr))
-            g_line = own.get((root, attr))
-            if g_line is None or g_line > line:
-                g_line = inherited.get((root, attr))
-            if g_line is None or g_line > line:
-                bad.append(f"{os.path.basename(path)}:{line} 用到新介面 {root}.{attr}（最舊舊版沒有），這一處之前沒有守住同一個屬性的 hasattr／getattr")
+            seen.add((n.lineno, root, attr))
+            if not _protected(n, (root, attr), scope, parents, helpers):
+                bad.append(f"{os.path.basename(path)}:{n.lineno} 用到新介面 {root}.{attr}（最舊舊版沒有），"
+                           f"執行到這一處之前沒有守住同一個屬性的 hasattr／getattr")
     return bad
 
 
@@ -135,12 +195,25 @@ SELFTEST = [
     ("def _():\n    need(hasattr(T(), 'newfn'), 'p')\n    x = T().newfn()\n", 0),        # 守了同一個、在之前
     ("def _():\n    x = T().newfn()\n    need(hasattr(T(), 'newfn'), 'p')\n", 1),        # 守在之後
     ("def _():\n    need(hasattr(T(), 'other'), 'p')\n    x = T().newfn()\n", 1),        # 守了別的屬性
-    ("def helper():\n    need(hasattr(T(), 'newfn'), 'p')\n\ndef _():\n    helper()\n    x = T().newfn()\n", 0),   # 輔助函式守的
+    ("def helper():\n    need(hasattr(T(), 'newfn'), 'p')\n\ndef _():\n    helper()\n    x = T().newfn()\n", 0),   # 先呼叫的輔助函式守的
     ("def helper():\n    x = T().newfn()\n", 1),                                          # 輔助函式自己用到也要守
     ("def _():\n    x = M.newobj.run()\n", 1),                                            # 兩層：M.newobj 是新的
     ("def _():\n    need(hasattr(M, 'newobj'), 'p')\n    x = M.newobj.run()\n", 0),
     ("def _():\n    x = T().oldfn()\n", 0),                                               # 舊介面不用守
     ("def _():\n    x = getattr(T(), 'newfn', None)\n    if x:\n        x()\n", 0),        # getattr 本身就是守護
+    # r80、r81：照執行順序
+    ("def _():\n    x = (T().newfn\n         if hasattr(T(), 'newfn') else None)\n", 0),   # 條件運算式、跨行寫
+    ("def _():\n    x = None if hasattr(T(), 'newfn') else T().newfn\n", 1),             # 用法在 else 那一邊
+    ("def _():\n    if hasattr(T(), 'newfn'):\n        pass\n    else:\n        x = T().newfn\n", 1),   # if 的 else 區塊
+    ("def _():\n    x = hasattr(T(), 'newfn') or T().newfn\n", 1),                        # or 的後段
+    ("def _():\n    x = hasattr(T(), 'newfn') and T().newfn\n", 0),                       # and 的後段
+    ("def _():\n    if not hasattr(T(), 'newfn'):\n        x = T().newfn\n", 1),         # not 底下
+    ("def _():\n    if not hasattr(T(), 'newfn'):\n        return 'x'\n    y = T().newfn\n", 0),  # 先排除再用
+    ("def _():\n    need(hasattr(T(), 'newfn'), 'p')\n\ndef _():\n    x = T().newfn\n", 1),   # 前一個情境守過不算
+    ("def helper():\n    need(hasattr(T(), 'newfn'), 'p')\n\ndef _():\n    x = T().newfn\n", 1),  # 定義了沒呼叫不算
+    ("def _():\n    def inner():\n        need(hasattr(T(), 'newfn'), 'p')\n    x = T().newfn\n", 1),  # 巢狀定義裡的守護不算
+    ("def _():\n    for M in []:\n        x = M.newobj\n", 0),                               # 跟別名同名的區域變數
+    ("x = T().newfn\n", 1),                                                                  # 模組最上層也檢查
 ]
 
 
