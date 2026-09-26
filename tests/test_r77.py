@@ -163,6 +163,54 @@ def _():
         return "程式有行程層級的「只做一次」旗標，框架沒有納入重設"
 
 
+@case("r78-1", "進場補登放棄之後：記號標成已結束、不刪掉；之後每次重啟都不再查（放棄過的跟從來沒有記號的分得出來）")
+def _():
+    ex, clock = fresh(keep_save=True)
+    path = state_path()
+    ex.pos[("XUSDT", "LONG")] = [2.0, 90.0]
+    ex.drop_avg = True
+    ex.trades_fail = True                                       # 永遠查不到
+    ex.mark["XUSDT"] = 100.4
+    r = T().open_position("X", "LONG", 100.0, None, stop_pct=5)
+    need(r.get("ok") and (T().STATE["positions"].get("XUSDT") or {}).get("entryUnverified"), f"進場價應先標未驗證（前提）：{r}")
+    need(R.BACKFILLS, "應排了進場補登（前提）")
+    capture_notify()
+    run_backfills()                                             # 查四次都查不到 → 放棄
+    counts = []
+    for _i in range(2):
+        R.BACKFILLS[:] = []
+        restart(ex, path)
+        counts.append(len(R.BACKFILLS))
+    if counts != [0, 0]:
+        return f"放棄過的進場補登重啟後又排了：{counts}"
+    pos = T().STATE["positions"]["XUSDT"]
+    need(hasattr(T(), "_mark_ended"), "程式沒有「標成已結束」（前提：r79 起才有）")
+    mark = pos.get("entryBackfill")
+    if not isinstance(mark, dict) or mark.get("ended") != "gave_up":
+        return f"放棄後記號不是標成已結束（gave_up）：{mark}"
+
+
+@case("r78-2", "出場補登查到：記號標成已結束（found），不是刪掉；重啟不再排")
+def _():
+    ex, clock = fresh(keep_save=True)
+    path = state_path()
+    open_long(ex)
+    t = close_unknown(ex, clock)
+    capture_notify()
+    run_backfills()
+    need(T().STATE["trades"], "平倉紀錄不見了（前提）")
+    t = T().STATE["trades"][-1]
+    need(t.get("exit") is not None, "補登應已查到出場價（前提）")
+    R.BACKFILLS[:] = []
+    restart(ex, path)
+    if R.BACKFILLS:
+        return "已結束的出場補登重啟後又排了"
+    t = T().STATE["trades"][-1]
+    need(hasattr(T(), "_mark_ended"), "程式沒有「標成已結束」（前提：r79 起才有）")
+    if not isinstance(t.get("backfillEnded"), dict) or t["backfillEnded"].get("ended") != "found":
+        return f"查到後記號不是標成已結束（found）：{t.get('backfillEnded')}"
+
+
 if __name__ == "__main__":
     fails = [r for r in RESULTS if r[2]]
     for tag, desc, err in RESULTS:

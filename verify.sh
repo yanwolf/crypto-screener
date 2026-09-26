@@ -135,6 +135,7 @@ echo "✓ 補登執行緒金絲雀：數得到（每支測試結束時的計數�
 
 echo "── 21. 測試本身與工具的檢查（用法第 5 點、第 14 條）──"
 python3 -m tests.check_indexing        # 先索引、沒先確認有東西（r35）
+python3 -m tests.check_newapi          # 呼叫新介面前先守住同一個屬性、在用法之前（r78、r79）
 # 現在的測試跑 tests/legacy/ 下每一版舊程式：測試本身崩掉要是 0（r35、r36；r41 gold-scalper：自動跑每一版）
 nleg=0
 for d in tests/legacy/*/; do

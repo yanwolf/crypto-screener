@@ -1033,6 +1033,7 @@ def open_position(symbol_base, side, entry_hint, stop, info=None, note="", stop_
             "orders": sub, "opened": int(time.time() * 1000),
             "note": note, "warnings": errs + ([base_warn] if base_warn else []) + ([entry_note] if entry_note else []),
         }
+        pos["entryOrderId"] = oc["orderId"]           # r75：重啟後重排進場補登要用
         if entry_note:
             pos["entryUnverified"] = True             # r42：進場價是估的，結帳時損益記未知
             schedule_backfill({"kind": "open", "symbol": sym, "orderId": oc["orderId"], "qty": qty,
@@ -1822,23 +1823,29 @@ def record_close(pos, exit_px, reason):
         "leftover": None,
         "opened": pos.get("opened"), "closed": now_ms,
         "reason": reason, "note": pos.get("note", ""),
+        # r77：進場補登跑完之前就平掉了 → 記號跟著紀錄走，重啟後照紀錄再查（部位不在了，r75 只看開倉中的規則接不到）
+        "entryUnverified": bool(pos.get("entryUnverified")), "entryOrderId": pos.get("entryOrderId"),
+        "rUnit": _r_unit_of(pos, qty0),
     }
+    # r71、r76：出場價當下查不到 → 先記未知，背景再查幾次補登（補的是實際成交價，跟「未知不估算」不衝突）。
+    # 「補登還沒完成」的記號在結帳（界線）**之前**就寫進紀錄，跟紀錄一起存檔；補登完成或放棄時清掉。
+    oid_q = _last_close_order.pop(sym_, None)
+    close_job = None
+    if exit_px is None and not pos.get("entryUnverified"):
+        snap = {k: pos.get(k) for k in ("symbol", "side", "qty", "base", "opened", "fillsSince", "fillsFromId",
+                                        "closePartial", "unclaimedQty")}
+        r_unit = trade["rUnit"]
+        trade.update({"backfillPending": True, "closeOrderId": oid_q[0] if oid_q else None,
+                      "closeQty": pos.get("qty"), "closeSnap": snap})
+        close_job = {"kind": "close", "symbol": sym_, "tradeId": trade["id"], "rUnit": r_unit,
+                     "orderId": oid_q[0] if oid_q else None, "qty": pos.get("qty"), "snap": snap}
 
     # ── 2. 結帳（界線）──
     STATE["trades"].append(trade)
     STATE["positions"].pop(sym_, None)
     save_state()
-    # r71：出場價當下查不到 → 先記未知，背景隔幾秒到兩分鐘再查幾次補登（補的是實際成交價，跟「未知不估算」不衝突）
-    oid_q = _last_close_order.pop(sym_, None)
-    if exit_px is None and not pos.get("entryUnverified"):
-        snap = {k: pos.get(k) for k in ("symbol", "side", "qty", "base", "opened", "fillsSince", "fillsFromId",
-                                        "closePartial", "unclaimedQty")}
-        try:
-            r_unit = float((pos.get("exits") or {}).get("R") or 0) * float(qty0 or 0)
-        except (TypeError, ValueError):
-            r_unit = 0.0
-        schedule_backfill({"kind": "close", "symbol": sym_, "tradeId": trade["id"], "rUnit": r_unit,
-                           "orderId": oid_q[0] if oid_q else None, "qty": pos.get("qty"), "snap": snap})
+    if close_job:
+        schedule_backfill(close_job)
 
     # ── 3. 界線之後：各自 try，出錯只推播 ──
     def after(step, fn):
@@ -1957,12 +1964,29 @@ def _run_backfill(job):
                                     f"成交後約 {sum(BACKFILL_DELAYS[:BACKFILL_DELAYS.index(delay) + 1])} 秒查到）。{applied}")
                 return
         BACKFILL["failed"] += 1
+        _give_up_backfill(job)                        # r76：查不到放棄也要清掉記號（重啟後不再排）
         kind_name = {"open": "進場", "partial": "部分出場"}.get(job.get("kind"), "出場")
         _notify("成交價補登失敗", f"{sym} {kind_name}價背景查了 {len(BACKFILL_DELAYS)} 次仍查不到，"
                                   f"維持未知；單號 {job.get('orderId')}，請到幣安核對。")
     except Exception as e:
         BACKFILL["failed"] += 1
         _notify("成交價補登出錯", f"{sym}：{type(e).__name__}: {str(e)[:160]}（單號 {job.get('orderId')}）")
+
+
+def _r_unit_of(pos, qty0):
+    try:
+        return float((pos.get("exits") or {}).get("R") or 0) * float(qty0 or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _give_up_backfill(job):
+    with engine_section():
+        if job.get("kind") == "close":
+            t = next((x for x in STATE["trades"] if x.get("id") == job.get("tradeId")), None)
+            if t is not None and t.pop("backfillPending", None):
+                t["backfillGaveUp"] = True
+                save_state()
 
 
 def _apply_backfill(job, avg):
@@ -1972,9 +1996,15 @@ def _apply_backfill(job, avg):
             t = next((x for x in STATE["trades"] if x.get("id") == job.get("tradeId")), None)
             if t is None:
                 return "但找不到那筆平倉紀錄，沒有改動"
+            if t.get("exit") is not None:
+                # r77：這段期間出場價已經從別的地方拿到了——不覆寫，只把記號清掉
+                t.pop("backfillPending", None)
+                save_state()
+                return f"但紀錄上已經有出場價 {t['exit']}，沒有改動、記號已清掉"
             old = t.get("exit")
             t["exit"] = avg
             t["backfilled"] = True
+            t.pop("backfillPending", None)
             note = "出場價原本未知"
             try:
                 parts = t.get("partials") or []
@@ -1998,8 +2028,31 @@ def _apply_backfill(job, avg):
             save_state()
             return note + ("" if old is None else f"（原值 {old}）")
         pos = STATE["positions"].get(job.get("symbol"))
+        if (pos is None or pos.get("opened") != job.get("opened")) and job.get("kind") == "open":
+            # r77：進場補登跑完之前部位就平掉了 → 補到那筆已平倉紀錄上（進場價、損益）
+            t = next((x for x in STATE["trades"] if x.get("symbol") == job.get("symbol") and x.get("opened") == job.get("opened")), None)
+            if t is None:
+                return "但那筆部位已不在帳上、也找不到平倉紀錄，沒有改動"
+            old = t.get("entry")
+            t["entry"] = avg
+            t["entryUnverified"] = False
+            note = f"進場價原估 {old}，已補到平倉紀錄"
+            if t.get("exit") is not None and not any(p.get("pnl") is None for p in t.get("partials") or []):
+                sgn = 1 if t.get("side") == "LONG" else -1
+                q = float(t.get("qty") or 0)
+                q_last = q - sum(float(p.get("qty") or 0) for p in t.get("partials") or [])
+                pnl = sum(float(p["pnl"]) for p in t.get("partials") or []) + (float(t["exit"]) - avg) * sgn * q_last
+                t["pnl"] = round(pnl, 4)
+                r_unit = float(t.get("rUnit") or 0)
+                t["rMultiple"] = round(pnl / r_unit, 2) if r_unit else None
+                note += f"，損益補算 {t['pnl']:+.2f} U"
+            save_state()
+            return note
         if pos is None or pos.get("opened") != job.get("opened"):
             return "但那筆部位已不在帳上，沒有改動"           # 結帳時已經跳過那段（unclaimedQty），不用再做
+        if job.get("kind") == "partial" and any(p.get("px") is None and p.get("ts", 0) < (job.get("partTs") or 0)
+                                                for p in pos.get("partials") or []):
+            return "但前面還有更早的段沒補到，界線只能依序推進，這段先不動"
         if job.get("kind") == "partial":
             part = next((p for p in pos.get("partials") or [] if p.get("ts") == job.get("partTs")), None)
             if part is None:
@@ -2944,7 +2997,52 @@ def load_state(path, _retry=False):
     STATE["loadError"] = None
     if was:
         _notify("狀態檔已讀到，恢復開新倉", f"{path}\n（已補上：先前讀取失敗 {was.get('attempts', 1)} 次）")
+    try:
+        reschedule_backfills()                 # r75：排好的背景補登是執行緒，重啟就沒了——照狀態重新排
+    except Exception as e:
+        _pos_step_error("重排背景補登", "", e)
     return True, None
+
+
+def reschedule_backfills():
+    """重啟後照狀態重新排背景補登（第 15 條 r75）：記號存進狀態檔還不夠，補登本身是執行緒。
+    - 還開著的部位：進場成交價還沒驗證、有開倉單號 → 進場補登；部分出場某段成交價未知 → 那段的補登（依序，前面的段先）。
+    - 已平倉紀錄：出場價未知、還標著待補登（有平倉單號或界線）→ 出場補登。每筆重啟後最多再排 2 次，避免永遠查不到的一直重排。
+    回傳排了幾個。"""
+    n = 0
+    for sym, pos in list(STATE["positions"].items()):
+        if pos.get("entryUnverified") and pos.get("entryOrderId") is not None and pos.get("entryRetries", 0) < 2:
+            pos["entryRetries"] = pos.get("entryRetries", 0) + 1
+            schedule_backfill({"kind": "open", "symbol": sym, "orderId": pos["entryOrderId"], "qty": pos.get("qty0") or pos.get("qty"),
+                               "opened": pos.get("opened"), "side": pos.get("side")})
+            n += 1
+        skip_before = 0.0
+        for p in pos.get("partials") or []:
+            if p.get("px") is not None:
+                continue
+            if p.get("retries", 0) < 2 and float(pos.get("base") or 0) <= 0:
+                p["retries"] = p.get("retries", 0) + 1
+                snap = {k: pos.get(k) for k in ("symbol", "side", "base", "opened", "fillsSince", "fillsFromId")}
+                snap["unclaimedQty"] = skip_before          # 前面還沒認領的段先跳過（界線只能依序推進）
+                schedule_backfill({"kind": "partial", "symbol": sym, "opened": pos.get("opened"),
+                                   "qty": p.get("qty"), "partTs": p.get("ts"), "snap": snap})
+                n += 1
+            skip_before += float(p.get("qty") or 0)
+    for t in STATE["trades"][-50:]:
+        if t.get("entryUnverified") and t.get("entryOrderId") is not None and t.get("entryRetries", 0) < 2:
+            # r77：進場補登跑完之前就平掉、接著重啟——照紀錄上的記號再查，補到紀錄上
+            t["entryRetries"] = t.get("entryRetries", 0) + 1
+            schedule_backfill({"kind": "open", "symbol": t.get("symbol"), "orderId": t["entryOrderId"], "qty": t.get("qty"),
+                               "opened": t.get("opened"), "side": t.get("side")})
+            n += 1
+        if t.get("exit") is None and t.get("backfillPending") and t.get("backfillRetries", 0) < 2:
+            t["backfillRetries"] = t.get("backfillRetries", 0) + 1
+            schedule_backfill({"kind": "close", "symbol": t.get("symbol"), "tradeId": t.get("id"), "rUnit": t.get("rUnit") or 0,
+                               "orderId": t.get("closeOrderId"), "qty": t.get("closeQty") or t.get("qty"), "snap": t.get("closeSnap") or {}})
+            n += 1
+    if n:
+        save_state()
+    return n
 
 
 def _load_failed(path, e, retry):
