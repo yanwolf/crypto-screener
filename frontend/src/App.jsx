@@ -181,6 +181,21 @@ function CryptoScreener() {
     return () => { dead = true; clearInterval(t); };
   }, [local]);
 
+  // CoinGecko 用量（2026-09-29）：顯示在補掃／重掃旁邊，按之前先看額度
+  const [cgUsage, setCgUsage] = useState(null);
+  const refreshCgUsage = useCallback(async () => {
+    try {
+      const r = await fetch("/api/cg/usage", { cache: "no-store" });
+      if (r.ok) setCgUsage(await r.json());
+    } catch (e) { /* 忽略：只是參考資訊 */ }
+  }, []);
+  useEffect(() => {
+    if (!local) { setCgUsage(null); return; }
+    refreshCgUsage();
+    const t = setInterval(refreshCgUsage, 60000);
+    return () => clearInterval(t);
+  }, [local, refreshCgUsage]);
+
   useEffect(() => {
     if (!local) { setServerTs({}); return; }
     let dead = false;
@@ -398,7 +413,7 @@ function CryptoScreener() {
    回傳 { blocks, warns }。blocks 非空就不該送單。 */
 
 /* ── 雷達掃描 ── */
-  const scan = useCallback(async (list) => {
+  const scan = useCallback(async (list, opts = {}) => {
     if (source === "demo") return;
     cancelRef.current = false;
     setBatch({ running: true, done: 0, total: list.length, now: "" });
@@ -407,10 +422,16 @@ function CryptoScreener() {
       const c = list[i];
       setBatch((b) => ({ ...b, now: c.sym }));
       try {
-        const chart = await cgFetch(`/coins/${c.id}/market_chart?vs_currency=usd&days=90`, cfg);
+        const chart = await cgFetch(`/coins/${c.id}/market_chart?vs_currency=usd&days=90`, cfg, opts);
         setScans((prev) => ({ ...prev, [c.id]: extractScan(chart, c.vol) }));
       } catch (e) {
         if (e.message === "RATE" || e.message === "BLOCKED" || e.message === "NOPROXY") { setError(errText(e)); break; }
+        if (e.message === "NOTCACHED") {
+          // 不是失敗：伺服器還沒補到這檔。30 分鐘後再看伺服器有沒有（一般失敗是 6 小時）
+          setScans((prev) => ({ ...prev, [c.id]: { err: true, errWhy: "等伺服器補", ts: Date.now() - ERR_RETRY_MS + 30 * 60000 } }));
+          setBatch((b) => ({ ...b, done: i + 1 }));
+          continue;
+        }
         setScans((prev) => ({ ...prev, [c.id]: { err: true, errWhy: errText(e).slice(0, 40), ts: Date.now() } }));
       }
       setBatch((b) => ({ ...b, done: i + 1 }));
@@ -852,7 +873,7 @@ function CryptoScreener() {
 
   /* 背景漸進掃描：一次一檔，關掉分頁也會停，重開後從斷點續掃 */
   const bgRef = useRef({});
-  bgRef.current = { queue, running: batch.running, source, scan, loading };
+  bgRef.current = { queue, running: batch.running, source, scan, loading, followServer: local && Object.keys(serverTs).length > 0 };
   useEffect(() => {
     if (!bgScan) return;
     let stop = false;
@@ -861,7 +882,8 @@ function CryptoScreener() {
         const b = bgRef.current;
         if (b.source === "demo") break;
         if (!b.running && !b.loading && b.queue.length) {
-          await b.scan(b.queue.slice(0, 1));
+          // 伺服器模式：背景掃描只讀伺服器已有的資料（伺服器的監控持續在更新），沒有的等伺服器補
+          await b.scan(b.queue.slice(0, 1), { cacheOnly: b.followServer });
         } else {
           await sleep(3000);
         }
@@ -974,7 +996,7 @@ function CryptoScreener() {
   };
 
   /* 分頁元件共用的狀態袋 */
-  const S = { pf, setPf, pfBusy, setPfBusy, COLS, DOWN, UP, activePreset, alertCfg, allHistory, apiKey, applyQuick, autoEdit, autoRefresh, autoScan, batch, batchN, bgScan, cancelRef, cell, cfg, chainAt, chainBuckets, chainBusy, chainDetail, chainErr, chainTokens, coverage, deepN, deriv, derivBusy, detail, detectProxy, diag, diagAbort, diagBusy, dirs, history, kpi, liveBusy, liveCheck, loadDemo, loadMarkets, loadRef, loading, local, minLiq, minMcap, minSafe, minVol, mon, monHistory, monMsg, monRefresh, monScope, monSync, monTopN, narrow, net, noSort, noStable, noWrapped, notifyLog, pages, pair, poolMode, pro, proxy, proxyForce, proxyMode, q, queue, quick, refreshTrade, rows, runDiag, runEngine, saveState, scan, scanChain, scanEvery, scanTTL, scannedCount, serverTs, setActivePreset, setAlertCfg, setApiKey, setAutoEdit, setAutoScan, setBatchN, setBgScan, setChainAt, setChainDetail, setChainErr, setChainTokens, setDeepN, setDetail, setDiagBusy, setDirs, setHistory, setLiveBusy, setLiveCheck, setMinLiq, setMinMcap, setMinSafe, setMinVol, setMonMsg, setMonScope, setMonTopN, setNet, setNoStable, setNoWrapped, setNotifyLog, setPair, setPoolMode, setPreset, setPro, setProxy, setProxyForce, setProxyMode, setQ, setScanEvery, setScanTTL, setShowWeights, setSigStates, setSmartRaw, setSortDir, setSortKey, setTargetEdit, setTgAdmin, setTgToken, setTrade, setTradeIdx, setTradeMsg, setTradeSide, setTradeTargets, setTradesLimit, setTradesOpen, setView, setWeights, showWeights, side, sigStates, smartRaw, sortBy, sortDir, sortKey, sorted, source, srvHistory, srvRefresh, startPair, stats, target, targetEdit, tg, tgAdmin, tgCall, tgMsg, tgRefresh, tgSetup, tgToken, toggleWatch, tone, trade, tradeBaseRef, tradeBusy, tradeCall, tradeIdx, tradeMsg, tradeSide, tradeTargets, tradesLimit, tradesOpen, universe, view, watch, weights };
+  const S = { cgUsage, refreshCgUsage, pf, setPf, pfBusy, setPfBusy, COLS, DOWN, UP, activePreset, alertCfg, allHistory, apiKey, applyQuick, autoEdit, autoRefresh, autoScan, batch, batchN, bgScan, cancelRef, cell, cfg, chainAt, chainBuckets, chainBusy, chainDetail, chainErr, chainTokens, coverage, deepN, deriv, derivBusy, detail, detectProxy, diag, diagAbort, diagBusy, dirs, history, kpi, liveBusy, liveCheck, loadDemo, loadMarkets, loadRef, loading, local, minLiq, minMcap, minSafe, minVol, mon, monHistory, monMsg, monRefresh, monScope, monSync, monTopN, narrow, net, noSort, noStable, noWrapped, notifyLog, pages, pair, poolMode, pro, proxy, proxyForce, proxyMode, q, queue, quick, refreshTrade, rows, runDiag, runEngine, saveState, scan, scanChain, scanEvery, scanTTL, scannedCount, serverTs, setActivePreset, setAlertCfg, setApiKey, setAutoEdit, setAutoScan, setBatchN, setBgScan, setChainAt, setChainDetail, setChainErr, setChainTokens, setDeepN, setDetail, setDiagBusy, setDirs, setHistory, setLiveBusy, setLiveCheck, setMinLiq, setMinMcap, setMinSafe, setMinVol, setMonMsg, setMonScope, setMonTopN, setNet, setNoStable, setNoWrapped, setNotifyLog, setPair, setPoolMode, setPreset, setPro, setProxy, setProxyForce, setProxyMode, setQ, setScanEvery, setScanTTL, setShowWeights, setSigStates, setSmartRaw, setSortDir, setSortKey, setTargetEdit, setTgAdmin, setTgToken, setTrade, setTradeIdx, setTradeMsg, setTradeSide, setTradeTargets, setTradesLimit, setTradesOpen, setView, setWeights, showWeights, side, sigStates, smartRaw, sortBy, sortDir, sortKey, sorted, source, srvHistory, srvRefresh, startPair, stats, target, targetEdit, tg, tgAdmin, tgCall, tgMsg, tgRefresh, tgSetup, tgToken, toggleWatch, tone, trade, tradeBaseRef, tradeBusy, tradeCall, tradeIdx, tradeMsg, tradeSide, tradeTargets, tradesLimit, tradesOpen, universe, view, watch, weights };
 
   return (
     <div style={{ background: C.ink, color: C.bone, fontFamily: FONT.body, minHeight: "100vh" }}>

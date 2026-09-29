@@ -1137,6 +1137,10 @@ AUTO = {
     "closedUsd": 0.0,          # 今日已實現 U（R 對政策有意義，U 對人有意義）
     "blockedAtR": None, "blockedAtUsd": None,   # 觸發停止那一刻的數字
     "lastClose": {},           # symbol → 最後平倉時間
+    # 以下兩個以前是執行時才用 setdefault 長出來的——讀狀態檔時只收「預設值裡有的鍵」，重啟就被丟掉：
+    # 獲利平倉的幣重啟後被當成虧損、套 120 分鐘長冷卻（2026-09-26 2Z 實例）；當日未知筆數歸零、斷路器少算。
+    "lastCloseWin": {},        # symbol → 最後一筆是不是獲利（True／False／None＝損益未知）
+    "unknownToday": 0,         # 今日損益未知的筆數（斷路器以每筆 -1R 計）
     "blocked": None,           # 當日被停用的原因
 }
 def _today():

@@ -135,6 +135,12 @@ python3 -m tests.test_auto_persist
 
 echo "── 20o. 第 8 條 r86：停止開關與「決定出場、還沒平完」重啟後還在、寫的一方白名單沒漏 ──"
 python3 -m tests.test_r86
+
+echo "── 20p. CoinGecko 額度：低優先的幣降頻、網頁背景掃描只讀快取、用量按來源計數 ──"
+python3 -m tests.test_cg_budget
+
+echo "── 20p. CoinGecko 額度：低優先降頻、網頁背景掃描只讀快取、用量按來源計數 ──"
+python3 -m tests.test_cg_budget
 # 每支測試結束時都會數「真的開了幾個補登執行緒」（不是 0 就以 ✕ 結束）；金絲雀確認數得到
 BACKFILL_CANARY=1 python3 -m tests.test_r32 > /dev/null || { echo "  ✕ 補登執行緒金絲雀沒數到"; exit 1; }
 echo "✓ 補登執行緒金絲雀：數得到（每支測試結束時的計數可信）"

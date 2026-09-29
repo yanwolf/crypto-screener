@@ -136,7 +136,8 @@ def revalidate_async(path_qs, prefix, key):
 
     def run():
         try:
-            st, body = fetch_upstream(path_qs, prefix)
+            with cg_source("代理背景更新"):
+                st, body = fetch_upstream(path_qs, prefix)
             if st == 200:
                 cache_put(key, body)
         except Exception:
@@ -489,10 +490,63 @@ def mon_save():
                                            "histTTL", "maxRefresh", "callsToday")})
 
 
+HIST_TTL_LOW = float(os.environ.get("HIST_TTL_LOW", 72))     # 幣安沒有的幣、已持倉的幣：歷史保鮮（小時）
+
+
+def _bn_candidates(sym):
+    s = (sym or "").upper()
+    return (f"{s}USDT", f"1000{s}USDT", f"1000000{s}USDT", f"1M{s}USDT")
+
+
+def binance_listed_and_held():
+    """幣安合約清單（取不到就回 None：一律當成有上架，不降頻）與目前持倉的合約代號。"""
+    listed, held = None, set()
+    if trader is not None:
+        try:
+            f = trader.load_filters()
+            if f:
+                listed = {k for k, v in f.items() if (v or {}).get("status") == "TRADING"}
+        except Exception:
+            listed = None
+        held = set((trader.STATE.get("positions") or {}).keys()) | set((trader.STATE.get("pending") or {}).keys())
+    return listed, held
+
+
+def low_priority(sym, listed, held):
+    """回傳降頻的原因：held（已持倉）／unlisted（幣安沒有合約）／None（正常）。"""
+    cands = _bn_candidates(sym)
+    if any(c in held for c in cands):
+        return "held"
+    if listed is not None and not any(c in listed for c in cands):
+        return "unlisted"
+    return None
+
+
+def _upstream_error_text(st, body):
+    """把上游錯誤講清楚（2026-09-29：只寫「上游回應 403」看不出是額度用完、還是公開端點擋了伺服器 IP）。"""
+    try:
+        d = json.loads(body or b"{}")
+    except Exception:
+        d = {}
+    s = d.get("status") if isinstance(d.get("status"), dict) else d
+    code = s.get("error_code") if isinstance(s, dict) else None
+    msg = str((s or {}).get("error_message") or d.get("error") or "")[:120] if isinstance(s, dict) else ""
+    if code == 10006 or "calls limit" in msg:
+        return f"CoinGecko 每月額度用完（上游回應 {st}）：要等下個月重置或升級方案"
+    if st == 403 and QUOTA.get("exhausted"):
+        return ("CoinGecko 金鑰月額度已用完、改走公開端點也被拒（上游回應 403，公開端點常擋雲端主機的 IP）："
+                "要等下個月重置或升級方案")
+    if st == 403:
+        return f"CoinGecko 拒絕這個請求（上游回應 403）：金鑰失效、方案不符，或伺服器 IP 被擋{'：' + msg if msg else ''}"
+    if st == 429:
+        return "CoinGecko 請求太頻繁（上游回應 429）：稍後自動重試"
+    return f"上游回應 {st}{'：' + msg if msg else ''}"
+
+
 def mon_fetch_json(path):
     st, body = fetch_upstream(path)
     if st != 200:
-        raise RuntimeError(f"上游回應 {st}")
+        raise RuntimeError(_upstream_error_text(st, body))
     return json.loads(body)
 
 
@@ -638,6 +692,11 @@ def push_all(title, text):
 
 def mon_run_once():
     """跑一輪：抓行情 → 取歷史 → 評分 → 判斷訊號 → 發通知"""
+    with cg_source("監控"):
+        return _mon_run_once()
+
+
+def _mon_run_once():
     if not (engine and MON["cfg"]):
         return 0
     if MON["scope"] != "top" and not MON["watch"]:
@@ -657,12 +716,21 @@ def mon_run_once():
             "&sparkline=false&price_change_percentage=24h,7d,30d&ids=" + ",".join(ids[:250]))
     rows = []
     refreshed = [0]                 # 本輪實際向上游補抓的檔數
+    listed, held = binance_listed_and_held()
+    low = {"unlisted": 0, "held": 0}
     for c in markets:
         path = f"/coins/{c['id']}/market_chart?vs_currency=usd&days=90"
         key = "/api/v3" + path
         # 90 天歷史一天內不會有意義的變化，快取沿用到 TTL 到期為止。
         # 量能倍數是用「快取基準量 ÷ 即時成交量」現算的，所以訊號仍然即時。
-        body = cache_get(key, MON.get("histTTL", 12) * 3600)
+        # 2026-09-29：幣安沒有合約的幣、已經持倉的幣，就算出訊號也不會下單——歷史保鮮拉長到 HIST_TTL_LOW 小時，
+        # 把額度留給能交易的。幣安後來上架、或部位平掉之後，下一輪就回到正常保鮮。
+        ttl_h = MON.get("histTTL", 12)
+        why_low = low_priority(c.get("symbol"), listed, held)
+        if why_low:
+            low[why_low] += 1
+            ttl_h = max(ttl_h, HIST_TTL_LOW)
+        body = cache_get(key, ttl_h * 3600)
         if body is None:
             if refreshed[0] >= MON.get("maxRefresh", 8):
                 continue                      # 單輪補抓上限，避免一次把額度用光
@@ -689,6 +757,7 @@ def mon_run_once():
         except Exception:
             continue
 
+    MON["lowPri"] = dict(low, ttlH=HIST_TTL_LOW)
     now_ms = time.time() * 1000
     events, states = engine.evaluate(rows, MON["cfg"], MON["states"], now_ms)
 
@@ -894,7 +963,8 @@ def hourly_prices(cid):
     key = _deep_key(cid)
     body, _ = cache_peek(key)
     if body is None:
-        st, body = fetch_upstream(f"/coins/{cid}/market_chart?vs_currency=usd&days=90")
+        with cg_source("影子追蹤"):
+            st, body = fetch_upstream(f"/coins/{cid}/market_chart?vs_currency=usd&days=90")
         if st != 200:
             return None
         cache_put(key, body)
@@ -1196,6 +1266,9 @@ def trade_handle(path, payload):
             "lastPush": MON.get("lastPushTs"),
         }
         st["cgCooldown"] = {"active": cg_cooling(), "until": int(CG_COOL["until"] * 1000), "hits": CG_COOL["hits"]}
+        st["cgCalls"] = {"day": CG_CALLS["day"], "today": dict(CG_CALLS["today"]),
+                         "month": CG_CALLS["month"], "thisMonth": dict(CG_CALLS["thisMonth"]),
+                         "lowPri": MON.get("lowPri")}
         st["poll"] = float(os.environ.get("POSITION_POLL", 20))
         st["readiness"] = live_readiness()
         st["notify"] = {"channels": notify_channels(), "errors": NOTIFY_ERR["errors"][-10:],
@@ -1729,12 +1802,95 @@ def ttl_for(path_qs: str) -> float:
     return OHLC_TTL if "/ohlc" in path_qs or "market_chart" in path_qs else CACHE_TTL
 
 
+# CoinGecko 用量按來源計數（2026-09-29：月額度 29 日用完，要看得出是誰在吃）。只算真的打到 CoinGecko 的（有 CG_UPSTREAM 時算轉發）
+CG_CALLS = {"day": None, "today": {}, "month": None, "thisMonth": {}, "since": None}
+_cg_src = threading.local()
+_cg_saved = [0.0]
+CG_DEMO_MONTHLY = 10000          # Demo 方案每月總額度（Pro 方案看自己的方案）
+
+
+def cg_calls_file():
+    return os.path.join(CACHE_DIR, "cg_calls.json")
+
+
+def cg_calls_load():
+    """重啟後讀回本月計數（不然每次部署都從 0 開始，看不出本月用了多少）。讀不到就從 0 開始並寫明起算時間。"""
+    try:
+        with open(cg_calls_file(), "r", encoding="utf-8") as f:
+            d = json.load(f)
+        if isinstance(d, dict) and d.get("month") == time.strftime("%Y-%m", time.gmtime()):
+            CG_CALLS.update({k: d.get(k) for k in ("day", "today", "month", "thisMonth", "since")})
+            CG_CALLS["today"] = CG_CALLS["today"] or {}
+            CG_CALLS["thisMonth"] = CG_CALLS["thisMonth"] or {}
+            if CG_CALLS["day"] != time.strftime("%Y-%m-%d", time.gmtime()):
+                CG_CALLS.update(day=None, today={})
+    except Exception:
+        pass
+
+
+def _cg_calls_save(force=False):
+    if not force and time.time() - _cg_saved[0] < 30:
+        return
+    _cg_saved[0] = time.time()
+    try:
+        tmp = cg_calls_file() + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(CG_CALLS, f, ensure_ascii=False)
+        os.replace(tmp, cg_calls_file())
+    except Exception:
+        pass                                  # 只是用量統計，存不下不影響交易
+
+
+def cg_usage():
+    """給網頁看的用量（本機的）。"""
+    return {"day": CG_CALLS["day"], "today": dict(CG_CALLS["today"] or {}),
+            "month": CG_CALLS["month"], "thisMonth": dict(CG_CALLS["thisMonth"] or {}),
+            "since": CG_CALLS.get("since"), "relay": bool(CG_UPSTREAM),
+            "hasKey": bool(CFG.get("key")), "pro": bool(CFG.get("pro")),
+            "limit": None if CFG.get("pro") else CG_DEMO_MONTHLY,
+            "exhausted": bool(QUOTA.get("exhausted")), "cooling": cg_cooling(),
+            "lowPri": MON.get("lowPri")}
+
+
+class cg_source:
+    """with cg_source("monitor"): —— 這條執行緒接下來打 CoinGecko 算在哪個來源。"""
+
+    def __init__(self, name):
+        self.name = name
+
+    def __enter__(self):
+        self.old = getattr(_cg_src, "name", None)
+        _cg_src.name = self.name
+
+    def __exit__(self, *a):
+        _cg_src.name = self.old
+        return False
+
+
+def _count_cg(path_qs):
+    kind = "markets" if "/coins/markets" in path_qs else ("history" if "market_chart" in path_qs else "other")
+    src = getattr(_cg_src, "name", None) or "other"
+    key = f"{src}·{kind}" + ("（轉發）" if CG_UPSTREAM else "")
+    day, month = time.strftime("%Y-%m-%d", time.gmtime()), time.strftime("%Y-%m", time.gmtime())
+    if CG_CALLS["day"] != day:
+        CG_CALLS.update(day=day, today={})
+    if CG_CALLS["month"] != month:
+        CG_CALLS.update(month=month, thisMonth={}, since=int(time.time() * 1000))
+    if not CG_CALLS.get("since"):
+        CG_CALLS["since"] = int(time.time() * 1000)
+    CG_CALLS["today"][key] = CG_CALLS["today"].get(key, 0) + 1
+    CG_CALLS["thisMonth"][key] = CG_CALLS["thisMonth"].get(key, 0) + 1
+    _cg_calls_save()
+
+
 def fetch_upstream(path_qs: str, prefix: str = "/api/v3", background: bool = False):
     """回傳 (status, body_bytes)。含節流與 429 退避。
     background=True：背景工作——CoinGecko 冷卻期間不打上游、直接回 429（不重試、不佔節流閘）。"""
     if background and prefix == "/api/v3" and cg_cooling():
         return 429, json.dumps({"error": "cg_cooldown", "detail": "CoinGecko 剛回 429，背景請求讓路中"},
                                ensure_ascii=False).encode()
+    if prefix == "/api/v3":
+        _count_cg(path_qs)
     url = upstream_url(path_qs) if prefix == "/api/v3" else UPSTREAMS[prefix] + path_qs
     req = urllib.request.Request(url, headers={
         "User-Agent": "local-crypto-screener/1.0",
@@ -1791,6 +1947,22 @@ class Handler(http.server.SimpleHTTPRequestHandler):
     # ── 路由 ──────────────────────────────────────────────
     def do_GET(self):
         p = self.path.split("?")[0]
+        if p == "/api/cg/usage":
+            # CoinGecko 用量（2026-09-29）：放在網頁補掃／重掃旁邊。模擬網沒有自己的額度，照 /api/deep/ts 的做法問上游（額度在那邊）
+            data = None
+            if CG_UPSTREAM:
+                try:
+                    req = urllib.request.Request(CG_UPSTREAM + "/api/cg/usage",
+                                                 headers={"User-Agent": "crypto-screener/relay"})
+                    with urllib.request.urlopen(req, timeout=10) as r:
+                        data = json.loads(r.read())
+                        data["via"] = "upstream"
+                except Exception as e:
+                    data = {"error": f"問不到上游的用量：{type(e).__name__}"}
+            if data is None:
+                data = cg_usage()
+            return self.send_json(200, json.dumps(data, ensure_ascii=False).encode())
+
         if p == "/api/deep/ts":
             # 有上游時，深度資料的時間戳以上游為準——資料本來就在那邊
             if CG_UPSTREAM:
@@ -1948,6 +2120,16 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         # 行情差幾十秒不影響量能倍數的判讀，畫面卡住才是問題。
         # 行情榜（/coins/markets）不設寬限上限：只要快取裡有舊的就先送、背景更新——畫面永遠不等上游（回應帶 X-Stale-Age，網頁會標「快取」）。
         stale, age = cache_peek(key)
+        if self.headers.get("X-Cache-Only") == "1" and prefix == "/api/v3":
+            # 網頁的背景掃描（2026-09-29）：伺服器有就給（再舊都給，網頁自己比時間戳），沒有就說沒有——
+            # 伺服器的監控本來就在更新這些資料，網頁不該為了背景掃描再去打 CoinGecko
+            if stale is not None:
+                return self.send_json(200, stale, cached=True, stale=int(age or 0), data_ts=time.time() - (age or 0))
+            self.send_response(404)
+            self.send_header("X-Cache", "CACHE-ONLY-MISS")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         markets = prefix == "/api/v3" and "/coins/markets" in path_qs
         if stale is not None and age is not None and (markets or age < ttl + STALE_GRACE):
             revalidate_async(path_qs, prefix, key)
@@ -1955,7 +2137,9 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
         # 深度資料（瀏覽器的背景深掃）是背景工作：冷卻期間直接讓路
         background = prefix == "/api/v3" and ("market_chart" in path_qs or "/ohlc" in path_qs)
-        status, body = fetch_upstream(path_qs, prefix, background=background)
+        who = "模擬網" if "relay" in (self.headers.get("User-Agent") or "") or "screener/1.0" in (self.headers.get("User-Agent") or "") else "網頁"
+        with cg_source(who):
+            status, body = fetch_upstream(path_qs, prefix, background=background)
         if status == 200:
             cache_put(key, body)
             # 網頁抓行情榜時順便更新宇宙清單，這樣即使沒開補抓，
@@ -2078,6 +2262,7 @@ def prefetch_worker(count: int, ttl_h: float):
     幾輪之後各檔的到期時間自然錯開，負載變成穩定的細流。
     """
     time.sleep(5)
+    _cg_src.name = "滾動補抓"                    # 這條執行緒整條都算在滾動補抓
     budget = int(os.environ.get("REFRESH_BUDGET", 0)) or max(24, int(count * 24 / ttl_h * 1.3))
     interval = 86400.0 / budget
     REFRESH["budget"] = budget
@@ -2239,6 +2424,7 @@ def main():
 
     tg_load()
     mon_load()
+    cg_calls_load()
     chans = [n for n, v in (("Telegram", _tg["token"]),
                             ("Discord", NOTIFY["discord"]),
                             ("電子郵件", NOTIFY["smtp_host"] and NOTIFY["mail_to"])) if v]

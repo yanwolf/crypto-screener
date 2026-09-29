@@ -53,6 +53,7 @@ def fake_cg(M, status=200, body=b'[{"id":"bitcoin"}]'):
 def proxy(M, path):
     h = M.Handler.__new__(M.Handler)
     h.path = path
+    h.headers = {}                                              # 真的請求一定有標頭（2026-09-29 起代理會讀 X-Cache-Only）
     out = {}
 
     def send_json(code, body, cached=False, stale=None, data_ts=None):

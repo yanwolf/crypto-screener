@@ -22,7 +22,7 @@ function enqueue(fn, minGap) {
   gate.chain = run.catch(() => {});
   return run;
 }
-async function cgFetch(path, cfg) {
+async function cgFetch(path, cfg, opts = {}) {
   const minGap = cfg.local ? 250 : cfg.key ? 900 : 2400;
   return enqueue(async () => {
     for (let attempt = 0; attempt < 3; attempt++) {
@@ -32,6 +32,8 @@ async function cgFetch(path, cfg) {
       try {
         res = await fetch(buildUrl(path, cfg), {
           method: "GET", mode: "cors", cache: "no-store", signal: ac ? ac.signal : undefined,
+          // 背景掃描只讀伺服器的快取，不讓伺服器為了它去打 CoinGecko（2026-09-29）
+          headers: opts.cacheOnly && cfg.local ? { "X-Cache-Only": "1" } : undefined,
         });
       } catch (e) {
         if (tid) clearTimeout(tid);
@@ -42,6 +44,7 @@ async function cgFetch(path, cfg) {
         if (attempt < 2) { await sleep(6000 * (attempt + 1)); continue; }
         throw new Error("RATE");
       }
+      if (res.status === 404 && res.headers.get("X-Cache") === "CACHE-ONLY-MISS") throw new Error("NOTCACHED");
       if (res.status === 401 || res.status === 403) throw new Error("AUTH");
       if (res.status === 404 && cfg.local && !res.headers.get("X-Cache")) throw new Error("NOPROXY");
       if (res.status >= 500) {
@@ -60,6 +63,7 @@ const ERR_MSG = {
   RATE: "CoinGecko 回 429，額度已滿。無金鑰時每分鐘只有 5–15 次；等一分鐘再試，或填入免費 Demo API Key 提高到每分鐘 30 次。",
   QUOTA: "Demo Key 的每月 10,000 次總額度已用盡（error_code 10006）。等一分鐘沒有用，要等到下個月重置。請調高監控間隔、關閉自動更新，或升級 CoinGecko 方案。",
   AUTH: "API Key 被拒絕。確認金鑰沒打錯，且 Pro 金鑰才需勾選 Pro。",
+  NOTCACHED: "伺服器還沒有這檔的資料，等伺服器的監控補抓",
   SERVER: "CoinGecko 伺服器暫時異常，稍後重試。",
   TIMEOUT: "請求超過 25 秒沒有回應。若走伺服器代理，通常是伺服器正在等額度或重新部署；按「執行連線診斷」可以看出卡在哪一步。",
   NOPROXY: "同源路徑 /api/v3 沒有回應，代理可能重新部署中或已停止。程式會自動改回直連，稍後可按「重新偵測」。",

@@ -4,9 +4,54 @@ import { BearMap, RadarMap, Stat } from "../components/Small.jsx";
 import { METRICS, PRESETS, QUICK_BEAR, QUICK_BULL } from "../constants.js";
 import { C, FONT } from "../theme.js";
 
+/* CoinGecko 用量（2026-09-29）：放在補掃／重掃旁邊，按之前先看還剩多少額度。
+   補掃／重掃每檔約用 1 次（伺服器已有的檔不算）。額度用完是真的警告，才用紅色。 */
+const SRC_ORDER = ["監控", "網頁", "模擬網", "滾動補抓", "代理背景更新", "影子追蹤"];
+function sumBySource(m) {
+  const out = {};
+  for (const [k, v] of Object.entries(m || {})) {
+    const src = k.split("·")[0].replace("（轉發）", "") || "其他";
+    out[src] = (out[src] || 0) + (Number(v) || 0);
+  }
+  return out;
+}
+function CgUsage({ u, batchN, onRefresh }) {
+  if (!u) return null;
+  if (u.error) return <span style={{ fontSize: 11.5, color: C.muted }}>CoinGecko 用量：{u.error}</span>;
+  const today = sumBySource(u.today), month = sumBySource(u.thisMonth);
+  const tTotal = Object.values(today).reduce((a, b) => a + b, 0);
+  const mTotal = Object.values(month).reduce((a, b) => a + b, 0);
+  const since = u.since ? new Date(u.since) : null;
+  const left = u.limit ? u.limit - mTotal : null;
+  const srcs = [...SRC_ORDER.filter((k) => month[k]), ...Object.keys(month).filter((k) => !SRC_ORDER.includes(k))];
+  const warn = u.exhausted || (left != null && left < batchN * 3);
+  return (
+    <div className="w-full" style={{ fontSize: 11.5, color: C.muted, lineHeight: 1.7 }}>
+      <span>CoinGecko 用量{u.via === "upstream" ? "（正式網伺服器，額度在那邊）" : ""}　</span>
+      <span style={{ fontFamily: FONT.data, color: C.bone }}>今日 {tTotal}</span>
+      <span>　本月 </span>
+      <span style={{ fontFamily: FONT.data, color: warn ? C.red : C.gold }}>
+        {mTotal}{u.limit ? ` / ${u.limit.toLocaleString()}` : ""}
+      </span>
+      {since && <span>（自 {since.getMonth() + 1}/{since.getDate()} 起記錄）</span>}
+      {u.exhausted && <span style={{ color: C.red }}>　月額度已用完：補掃／重掃會改走公開端點，常被拒</span>}
+      {!u.exhausted && left != null && <span>　這次補掃 {batchN} 檔最多約用 {batchN} 次</span>}
+      {srcs.length > 0 && (
+        <div style={{ fontFamily: FONT.data }}>
+          本月來源　{srcs.map((k) => `${k} ${month[k]}`).join("　·　")}
+          {u.lowPri && (u.lowPri.unlisted || u.lowPri.held)
+            ? `　（降頻中：幣安沒有 ${u.lowPri.unlisted || 0}、已持倉 ${u.lowPri.held || 0} 檔，${u.lowPri.ttlH} 小時才補）` : ""}
+          <button onClick={onRefresh} className="ml-2 px-1.5 rounded"
+            style={{ background: "transparent", border: `1px solid ${C.line}`, color: C.muted, fontSize: 11 }}>更新</button>
+        </div>
+      )}
+    </div>
+  );
+}
+
 /* 由 App.jsx 抽出。共用狀態透過 s 傳入，避免逐一列 props。 */
 export default function RadarPage({ s }) {
-  const { COLS, DOWN, UP, activePreset, applyQuick, batch, batchN, bgScan, cancelRef, cell, coverage, dirs, kpi, loading, local, minLiq, minMcap, minVol, narrow, noSort, noStable, noWrapped, q, queue, quick, rows, saveState, scan, scanTTL, scannedCount, serverTs, setActivePreset, setBatchN, setBgScan, setDetail, setDirs, setMinLiq, setMinMcap, setMinVol, setNoStable, setNoWrapped, setPreset, setQ, setScanTTL, setShowWeights, setSortDir, setSortKey, setView, setWeights, showWeights, side, sortBy, sortDir, sortKey, sorted, source, srvRefresh, toggleWatch, universe, view, watch, weights } = s;
+  const { cgUsage, refreshCgUsage, COLS, DOWN, UP, activePreset, applyQuick, batch, batchN, bgScan, cancelRef, cell, coverage, dirs, kpi, loading, local, minLiq, minMcap, minVol, narrow, noSort, noStable, noWrapped, q, queue, quick, rows, saveState, scan, scanTTL, scannedCount, serverTs, setActivePreset, setBatchN, setBgScan, setDetail, setDirs, setMinLiq, setMinMcap, setMinVol, setNoStable, setNoWrapped, setPreset, setQ, setScanTTL, setShowWeights, setSortDir, setSortKey, setView, setWeights, showWeights, side, sortBy, sortDir, sortKey, sorted, source, srvRefresh, toggleWatch, universe, view, watch, weights } = s;
   return (
 <>
         {/* ── 雷達掃描控制：核心入口 ── */}
@@ -45,6 +90,7 @@ export default function RadarPage({ s }) {
                 停止（{batch.done}/{batch.total} · {batch.now}）
               </button>
             )}
+            <CgUsage u={cgUsage} batchN={batchN} onRefresh={refreshCgUsage} />
             <label className="flex items-center gap-1.5 cursor-pointer" style={{ fontSize: 12, color: bgScan ? C.teal : C.bone }}>
               <input type="checkbox" checked={bgScan} onChange={(e) => setBgScan(e.target.checked)} style={{ accentColor: C.teal }} />
               背景持續掃描
