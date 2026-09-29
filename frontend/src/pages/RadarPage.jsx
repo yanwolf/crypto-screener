@@ -45,6 +45,30 @@ function CgUsage({ u, batchN, onRefresh }) {
             style={{ background: "transparent", border: `1px solid ${C.line}`, color: C.muted, fontSize: 11 }}>更新</button>
         </div>
       )}
+      <BnShadow s={u.bnShadow} />
+    </div>
+  );
+}
+
+/* 幣安備援比對（2026-09-29）：平常就拿幣安 90 天 K 線跟 CoinGecko 比，看差異大不大；
+   達標（樣本夠、門檻一致、量能倍數差得不多）才讓 CoinGecko 拿不到時的備援資料自動下單。 */
+function BnShadow({ s }) {
+  if (!s) return null;
+  const pct = (v) => (v == null ? "—" : `${(v * 100).toFixed(0)}%`);
+  return (
+    <div style={{ fontFamily: FONT.data }}>
+      幣安備援比對　樣本 {s.n}
+      　門檻一致 {pct(s.gateAgree)}
+      　量能倍數中位差 {pct(s.rvolMedDiff)}
+      　分數中位差 {s.scoreMedDiff == null ? "—" : s.scoreMedDiff.toFixed(1)}
+      　階段一致 {pct(s.stageAgree)}
+      {s.cgTriggers > 0 && <span>　CoinGecko 過門檻 {s.cgTriggers} 次、幣安也過 {s.bothTriggers} 次</span>}
+      <span style={{ color: s.ok ? C.teal : C.muted }}>
+        　{s.ok ? "已達標：CoinGecko 拿不到時，幣安有的幣可接手自動下單" : `未達標（${s.why}）：備援訊號只通知不下單`}
+      </span>
+      {s.worst && s.worst.length > 0 && (
+        <span>　差最多 {s.worst.map((w) => `${w.sym} ${(w.diff * 100).toFixed(0)}%`).join("、")}</span>
+      )}
     </div>
   );
 }

@@ -19,6 +19,8 @@ produced |= set(re.findall(r'"([a-zA-Z0-9_]+)":', eng[eng.index('def extract_sca
 mon = main[main.index('def mon_run_once'):]
 produced |= set(re.findall(r'"([a-zA-Z0-9_]+)":\s*c\.get', mon))
 produced |= set(re.findall(r'"([a-zA-Z0-9_]+)":\s*c\[', mon))
+# main.py 在監控裡直接寫到 row 上的欄位（例如 2026-09-29 的資料來源 dataSource）
+produced |= set(re.findall(r'row\["([a-zA-Z0-9_]+)"\]\s*=', mon))
 # 事件欄位
 ev_block = eng[eng.index('events.append({'):eng.index('return events, nxt')]
 ev_produced = set(re.findall(r'"([a-zA-Z0-9_]+)":', ev_block))
