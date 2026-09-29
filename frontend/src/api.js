@@ -47,6 +47,7 @@ async function cgFetch(path, cfg, opts = {}) {
       if (res.status === 404 && res.headers.get("X-Cache") === "CACHE-ONLY-MISS") throw new Error("NOTCACHED");
       if (res.status === 401 || res.status === 403) throw new Error("AUTH");
       if (res.status === 404 && cfg.local && !res.headers.get("X-Cache")) throw new Error("NOPROXY");
+      if (res.headers.get("X-CG-Error") === "QUOTA") throw new Error("QUOTA");   // 額度用完：重試沒用
       if (res.status >= 500) {
         if (attempt < 2) { await sleep(2500); continue; }
         throw new Error("SERVER");

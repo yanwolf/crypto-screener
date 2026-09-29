@@ -55,7 +55,9 @@ export default function ConnPanel({ s }) {
             )}
             <div className="flex flex-wrap gap-2">
               <button onClick={() => loadMarkets()} className="px-3 py-1.5 rounded" style={{ background: C.panel2, border: `1px solid ${C.gold}`, color: C.gold }}>重新嘗試即時資料</button>
-              <button onClick={loadDemo} className="px-3 py-1.5 rounded" style={{ background: C.panel2, border: `1px solid ${C.line}`, color: C.muted }}>載入示範資料</button>
+              {!local && (
+                <button onClick={loadDemo} className="px-3 py-1.5 rounded" style={{ background: C.panel2, border: `1px solid ${C.line}`, color: C.muted }}>載入示範資料</button>
+              )}
             </div>
           </div>
   );

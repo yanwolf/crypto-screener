@@ -154,7 +154,7 @@ def R55_proxy(M, key, cache_only=False):
     h.path = key
     h.headers = {"X-Cache-Only": "1"} if cache_only else {}
     out = {}
-    h.send_json = lambda code, body, **k: out.update(code=code, body=body)
+    h.send_json = lambda code, body, **k: out.update(code=code, body=body, xcgerr=k.get("cg_error"))
     h.send_response = lambda code: out.update(code=code)
     h.send_header = lambda k, v: out.update(xcache=v) if k == "X-Cache" else None
     h.end_headers = lambda: None
@@ -271,6 +271,41 @@ def _():
         return f"監控補抓歷史沒算到：{t}"
     if t.get("網頁·history", 0) != 1:
         return f"網頁要的那一檔應算 1 次，實際 {t}"
+
+
+@case("b-10", "行情榜存進磁碟：部署重啟後（記憶體清空）額度又用完，網頁照樣先拿到上一份行情，不打上游、不會變成示範資料")
+def _():
+    ex, clock = fresh()
+    M = main_mod()
+    calls = setup(M)
+    key = "/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=250&page=1"
+    M.cache_put(key, b'[{"id":"aaa"}]')
+    cache_dir = M.CACHE_DIR
+    M = main_mod()                                              # 重啟：記憶體快取清空
+    M.CACHE_DIR = cache_dir
+    calls = []
+    M.fetch_upstream = lambda path, prefix="/api/v3", background=False: (calls.append(path) or (403, b"blocked"))
+    M.revalidate_async = lambda *a, **k: None
+    M.QUOTA["exhausted"] = True
+    out = R55_proxy(M, key)
+    if out.get("code") != 200 or out.get("body") != b'[{"id":"aaa"}]':
+        return f"重啟後行情榜沒有先給上一份：{out}"
+    if calls:
+        return f"有上一份還同步打上游：{calls}"
+
+
+@case("b-11", "額度用完、公開端點也被拒、又沒有快取可給：回「額度用完」（不是 403 被網頁當成金鑰錯）")
+def _():
+    ex, clock = fresh()
+    M = main_mod()
+    setup(M)
+    M.fetch_upstream = lambda path, prefix="/api/v3", background=False: (403, b"<html>blocked</html>")
+    M.QUOTA["exhausted"] = True
+    out = R55_proxy(M, "/api/v3/coins/nothing-cached/market_chart?vs_currency=usd&days=90")
+    if out.get("code") == 403:
+        return "照樣回 403（網頁會顯示「API Key 被拒絕」，講錯原因）"
+    if out.get("xcgerr") != "QUOTA":
+        return f"沒有標明額度用完：{out}"
 
 
 if __name__ == "__main__":

@@ -112,8 +112,15 @@ def _():
     M.revalidate_async = lambda *a, **k: calls.append("revalidate")
     key = "/api/v3/coins/markets?vs_currency=usd&page=1"
     M.cache_put(key, b'[{"id":"old"}]')
+    old = time.time() - M.CACHE_TTL - M.STALE_GRACE - 3600          # 過期超過寬限一小時
     with M._cache_lock:
-        M._cache[key] = (time.time() - M.CACHE_TTL - M.STALE_GRACE - 3600, b'[{"id":"old"}]')   # 過期超過寬限一小時
+        M._cache[key] = (old, b'[{"id":"old"}]')
+    p = M._disk_path(key)
+    if os.path.exists(p):                                        # 2026-09-29 起行情榜也存磁碟：磁碟那份一起變舊
+        import json as _json
+        blob = _json.load(open(p, encoding="utf-8"))
+        blob["ts"] = old
+        _json.dump(blob, open(p, "w", encoding="utf-8"))
     need(M.cache_get(key, M.CACHE_TTL) is None, "快取應已過期（前提）")
     out = proxy(M, key)
     if out["body"] != b'[{"id":"old"}]' or out.get("stale") is None:

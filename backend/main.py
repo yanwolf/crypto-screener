@@ -173,8 +173,8 @@ def cache_get(key: str, ttl: float):
 def cache_put(key: str, body: bytes):
     with _cache_lock:
         _cache[key] = (time.time(), body)
-    if "market_chart" not in key and "token_security" not in key:
-        return                                   # 只有昂貴的深度資料值得落地
+    if "market_chart" not in key and "token_security" not in key and "/coins/markets" not in key:
+        return                                   # 只有昂貴的深度資料值得落地；行情榜也存（2026-09-29：重啟後額度用完時還有上一份可給）
     try:
         os.makedirs(CACHE_DIR, exist_ok=True)
         with open(_disk_path(key), "w") as f:
@@ -2152,14 +2152,20 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                         REFRESH["universeTs"] = time.time()
                 except Exception:
                     pass
+        if status != 200 and prefix == "/api/v3" and QUOTA.get("exhausted"):
+            # 2026-09-29：額度用完後改走公開端點被拒（403），網頁以前顯示成「API Key 被拒絕」——講錯原因
+            return self.send_json(503, json.dumps({"error": "QUOTA", "detail": _upstream_error_text(status, body)},
+                                                  ensure_ascii=False).encode(), cg_error="QUOTA")
         self.send_json(status, body, data_ts=time.time() if status == 200 else None)
 
-    def send_json(self, code, body, cached=False, stale=None, data_ts=None):
+    def send_json(self, code, body, cached=False, stale=None, data_ts=None, cg_error=None):
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Access-Control-Allow-Origin", "*")
         if stale is not None:
             self.send_header("X-Stale-Age", str(stale))
+        if cg_error:
+            self.send_header("X-CG-Error", cg_error)
         if data_ts is not None:
             self.send_header("X-Data-Ts", str(int(data_ts * 1000)))
         self.send_header("Cache-Control", "no-store")

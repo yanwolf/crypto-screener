@@ -251,7 +251,9 @@ function CryptoScreener() {
         }
       }
       setError(errText(e));
-      if (!rawRef.current.length) loadDemo();
+      // 連上自己的伺服器時不自動換成示範資料（2026-09-29）：伺服器有上一份行情會先給；真的沒有就顯示錯誤，
+      // 不要讓畫面看起來像有資料——示範資料是給還沒連上任何資料來源時看介面用的
+      if (!rawRef.current.length && !cfg.local) loadDemo();
     } finally { setLoading(false); setStaleAge(lastStale.age); }
   }, [pages, cfg, loadDemo]);
 
