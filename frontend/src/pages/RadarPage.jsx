@@ -15,6 +15,19 @@ function sumBySource(m) {
   }
   return out;
 }
+// 各來源再分「行情榜／歷史／其他」（2026-09-30：看得出模擬網、滾動補抓是在拿哪一種）
+const KIND_LABEL = { markets: "行情榜", history: "歷史", other: "其他" };
+function kindsOf(m, src) {
+  const out = {};
+  for (const [k, v] of Object.entries(m || {})) {
+    const [s, kind] = k.replace("（轉發）", "").split("·");
+    if ((s || "其他") !== src) continue;
+    const lb = KIND_LABEL[kind] || "其他";
+    out[lb] = (out[lb] || 0) + (Number(v) || 0);
+  }
+  const parts = Object.entries(out).filter(([, v]) => v > 0);
+  return parts.length > 1 ? `（${parts.map(([k, v]) => `${k} ${v}`).join("、")}）` : "";
+}
 function CgUsage({ u, batchN, onRefresh }) {
   if (!u) return null;
   if (u.error) return <span style={{ fontSize: 11.5, color: C.muted }}>CoinGecko 用量：{u.error}</span>;
@@ -38,7 +51,8 @@ function CgUsage({ u, batchN, onRefresh }) {
       {!u.exhausted && left != null && <span>　這次補掃 {batchN} 檔最多約用 {batchN} 次</span>}
       {srcs.length > 0 && (
         <div style={{ fontFamily: FONT.data }}>
-          本月來源　{srcs.map((k) => `${k} ${month[k]}`).join("　·　")}
+          本月來源　{srcs.map((k) => `${k} ${month[k]}${kindsOf(u.thisMonth, k)}`).join("　·　")}
+          {u.prefetch && u.prefetch.on ? `　（滾動補抓開著：每日上限 ${u.prefetch.budget} 次）` : ""}
           {u.lowPri && (u.lowPri.unlisted || u.lowPri.held)
             ? `　（降頻中：幣安沒有 ${u.lowPri.unlisted || 0}、已持倉 ${u.lowPri.held || 0} 檔，${u.lowPri.ttlH} 小時才補）` : ""}
           <button onClick={onRefresh} className="ml-2 px-1.5 rounded"
@@ -62,7 +76,10 @@ function BnShadow({ s }) {
       　量能倍數中位差 {pct(s.rvolMedDiff)}
       　分數中位差 {s.scoreMedDiff == null ? "—" : s.scoreMedDiff.toFixed(1)}
       　階段一致 {pct(s.stageAgree)}
-      {s.cgTriggers > 0 && <span>　CoinGecko 過門檻 {s.cgTriggers} 次、幣安也過 {s.bothTriggers} 次</span>}
+      {s.trig && (
+        <span>　觸發一致 {pct(s.trig.agree)}（任一邊觸發 {s.trig.any} 次：CoinGecko {s.trig.cg}、幣安 {s.trig.bn}、兩邊都有 {s.trig.both}；
+          要 {s.trig.min} 次以上、{(s.trig.need * 100).toFixed(0)}% 以上）</span>
+      )}
       <span style={{ color: s.ok ? C.teal : C.muted }}>
         　{s.ok ? "已達標：CoinGecko 拿不到時，幣安有的幣可接手自動下單" : `未達標（${s.why}）：備援訊號只通知不下單`}
       </span>

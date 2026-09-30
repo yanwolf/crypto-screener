@@ -308,6 +308,39 @@ def _():
         return f"沒有標明額度用完：{out}"
 
 
+@case("b-12", "滾動補抓的幣別清單：快取裡 6 小時內有行情榜就用它、不打 CoinGecko；額度用完又沒快取也不打；6 小時內不重拿")
+def _():
+    ex, clock = fresh()
+    M = main_mod()
+    need(hasattr(M, "refresh_universe"), "程式沒有幣別清單的新邏輯（前提：2026-09-30 起才有）")
+    M.CACHE_DIR = tempfile.mkdtemp()
+    calls = []
+    M.fetch_upstream = lambda path, prefix="/api/v3", background=False: (calls.append(path) or (200, b'[{"id":"zzz"}]'))
+    M.MON["topN"] = 100
+    mon_key = ("/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=100&page=1"
+               "&sparkline=false&price_change_percentage=24h,7d,30d")
+    M.cache_put(mon_key, b'[{"id":"aaa"},{"id":"bbb"}]')
+    M.REFRESH.update(universe=[], universeTs=0)
+    r1 = M.refresh_universe()
+    if r1 != "cache" or M.REFRESH["universe"] != ["aaa", "bbb"] or calls:
+        return f"有監控剛拿的行情榜還去打 CoinGecko：{r1}、{M.REFRESH['universe']}、{calls}"
+    r2 = M.refresh_universe()
+    if r2 != "fresh" or calls:
+        return f"6 小時內又重拿：{r2}、{calls}"
+    M.CACHE_DIR = tempfile.mkdtemp()
+    with M._cache_lock:
+        M._cache.clear()
+    M.REFRESH.update(universe=[], universeTs=0)
+    M.QUOTA["exhausted"] = True
+    r3 = M.refresh_universe()
+    M.QUOTA["exhausted"] = False
+    if r3 != "skip" or calls:
+        return f"額度用完、沒有快取時還去打：{r3}、{calls}"
+    r4 = M.refresh_universe()
+    if r4 != "coingecko" or len(calls) != 1:
+        return f"額度正常、沒有快取時應打一次：{r4}、{calls}"
+
+
 if __name__ == "__main__":
     fails = [r for r in RESULTS if r[2]]
     for tag, desc, err in RESULTS:

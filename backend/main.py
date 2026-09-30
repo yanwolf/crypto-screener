@@ -531,6 +531,9 @@ def low_priority(sym, listed, held):
 BN_SHADOW = {"samples": [], "lastCmp": {}, "ratio": {}}
 BN_SHADOW_PER_ROUND = int(os.environ.get("BN_SHADOW_PER_ROUND", 8))
 BN_OK_MIN_N, BN_OK_GATE, BN_OK_RVOL = 60, 0.90, 0.25       # 讓備援資料自動下單的門檻：樣本數、門檻一致率、量能倍數中位差
+# 觸發一致率（2026-09-30）：「門檻一致」大多是兩邊都沒觸發，容易一致。真正要看的是「有一邊觸發時，另一邊也觸發嗎」——
+# 分母是任一邊觸發的次數（多空各算），所以只有幣安觸發（CoinGecko 不會下的單）也會拉低一致率
+BN_OK_MIN_TRIG, BN_OK_TRIG = 10, 0.80
 BN_FALLBACK_MARKETS_S = 6 * 3600                           # 行情榜也拿不到時，最多沿用多舊的上一份
 _bn_ticker = {"ts": 0.0, "map": {}}
 
@@ -579,9 +582,13 @@ def bn_symbol(sym, listed):
     return None
 
 
+UPSTREAM_DOWN = {"until": 0.0, "hits": 0}     # 模擬網：上游伺服器回報 CoinGecko 額度用完，到這個時間前都當成拿不到
+UPSTREAM_DOWN_SEC = 20 * 60.0                # 監控 30 分鐘一輪：每輪最多再試一次，看上游恢復了沒
+
+
 def cg_down():
-    """CoinGecko 現在拿不到：月額度用完（降級模式）或剛被 429 在冷卻。"""
-    return bool(QUOTA.get("exhausted")) or cg_cooling()
+    """CoinGecko 現在拿不到：月額度用完（降級模式）、剛被 429 在冷卻，或（模擬網）上游伺服器說額度用完。"""
+    return bool(QUOTA.get("exhausted")) or cg_cooling() or time.time() < UPSTREAM_DOWN["until"]
 
 
 def bn_tickers():
@@ -729,6 +736,14 @@ def bn_shadow_summary():
     stage = sum(1 for x in s if x.get("stCG") == x.get("stBN")) / n if n else None
     both = sum(1 for x in s if x["gCG"] or x["bCG"])
     hit = sum(1 for x in s if (x["gCG"] and x["gBN"]) or (x["bCG"] and x["bBN"]))
+    cg_t = bn_t = both_t = any_t = 0
+    for x in s:
+        for a, b in (("gCG", "gBN"), ("bCG", "bBN")):
+            cg_t += bool(x[a])
+            bn_t += bool(x[b])
+            both_t += bool(x[a] and x[b])
+            any_t += bool(x[a] or x[b])
+    trig = both_t / any_t if any_t else None
     rvm = _median(rv)
     why = []
     if n < BN_OK_MIN_N:
@@ -737,10 +752,16 @@ def bn_shadow_summary():
         why.append(f"門檻一致 {gate * 100:.0f}% 未達 {BN_OK_GATE * 100:.0f}%")
     if rvm is not None and rvm > BN_OK_RVOL:
         why.append(f"量能倍數中位差 {rvm * 100:.0f}% 超過 {BN_OK_RVOL * 100:.0f}%")
+    if any_t < BN_OK_MIN_TRIG:
+        why.append(f"比到的觸發 {any_t}／{BN_OK_MIN_TRIG} 次不足")
+    elif trig < BN_OK_TRIG:
+        why.append(f"觸發一致 {trig * 100:.0f}% 未達 {BN_OK_TRIG * 100:.0f}%")
     worst = sorted(((abs(x["rvBN"] / x["rvCG"] - 1), x["sym"]) for x in s if x.get("rvCG") and x.get("rvBN") is not None),
                    reverse=True)[:3]
     return {"n": n, "gateAgree": gate, "stageAgree": stage, "rvolMedDiff": rvm, "scoreMedDiff": _median(sc),
             "cgTriggers": both, "bothTriggers": hit, "worst": [{"sym": w[1], "diff": w[0]} for w in worst],
+            "trig": {"cg": cg_t, "bn": bn_t, "both": both_t, "any": any_t, "agree": trig,
+                     "min": BN_OK_MIN_TRIG, "need": BN_OK_TRIG},
             "ok": not why, "why": "、".join(why)}
 
 
@@ -2133,7 +2154,10 @@ def cg_usage():
             "hasKey": bool(CFG.get("key")), "pro": bool(CFG.get("pro")),
             "limit": None if CFG.get("pro") else CG_DEMO_MONTHLY,
             "exhausted": bool(QUOTA.get("exhausted")), "cooling": cg_cooling(),
-            "lowPri": MON.get("lowPri"), "bnShadow": bn_shadow_summary()}
+            "upstreamDown": time.time() < UPSTREAM_DOWN["until"],
+            "lowPri": MON.get("lowPri"), "bnShadow": bn_shadow_summary(),
+            "prefetch": {"on": bool(REFRESH.get("budget")), "budget": REFRESH.get("budget"),
+                         "universeFrom": REFRESH.get("universeFrom")}}
 
 
 class cg_source:
@@ -2197,6 +2221,12 @@ def fetch_upstream(path_qs: str, prefix: str = "/api/v3", background: bool = Fal
                 return 200, r.read()
         except urllib.error.HTTPError as e:
             body = e.read()
+            if prefix == "/api/v3" and CG_UPSTREAM and (e.headers or {}).get("X-CG-Error") == "QUOTA":
+                # 模擬網（2026-09-30）：上游伺服器說 CoinGecko 額度用完——重試沒用（以前當成 5xx 重試兩次），
+                # 而且接下來一段時間都一樣：記下來，讓監控直接改用幣安備援，不再每輪白試
+                UPSTREAM_DOWN["until"] = time.time() + UPSTREAM_DOWN_SEC
+                UPSTREAM_DOWN["hits"] += 1
+                return e.code, body
             # error_code 10006 是「每月總額度用盡」，重試沒有意義，直接放棄
             if b"10006" in body or b"calls limit" in body:
                 QUOTA["exhausted"] = True
@@ -2477,6 +2507,51 @@ REFRESH = {"universe": [], "universeTs": 0, "last": None, "lastTs": None,
            "fresh": 0, "stale": 0, "never": 0, "n": 0, "budget": 0}
 
 
+UNIVERSE_EVERY = 6 * 3600.0
+PREFETCH_MARKETS = "/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=250&page=1"
+
+
+def cached_universe(max_age=UNIVERSE_EVERY):
+    """伺服器快取裡 max_age 秒內的市值排行（滾動補抓、網頁、監控拿過的都算），取最長的那份。沒有回 None。"""
+    n = max(10, min(250, int(MON.get("topN") or 100)))
+    keys = [PREFETCH_MARKETS,
+            "/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=250&page=1"
+            "&sparkline=true&price_change_percentage=1h,24h,7d,30d,1y",          # 網頁
+            f"/coins/markets?vs_currency=usd&order=market_cap_desc&per_page={n}&page=1"
+            "&sparkline=false&price_change_percentage=24h,7d,30d"]               # 監控
+    best = None
+    for k in keys:
+        body, age = cache_peek("/api/v3" + k)
+        if body is None or age is None or age > max_age:
+            continue
+        try:
+            ids = [c["id"] for c in json.loads(body) if isinstance(c, dict) and c.get("id")]
+        except Exception:
+            continue
+        if ids and (best is None or len(ids) > len(best)):
+            best = ids
+    return best
+
+
+def refresh_universe():
+    """滾動補抓的幣別清單：6 小時更新一次，先用快取裡已有的行情榜，都沒有才打 CoinGecko；額度用完時不打。"""
+    if time.time() - REFRESH["universeTs"] <= UNIVERSE_EVERY and REFRESH["universe"]:
+        return "fresh"
+    uni = cached_universe()
+    if uni:
+        REFRESH["universe"], REFRESH["universeTs"], REFRESH["universeFrom"] = uni, time.time(), "cache"
+        return "cache"
+    if QUOTA["exhausted"]:
+        return "skip"
+    st, body = fetch_upstream(PREFETCH_MARKETS)
+    if st == 200:
+        cache_put("/api/v3" + PREFETCH_MARKETS, body)
+        REFRESH["universe"] = [c["id"] for c in json.loads(body)]
+        REFRESH["universeTs"], REFRESH["universeFrom"] = time.time(), "coingecko"
+        return "coingecko"
+    return "failed"
+
+
 def _deep_key(cid):
     return "/api/v3" + f"/coins/{cid}/market_chart?vs_currency=usd&days=90"
 
@@ -2568,13 +2643,10 @@ def prefetch_worker(count: int, ttl_h: float):
                 REFRESH["day"] = d
                 REFRESH["callsToday"] = 0
 
-            # 宇宙每 15 分鐘更新一次，新幣進榜會自動被納入
-            if time.time() - REFRESH["universeTs"] > 900:
-                st, body = fetch_upstream(
-                    "/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=250&page=1")
-                if st == 200:
-                    REFRESH["universe"] = [c["id"] for c in json.loads(body)]
-                    REFRESH["universeTs"] = time.time()
+            # 幣別清單（市值前 250）變化很慢：6 小時更新一次，而且先拿伺服器快取裡已有的行情榜（監控、網頁剛拿過的），
+            # 都沒有才打 CoinGecko；額度用完時不打。2026-09-30：以前每 15 分鐘打一次、額度用完也照打，一天約 96 次——
+            # 是「滾動補抓」用量的大宗
+            refresh_universe()
 
             if QUOTA["exhausted"] or not REFRESH["universe"]:
                 time.sleep(300)

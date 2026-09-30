@@ -288,6 +288,69 @@ def _():
         return "CoinGecko 正常卻標成幣安資料（會被下單把關擋掉）"
 
 
+@case("bn-9", "觸發一致率：比到的觸發不到 10 次不放行；只有幣安觸發（CoinGecko 不會下的單）會拉低一致率；夠多又夠一致才放行")
+def _():
+    ex, clock = fresh()
+    M = main_mod()
+    need(hasattr(M, "BN_OK_MIN_TRIG"), "程式沒有觸發一致率門檻（前提：2026-09-30 起才有）")
+    quiet = {"sym": "Q", "rvCG": 1.0, "rvBN": 1.02, "scCG": 40, "scBN": 41, "stCG": "quiet", "stBN": "quiet",
+             "gCG": False, "gBN": False, "bCG": False, "bBN": False}
+    both = dict(quiet, gCG=True, gBN=True)
+    bn_only = dict(quiet, gBN=True)
+    M.BN_SHADOW["samples"] = [quiet] * 80 + [both] * 3
+    s1 = M.bn_shadow_summary()
+    need(s1["gateAgree"] == 1.0 and s1["n"] == 83, f"門檻一致 100%、樣本夠（前提）：{s1}")
+    if s1["ok"] or "觸發" not in s1["why"]:
+        return f"觸發只比到 3 次也放行了：{s1}"
+    M.BN_SHADOW["samples"] = [quiet] * 70 + [both] * 8 + [bn_only] * 4
+    s2 = M.bn_shadow_summary()
+    need(s2["trig"]["any"] == 12, f"任一邊觸發應為 12 次（前提）：{s2['trig']}")
+    if s2["ok"] or "觸發一致" not in s2["why"]:
+        return f"8/12 = 67% 應未達 80%（只有幣安觸發的 4 次要算進分母）：{s2}"
+    M.BN_SHADOW["samples"] = [quiet] * 70 + [both] * 11 + [bn_only] * 1
+    s3 = M.bn_shadow_summary()
+    if not s3["ok"]:
+        return f"11/12 = 92% 應放行：{s3}"
+
+
+@case("bn-10", "模擬網：上游伺服器回「額度用完」→ 不重試、記下來；之後監控直接用幣安備援、不再白試 CoinGecko；20 分鐘後再試一次")
+def _():
+    ex, clock = fresh()
+    M = main_mod()
+    need(hasattr(M, "UPSTREAM_DOWN"), "程式沒有上游額度用完的記號（前提：2026-09-30 起才有）")
+    import io
+    import urllib.error
+    M.CG_UPSTREAM = "http://bz.invalid"
+    M.CFG["gap"] = 0.0
+    tries = []
+
+    def quota_503(req, timeout=0):
+        tries.append(req.full_url)
+        raise urllib.error.HTTPError(req.full_url, 503, "x", {"X-CG-Error": "QUOTA"}, io.BytesIO(b'{"error":"QUOTA"}'))
+    real_open = M.urllib.request.urlopen
+    M.urllib.request.urlopen = quota_503
+    try:
+        st, _b = M.fetch_upstream("/coins/aaa/market_chart?vs_currency=usd&days=90")
+    finally:
+        M.urllib.request.urlopen = real_open
+    if len(tries) != 1:
+        return f"額度用完還重試了：打了 {len(tries)} 次"
+    if not M.cg_down():
+        return "沒有記下「上游額度用完」"
+    series, markets = mon_setup(M, ["AAA"])
+    calls = install(M, series)
+    got = {}
+    real_eval = M.engine.evaluate
+    M.engine.evaluate = lambda rows, cfg, states, now: (got.update({r["id"]: r for r in rows}) or real_eval(rows, cfg, states, now))
+    M.mon_run_once()
+    if [p for pre, p in calls if pre == "/api/v3" and "market_chart" in p]:
+        return "記下上游額度用完之後，監控還去試 CoinGecko 歷史"
+    if (got.get("aaa") or {}).get("dataSource") != "binance":
+        return f"沒有改用幣安備援接手：{got.get('aaa')}"
+    M.UPSTREAM_DOWN["until"] = M.time.time() - 1                    # 20 分鐘過了
+    need(not M.cg_down(), "記號應已過期（前提）")
+
+
 if __name__ == "__main__":
     fails = [r for r in RESULTS if r[2]]
     for tag, desc, err in RESULTS:
