@@ -77,8 +77,12 @@ def install(M, series_by_sym, cg_fail=False):
             sr = series_by_sym.get(q["symbol"])
             if sr is None:
                 return 400, b'{"code":-1121,"msg":"Invalid symbol."}'
-            end, lim = int(q["endTime"]), int(q["limit"])
-            rows = [k for k in klines(sr, 1000 if q["symbol"].startswith("1000") else 1) if k[0] <= end][-lim:]
+            lim = int(q["limit"])
+            ks = klines(sr, 1000 if q["symbol"].startswith("1000") else 1)
+            if "startTime" in q:                                 # 觸發後續追蹤：從某個時間往後拿
+                rows = [k for k in ks if k[0] >= int(q["startTime"])][:lim]
+            else:
+                rows = [k for k in ks if k[0] <= int(q["endTime"])][-lim:]
             return 200, json.dumps(rows).encode()
         if cg_fail:
             return 403, b"<html>blocked</html>"
@@ -349,6 +353,101 @@ def _():
         return f"沒有改用幣安備援接手：{got.get('aaa')}"
     M.UPSTREAM_DOWN["until"] = M.time.time() - 1                    # 20 分鐘過了
     need(not M.cg_down(), "記號應已過期（前提）")
+
+
+def age_key(M, key, hours):
+    old = time.time() - hours * 3600
+    body, _a = M.cache_peek(key)
+    need(body is not None, "快取裡應有這份（前提）")
+    with M._cache_lock:
+        M._cache[key] = (old, body)
+    p = M._disk_path(key)
+    if os.path.exists(p):
+        blob = json.load(open(p, encoding="utf-8"))
+        blob["ts"] = old
+        json.dump(blob, open(p, "w", encoding="utf-8"))
+
+
+@case("bn-11", "CoinGecko 拿不到：先用快取裡 7 天內的舊 CoinGecko 歷史（標 coingecko_stale、記幾小時前），不換幣安；超過 7 天才換幣安")
+def _():
+    ex, clock = fresh()
+    M = main_mod()
+    need(hasattr(M, "STALE_CG_MAX_H"), "程式沒有舊 CoinGecko 歷史優先（前提：2026-10-05 起）")
+    series, markets = mon_setup(M, ["AAA"])
+    calls = install(M, series)
+    key = "/api/v3/coins/aaa/market_chart?vs_currency=usd&days=90"
+    M.cache_put(key, json.dumps(cg_chart(series["AAAUSDT"])).encode())
+    age_key(M, key, 30)
+    M.QUOTA["exhausted"] = True
+    got = {}
+    real_eval = M.engine.evaluate
+    M.engine.evaluate = lambda rows, cfg, states, now: (got.update({r["id"]: r for r in rows}) or real_eval(rows, cfg, states, now))
+    M.BN_SHADOW_PER_ROUND = 0
+    M.mon_run_once()
+    row = got.get("aaa") or {}
+    if row.get("dataSource") != "coingecko_stale" or abs((row.get("staleH") or 0) - 30) > 0.5:
+        M.QUOTA["exhausted"] = False
+        return f"30 小時前的 CoinGecko 歷史沒被優先使用：{row.get('dataSource')}、{row.get('staleH')}"
+    if [p for pre, p in calls if pre == "/api/bn" and "klines" in p]:
+        M.QUOTA["exhausted"] = False
+        return "有舊 CoinGecko 歷史可用，還去拿幣安 K 線"
+    age_key(M, key, 200)
+    got.clear()
+    M.mon_run_once()
+    M.QUOTA["exhausted"] = False
+    if (got.get("aaa") or {}).get("dataSource") != "binance":
+        return f"超過 7 天的舊歷史應換成幣安：{(got.get('aaa') or {}).get('dataSource')}"
+
+
+@case("bn-12", "舊 CoinGecko 歷史算出的訊號：48 小時內照常往下走；超過 48 小時只通知不下單")
+def _():
+    ex, clock = fresh()
+    M = main_mod()
+    need(hasattr(M, "STALE_CG_TRADE_H"), "程式沒有舊歷史下單門檻（前提）")
+    T().AUTO["on"] = True
+    ev = {"side": "bull", "score": 90, "id": "aaa", "sym": "AAA"}
+    out1 = M.auto_try_trade(ev, {"id": "aaa", "sym": "AAA", "radar": 90, "dataSource": "coingecko_stale", "staleH": 30})
+    if "小時沒更新" in str(out1.get("why")):
+        return f"30 小時前的歷史被擋了：{out1}"
+    out2 = M.auto_try_trade(ev, {"id": "aaa", "sym": "AAA", "radar": 90, "dataSource": "coingecko_stale", "staleH": 100})
+    if out2.get("stage") != "gate" or "小時沒更新" not in str(out2.get("why")):
+        return f"100 小時前的歷史應只通知不下單：{out2}"
+
+
+@case("bn-13", "觸發的後續追蹤：只有幣安觸發、兩邊都觸發分開記；用幣安小時收盤看 72 小時內先到 2R 還是先停損")
+def _():
+    ex, clock = fresh()
+    M = main_mod()
+    need(hasattr(M, "bn_trig_evaluate"), "程式沒有觸發後續追蹤（前提：2026-10-05 起）")
+    M.CACHE_DIR = tempfile.mkdtemp()
+    M.trader = T()
+    M.engine.stop_pct = lambda *a, **k: (5.0, "atr")
+    M._gates = lambda row: {"bull": bool(row.get("_g")), "bear": False}
+    M.BN_SHADOW["trig"] = []
+    M.bn_compare("aaa", "AAA", {"price": 1.0, "_g": False}, {"_g": True}, 100, 30, bsym="AAAUSDT")     # 只有幣安
+    M.bn_compare("bbb", "BBB", {"price": 1.0, "_g": True}, {"_g": True}, 100, 30, bsym="BBBUSDT")      # 兩邊都有
+    M.bn_compare("ccc", "CCC", {"price": 1.0, "_g": True}, {"_g": False}, 100, 30, bsym="CCCUSDT")     # 只有 CoinGecko：不追
+    kinds = sorted(t["kind"] for t in M.BN_SHADOW["trig"])
+    if kinds != ["bnOnly", "both"]:
+        return f"應記一筆只有幣安、一筆兩邊都有：{kinds}"
+    t0 = M.BN_SHADOW["trig"][0]["ts"]
+    path = {"AAAUSDT": [1.0, 0.99, 0.96, 0.94], "BBBUSDT": [1.0, 1.03, 1.08, 1.12]}       # AAA 先停損（5%），BBB 先到 2R（+10%）
+
+    def fake(p, prefix="/api/v3", background=False):
+        q = dict(kv.split("=") for kv in p.split("?")[1].split("&"))
+        rows = [[t0 + i * 3600000, "0", "0", "0", str(px), "0", t0 + (i + 1) * 3600000 - 1, "0"]
+                for i, px in enumerate(path[q["symbol"]])]
+        return 200, json.dumps(rows).encode()
+    M.fetch_upstream = fake
+    M.bn_trig_evaluate()
+    res = {t["sym"]: (t["result"], t["r"]) for t in M.BN_SHADOW["trig"]}
+    if res.get("AAA") != ("stop", -1.0):
+        return f"AAA 應先碰停損 −1R：{res.get('AAA')}"
+    if (res.get("BBB") or (None,))[0] != "tp2":
+        return f"BBB 應先到目標：{res.get('BBB')}"
+    s = M.bn_trig_summary()
+    if s["bnOnly"]["stop"] != 1 or s["both"]["tp2"] != 1:
+        return f"摘要分組不對：{s}"
 
 
 if __name__ == "__main__":

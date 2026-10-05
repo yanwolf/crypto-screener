@@ -127,6 +127,9 @@ _revalidating = set()
 _reval_lock = threading.Lock()
 
 
+MARKETS_REVALIDATE_S = float(os.environ.get("MARKETS_REVALIDATE_S", 600))
+
+
 def revalidate_async(path_qs, prefix, key):
     """背景更新快取。同一個 key 同時只跑一輪，避免重複打上游。"""
     with _reval_lock:
@@ -471,7 +474,9 @@ if preflight is not None:
 
 MON = {"on": False, "watch": [], "cfg": None, "states": {}, "scope": "watch", "topN": 100,
        "history": [], "lastRun": None, "lastCount": 0, "lastError": None,
-       "histTTL": 12, "maxRefresh": 8, "lastRefreshed": 0, "callsToday": 0}
+       "histTTL": 24, "maxRefresh": 8, "lastRefreshed": 0, "callsToday": 0, "histTTLv": 2}
+# histTTL 2026-10-05 從 12 改 24 小時：90 天基準量一天內變化很小（量能倍數用的現量仍是即時的），
+# 監控補抓歷史一天約 250 次 → 約 125 次。histTTLv 標記已遷移，之後手動設回 12 不會被改掉
 _mon_lock = threading.Lock()
 
 
@@ -480,14 +485,23 @@ def mon_file():
 
 
 def mon_load():
-    _conf_load("monitor.json", mon_file(), MON.update)
+    loaded = {}
+    _conf_load("monitor.json", mon_file(), loaded.update)
+    MON.update(loaded)
+    # 看「設定檔本身」有沒有遷移記號，不是看 MON（預設值裡就有記號，看 MON 會讓舊檔永遠不遷移——測試抓到的）
+    if loaded and loaded.get("histTTLv") != 2:
+        # 舊設定檔存的是當時的預設 12：一次性改成 24（見上面 histTTL 的說明）；其他值是手動設的，不動
+        if loaded.get("histTTL") == 12:
+            MON["histTTL"] = 24
+        MON["histTTLv"] = 2
+        mon_save()
 
 
 def mon_save():
     return _conf_save("monitor.json", mon_file(),
                       {k: MON[k] for k in ("on", "watch", "cfg", "states", "history",
                                            "lastRun", "lastCount", "scope", "topN",
-                                           "histTTL", "maxRefresh", "callsToday")})
+                                           "histTTL", "histTTLv", "maxRefresh", "callsToday")})
 
 
 HIST_TTL_LOW = float(os.environ.get("HIST_TTL_LOW", 72))     # 幣安沒有的幣、已持倉的幣：歷史保鮮（小時）
@@ -528,7 +542,9 @@ def low_priority(sym, listed, held):
 # 接手算出的訊號照常通知，但比對樣本夠多、一致率達標才讓它自動下單。
 # 量能換算：幣安只算自家成交量、CoinGecko 是全市場，所以把幣安的基準量乘上「CoinGecko 當下量 ÷ 幣安當下量」——
 # 量能倍數變成「幣安現在 ÷ 幣安過去」，跟幣安的市佔無關。
-BN_SHADOW = {"samples": [], "lastCmp": {}, "ratio": {}}
+BN_SHADOW = {"samples": [], "lastCmp": {}, "ratio": {}, "trig": []}
+STALE_CG_MAX_H = float(os.environ.get("STALE_CG_MAX_H", 168))     # 舊 CoinGecko 歷史最多沿用幾小時（之後才換幣安）
+STALE_CG_TRADE_H = float(os.environ.get("STALE_CG_TRADE_H", 48))  # 舊到幾小時以內，訊號仍可自動下單（超過只通知）
 BN_SHADOW_PER_ROUND = int(os.environ.get("BN_SHADOW_PER_ROUND", 8))
 BN_OK_MIN_N, BN_OK_GATE, BN_OK_RVOL = 60, 0.90, 0.25       # 讓備援資料自動下單的門檻：樣本數、門檻一致率、量能倍數中位差
 # 觸發一致率（2026-09-30）：「門檻一致」大多是兩邊都沒觸發，容易一致。真正要看的是「有一邊觸發時，另一邊也觸發嗎」——
@@ -547,7 +563,7 @@ def bn_shadow_load():
         with open(bn_shadow_file(), "r", encoding="utf-8") as f:
             d = json.load(f)
         if isinstance(d, dict):
-            for k in ("samples", "lastCmp", "ratio"):
+            for k in ("samples", "lastCmp", "ratio", "trig"):
                 if isinstance(d.get(k), type(BN_SHADOW[k])):
                     BN_SHADOW[k] = d[k]
     except Exception:
@@ -671,9 +687,111 @@ def _gates(row):
     return out
 
 
-def bn_compare(cid, sym, cg_row, bn_row, cg_vol, bn_now):
+def bn_trig_record(sym, bsym, side, cg_row, bn_row, kind):
+    """觸發的後續追蹤（2026-10-05）：只有幣安觸發（bnOnly）、兩邊都觸發（both）分開記，之後用幣安小時 K 線看
+    72 小時內先到 2R 還是先碰停損——跟「被持倉上限擋掉的訊號」同一套算法。同一檔同一方向 24 小時內只記一次。"""
+    if trader is None:
+        return
+    now_ms = int(time.time() * 1000)
+    for t in BN_SHADOW["trig"]:
+        if t["sym"] == sym and t["side"] == side and now_ms - t["ts"] < 24 * 3600 * 1000:
+            return
+    bear = side == "SHORT"
+    row = bn_row if kind == "bnOnly" else cg_row
+    try:
+        pct, _sd = engine.stop_pct(row, bear, mode=trader.CFG.get("stopMode", "tighter"),
+                                   atr_mult=trader.CFG.get("stopAtrMult", 1.5),
+                                   max_pct=trader.CFG.get("maxStopPct", 12.0),
+                                   min_pct=trader.CFG.get("minStopPct", 1.5))
+    except Exception:
+        pct = None
+    price = cg_row.get("price")
+    if not pct or not price:
+        return
+    BN_SHADOW["trig"].append({"sym": sym, "bsym": bsym, "side": side, "kind": kind, "price": float(price),
+                              "stopPct": float(pct), "ts": now_ms, "result": None, "r": None})
+    del BN_SHADOW["trig"][:-300]
+
+
+_bn_hourly_memo = {}
+
+
+def bn_hourly(bsym, since_ms):
+    """幣安小時收盤 [(收盤時間, 價格)]（從 since_ms 起最多 80 根；同一檔 10 分鐘內不重拿）。"""
+    m = _bn_hourly_memo.get(bsym)
+    if m and time.time() - m[0] < 600 and m[1] <= since_ms:
+        return m[2]
+    st, b = fetch_upstream(f"/fapi/v1/klines?symbol={bsym}&interval=1h&limit=80&startTime={int(since_ms)}", "/api/bn")
+    if st != 200:
+        return None
+    try:
+        mult = _bn_mult(bsym)
+        out = [(int(r[6]) + 1, float(r[4]) / mult) for r in json.loads(b)]
+    except Exception:
+        return None
+    _bn_hourly_memo[bsym] = (time.time(), since_ms, out)
+    return out
+
+
+def bn_trig_evaluate(horizon_h=72):
+    """沒有結果的觸發：先碰停損 −1R、先到目標 +tp1R，72 小時都沒碰到以收盤算。出場位階跟實盤共用 plan_exits。"""
+    if trader is None:
+        return 0
+    now = time.time() * 1000
+    done = 0
+    for t in BN_SHADOW["trig"]:
+        if t["result"] is not None:
+            continue
+        expired = now - t["ts"] >= horizon_h * 3600000
+        series = bn_hourly(t["bsym"], t["ts"]) or []
+        pts = [(ts, p) for ts, p in series if t["ts"] <= ts <= t["ts"] + horizon_h * 3600000]
+        if not pts or (not expired and len(pts) < 2):
+            continue
+        sgn = 1 if t["side"] == "LONG" else -1
+        entry = t["price"]
+        stop = entry - sgn * entry * t["stopPct"] / 100.0
+        ex = trader.plan_exits(entry, stop, t["side"])
+        res, r = "none", None
+        for _ts, p in pts:
+            if (p - stop) * sgn <= 0:
+                res, r = "stop", -1.0
+                break
+            if (p - ex["tp1"]) * sgn >= 0:
+                res, r = "tp2", float(trader.CFG.get("tp1R", 2))
+                break
+        if res == "none":
+            if not expired:
+                continue
+            r = round((pts[-1][1] - entry) * sgn / ex["R"], 2)
+        t["result"], t["r"] = res, r
+        done += 1
+    if done:
+        bn_shadow_save()
+    return done
+
+
+def bn_trig_summary():
+    out = {}
+    for kind in ("bnOnly", "both"):
+        ev = [t for t in BN_SHADOW["trig"] if t["kind"] == kind and t["result"] is not None]
+        pend = sum(1 for t in BN_SHADOW["trig"] if t["kind"] == kind and t["result"] is None)
+        rs = [t["r"] for t in ev]
+        out[kind] = {"evaluated": len(ev), "pending": pend,
+                     "tp2": sum(1 for t in ev if t["result"] == "tp2"),
+                     "stop": sum(1 for t in ev if t["result"] == "stop"),
+                     "avgR": round(sum(rs) / len(rs), 2) if rs else None}
+    return out
+
+
+def bn_compare(cid, sym, cg_row, bn_row, cg_vol, bn_now, bsym=None):
     """記一筆比對樣本。"""
     g1, g2 = _gates(cg_row), _gates(bn_row)
+    if bsym:
+        for side_key, side in (("bull", "LONG"), ("bear", "SHORT")):
+            if g2[side_key] and not g1[side_key]:
+                bn_trig_record(sym, bsym, side, cg_row, bn_row, "bnOnly")
+            elif g2[side_key] and g1[side_key]:
+                bn_trig_record(sym, bsym, side, cg_row, bn_row, "both")
     BN_SHADOW["samples"].append({
         "sym": sym, "id": cid, "ts": int(time.time() * 1000),
         "rvCG": cg_row.get("rvol7"), "rvBN": bn_row.get("rvol7"),
@@ -715,7 +833,8 @@ def bn_shadow_round(rows, bases, listed, per_round=None):
         bn_now = t[1] if t else None
         bn_row = engine.analyze(base, bn_scan(base["vol"], chart_bn, bn_now))
         bn_compare(r["id"], r.get("sym") or "", r, bn_row, base["vol"], bn_now or (chart_bn["total_volumes"][-1][1]
-                                                                                   if chart_bn.get("total_volumes") else None))
+                                                                                   if chart_bn.get("total_volumes") else None),
+                   bsym=bsym)
         done += 1
     if done:
         bn_shadow_save()
@@ -762,6 +881,7 @@ def bn_shadow_summary():
             "cgTriggers": both, "bothTriggers": hit, "worst": [{"sym": w[1], "diff": w[0]} for w in worst],
             "trig": {"cg": cg_t, "bn": bn_t, "both": both_t, "any": any_t, "agree": trig,
                      "min": BN_OK_MIN_TRIG, "need": BN_OK_TRIG},
+            "outcomes": bn_trig_summary(),
             "ok": not why, "why": "、".join(why)}
 
 
@@ -1020,6 +1140,13 @@ def _mon_run_once():
                 refreshed[0] += 1
             else:
                 body = None
+        stale_h = None
+        if body is None:
+            # 2026-10-05：先用快取裡的舊 CoinGecko 歷史（STALE_CG_MAX_H 內）。現量仍來自 CoinGecko 行情榜，算法完全一樣，
+            # 只差基準量舊幾天——比換成幣安準得多（影子比對：幣安會多觸發一倍以上）。太舊才退回幣安
+            old, age = cache_peek(key)
+            if old is not None and age is not None and age <= STALE_CG_MAX_H * 3600:
+                body, stale_h = old, age / 3600.0
         if body is None:
             # CoinGecko 拿不到這檔的 90 天歷史：幣安有合約的改用幣安 K 線接手（2026-09-29），幣安沒有的略過
             bsym = bn_symbol(c.get("symbol"), listed)
@@ -1044,13 +1171,17 @@ def _mon_run_once():
             continue
         if stale_mk:
             row["dataSource"] = "binance"      # 行情榜是沿用的：價格、成交量來自幣安即時（CoinGecko 歷史仍可用）
+        elif stale_h is not None:
+            row["dataSource"] = "coingecko_stale"
+            row["staleH"] = round(stale_h, 1)
         else:
             bases[c["id"]] = base
         rows.append(row)
 
-    # 影子比對（2026-09-29）：CoinGecko 正常的幣挑幾檔用幣安再算一次，累積兩邊差異
+    # 影子比對（2026-09-29）：CoinGecko 正常的幣挑幾檔用幣安再算一次，累積兩邊差異；觸發的後續用幣安 K 線評估（2026-10-05）
     try:
         bn_shadow_round(rows, bases, listed)
+        bn_trig_evaluate()
     except Exception as e:
         sys.stderr.write(f"  ! 幣安影子比對出錯：{type(e).__name__}: {str(e)[:120]}\n")
 
@@ -1093,8 +1224,11 @@ def _mon_run_once():
         except Exception as ex:
             outcome = {"stage": "failed", "why": f"執行時發生錯誤：{str(ex)[:80]}"}
 
-        if (by_id.get(e.get("id")) or {}).get("dataSource") == "binance":
+        src_row = by_id.get(e.get("id")) or {}
+        if src_row.get("dataSource") == "binance":
             text += "\n資料來源：幣安合約 K 線（CoinGecko 暫時拿不到，備援接手）"
+        elif src_row.get("dataSource") == "coingecko_stale":
+            text += f"\n資料來源：CoinGecko 歷史（{src_row.get('staleH', 0):.0f} 小時前的快取，CoinGecko 暫時拿不到）"
         text += "\n" + trade_outcome_text(outcome)
         push_all(title, text)
 
@@ -1130,6 +1264,8 @@ def auto_try_trade(ev, row):
     if not row:
         return {"stage": "disabled", "why": "本輪沒有這檔的完整掃描資料"}
 
+    if row.get("dataSource") == "coingecko_stale" and (row.get("staleH") or 0) > STALE_CG_TRADE_H:
+        return {"stage": "gate", "why": f"CoinGecko 歷史已經 {row.get('staleH'):.0f} 小時沒更新（超過 {STALE_CG_TRADE_H:.0f} 小時），只通知不下單"}
     if row.get("dataSource") == "binance":
         # 幣安備援資料算出的訊號（2026-09-29）：兩邊比對夠多、夠一致才自動下單，不然只通知
         s = bn_shadow_summary()
@@ -2104,6 +2240,10 @@ def ttl_for(path_qs: str) -> float:
         return 900.0            # 合約檢查結果變動慢
     if "/trades" in path_qs or "_pools" in path_qs:
         return 60.0
+    if "market_chart" in path_qs and "days=90" in path_qs:
+        # 2026-10-05：跟監控的保鮮一致（24 小時）。磁碟快取原本只算 12 小時——模擬網、網頁來要 12～24 小時前的那份時，
+        # 伺服器會重打 CoinGecko，拿回來的幾乎一樣
+        return max(OHLC_TTL, MON.get("histTTL", 24) * 3600)
     return OHLC_TTL if "/ohlc" in path_qs or "market_chart" in path_qs else CACHE_TTL
 
 
@@ -2446,7 +2586,10 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             return
         markets = prefix == "/api/v3" and "/coins/markets" in path_qs
         if stale is not None and age is not None and (markets or age < ttl + STALE_GRACE):
-            revalidate_async(path_qs, prefix, key)
+            # 行情榜的背景更新至少隔 MARKETS_REVALIDATE_S（2026-10-05：網頁每 90 秒輪詢、模擬網每輪都來要，
+            # 以前每次都觸發一次 CoinGecko，「代理背景更新」一天約 50 次）
+            if not markets or age >= MARKETS_REVALIDATE_S:
+                revalidate_async(path_qs, prefix, key)
             return self.send_json(200, stale, cached=True, stale=int(age), data_ts=time.time() - age)
 
         # 深度資料（瀏覽器的背景深掃）是背景工作：冷卻期間直接讓路

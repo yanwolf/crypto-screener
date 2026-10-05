@@ -341,6 +341,71 @@ def _():
         return f"額度正常、沒有快取時應打一次：{r4}、{calls}"
 
 
+@case("b-13", "歷史保鮮改 24 小時：舊設定檔存的 12（當時的預設）一次性改成 24；遷移過後手動設回 12 不會再被改")
+def _():
+    ex, clock = fresh()
+    M = main_mod()
+    need(M.MON.get("histTTLv") == 2 and M.MON.get("histTTL") == 24, f"預設應為 24 小時（前提：2026-10-05 起）：{M.MON.get('histTTL')}")
+    M.mon_save = lambda: True
+    M._conf_load = lambda name, path, fn: fn({"histTTL": 12})
+    M.mon_load()
+    if M.MON["histTTL"] != 24:
+        return f"舊設定檔的 12 沒遷移成 24：{M.MON['histTTL']}"
+    M._conf_load = lambda name, path, fn: fn({"histTTL": 12, "histTTLv": 2})
+    M.mon_load()
+    if M.MON["histTTL"] != 12:
+        return f"遷移過後手動設的 12 被改掉了：{M.MON['histTTL']}"
+
+
+@case("b-14", "代理的 90 天歷史保鮮跟監控一致（24 小時）：20 小時前的直接給、不打上游；30 小時前的才重拿")
+def _():
+    ex, clock = fresh()
+    M = main_mod()
+    calls = setup(M)
+    M.MON["histTTL"] = 24
+    key = "/api/v3/coins/aaa/market_chart?vs_currency=usd&days=90"
+    age_cache(M, key, 20 * 3600)
+    out = R55_proxy(M, key)
+    if calls or out.get("code") != 200:
+        return f"20 小時前的歷史還去打上游（磁碟只算 12 小時）：{calls}"
+    age_cache(M, key, 30 * 3600)
+    R55_proxy(M, key)
+    if len(calls) != 1:
+        return f"30 小時前的應重拿一次：{calls}"
+
+
+def age_cache_raw(M, key, age_s, body):
+    old = time.time() - age_s
+    with M._cache_lock:
+        M._cache[key] = (old, body)
+    p = M._disk_path(key)
+    if os.path.exists(p):
+        blob = json.load(open(p, encoding="utf-8"))
+        blob["ts"] = old
+        json.dump(blob, open(p, "w", encoding="utf-8"))
+
+
+@case("b-15", "行情榜的背景更新至少隔 10 分鐘：5 分鐘前的直接給、不觸發 CoinGecko；11 分鐘前的才背景更新")
+def _():
+    ex, clock = fresh()
+    M = main_mod()
+    need(hasattr(M, "MARKETS_REVALIDATE_S"), "程式沒有行情榜背景更新間隔（前提：2026-10-05 起）")
+    setup(M)
+    reval = []
+    M.revalidate_async = lambda *a, **k: reval.append(a)
+    key = "/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=250&page=1"
+    M.CACHE_DIR = tempfile.mkdtemp()
+    M.cache_put(key, b'[{"id":"aaa"}]')
+    age_cache_raw(M, key, 5 * 60, b'[{"id":"aaa"}]')
+    R55_proxy(M, key)
+    if reval:
+        return "5 分鐘前的行情榜也觸發了背景更新"
+    age_cache_raw(M, key, 11 * 60, b'[{"id":"aaa"}]')
+    R55_proxy(M, key)
+    if len(reval) != 1:
+        return f"11 分鐘前的應觸發一次背景更新：{len(reval)}"
+
+
 if __name__ == "__main__":
     fails = [r for r in RESULTS if r[2]]
     for tag, desc, err in RESULTS:

@@ -86,6 +86,23 @@ function BnShadow({ s }) {
       {s.worst && s.worst.length > 0 && (
         <span>　差最多 {s.worst.map((w) => `${w.sym} ${(w.diff * 100).toFixed(0)}%`).join("、")}</span>
       )}
+      {s.outcomes && <TrigOutcomes o={s.outcomes} />}
+    </div>
+  );
+}
+
+/* 觸發的後續（2026-10-05）：只有幣安觸發 vs 兩邊都觸發，72 小時內先到 2R 還是先停損。
+   幣安多出來的那些如果明顯比較差，就是雜訊；如果差不多，幣安量能也許能當額外訊號。 */
+function TrigOutcomes({ o }) {
+  const line = (label, x) => {
+    if (!x) return null;
+    if (!x.evaluated) return `${label}：還在等（${x.pending} 筆追蹤中）`;
+    return `${label}：${x.evaluated} 筆，先到 2R ${x.tp2}、先停損 ${x.stop}、平均 ${x.avgR >= 0 ? "+" : ""}${x.avgR}R` +
+      (x.pending ? `（另 ${x.pending} 筆追蹤中）` : "");
+  };
+  return (
+    <div>
+      觸發後續　{line("只有幣安觸發", o.bnOnly)}　·　{line("兩邊都觸發", o.both)}
     </div>
   );
 }
