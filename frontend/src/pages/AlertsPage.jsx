@@ -148,6 +148,12 @@ export default function AlertsPage({ s }) {
                           歷史資料在 {mon.histTTL ?? 12} 小時內不重抓，每輪最多補抓 {mon.maxRefresh ?? 8} 檔；
                           上一輪實際補抓 {mon.lastRefreshed ?? 0} 檔。
                         </div>
+                        {mon.bnSkip && (mon.bnSkip.limited > 0 || mon.bnSkip.error > 0) && (
+                          <div style={{ color: C.gold }}>
+                            幣安備援上一輪沒算：限流 {mon.bnSkip.limited} 檔（暫時性，不是沒資料）、其他錯誤 {mon.bnSkip.error} 檔
+                            {mon.bnRate ? `；幣安權重這一分鐘 ${mon.bnRate.used}/${mon.bnRate.cap}` + (mon.bnRate.ban ? `，IP 封鎖中還要 ${mon.bnRate.ban} 秒` : "") : ""}
+                          </div>
+                        )}
                       </div>
                     );
                   })()}

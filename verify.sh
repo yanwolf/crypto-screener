@@ -141,6 +141,8 @@ python3 -m tests.test_cg_budget
 
 echo "── 20q. 幣安備援：換算一致、影子比對、CoinGecko 拿不到時接手、下單把關 ──"
 python3 -m tests.test_bn_backup
+echo "── 20r. 第 6 條 r97：K 線也算 IP 權重（讓路、429 照 Retry-After、418 立刻停、限流 ≠ 沒資料）──"
+python3 -m tests.test_r97
 # 每支測試結束時都會數「真的開了幾個補登執行緒」（不是 0 就以 ✕ 結束）；金絲雀確認數得到
 BACKFILL_CANARY=1 python3 -m tests.test_r32 > /dev/null || { echo "  ✕ 補登執行緒金絲雀沒數到"; exit 1; }
 echo "✓ 補登執行緒金絲雀：數得到（每支測試結束時的計數可信）"

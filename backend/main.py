@@ -191,6 +191,125 @@ _last_chain = [0.0]
 _bn_lock = threading.Lock()
 _last_bn = [0.0]
 
+# 幣安 IP 權重（BINANCE_LESSONS 第 6 條 r97）：公開行情不用金鑰，但一樣算 IP 權重——K 線 limit=1500 一次 10，每分鐘上限 2400。
+# CoinGecko 拿不到時，監控每檔改抓幣安 90 天小時 K（約 15 權重），整個宇宙一輪就是幾千權重；429 之後還打會升級成 418 封 IP，
+# 正式網服務的 trader 走同一個出口 IP（對帳、停損管理），會一起被封。
+BN_CAP = 2400                 # 合約每分鐘 IP 權重上限
+BN_SOFT = BN_CAP // 2         # K 線用到一半就等下一分鐘，另一半留給 trader 與其他請求
+BN_RETRY = 3                  # 429 照 Retry-After 重試的上限
+BN_WAIT_MAX = 120             # 單次最多等幾秒
+BN_RL = {"used": 0, "minute": -1, "cool": 0.0, "ban": 0.0, "n429": 0, "n418": 0, "waits": 0, "waited": 0.0,
+         "last": "", "limitedAt": 0.0}
+_bn_kline_lock = threading.Lock()   # 整個程序的 K 線排隊（含等待）；其他 /api/bn 請求不排這條隊
+
+
+def bn_kline_weight(limit):
+    """幣安合約 K 線權重：limit <100 → 1、<500 → 2、≤1000 → 5、>1000 → 10。"""
+    limit = int(limit)
+    return 1 if limit < 100 else 2 if limit < 500 else 5 if limit <= 1000 else 10
+
+
+def _bn_hdr(headers, name):
+    try:
+        return (headers or {}).get(name)
+    except Exception:
+        return None
+
+
+def _bn_note(headers, code=200):
+    """每個幣安（/api/bn）回應都記：已用權重；429 → 冷卻到 Retry-After（最多 120 秒）；418 → 封鎖到 Retry-After。"""
+    now = time.time()
+    try:
+        used = int(_bn_hdr(headers, "X-MBX-USED-WEIGHT-1M"))
+    except Exception:
+        used = None
+    if used is not None:
+        BN_RL.update(used=used, minute=int(now // 60))
+    if code not in (418, 429):
+        return
+    try:
+        ra = float(_bn_hdr(headers, "Retry-After") or 0)
+    except Exception:
+        ra = 0.0
+    if code == 418:
+        BN_RL["ban"] = max(BN_RL["ban"], now + (ra or BN_WAIT_MAX))
+        BN_RL["n418"] += 1
+    else:
+        BN_RL["cool"] = max(BN_RL["cool"], now + min(ra or 60.0, BN_WAIT_MAX))
+        BN_RL["n429"] += 1
+    BN_RL["last"] = time.strftime("%m-%d %H:%M:%S", time.localtime(now)) + f" HTTP {code}"
+
+
+def bn_rate_status():
+    now = time.time()
+    return {"used": BN_RL["used"] if BN_RL["minute"] == int(now // 60) else 0, "cap": BN_CAP, "soft": BN_SOFT,
+            "cool": max(0, int(BN_RL["cool"] - now)), "ban": max(0, int(BN_RL["ban"] - now)),
+            "n429": BN_RL["n429"], "n418": BN_RL["n418"], "waits": BN_RL["waits"], "waited": round(BN_RL["waited"]),
+            "last": BN_RL["last"]}
+
+
+def bn_blocked():
+    """這一刻幣安 K 線拿不到（封鎖中、或剛限流到放棄）：批次迴圈（監控備援、影子比對、觸發追蹤）這輪剩下的直接讓開，
+    不要每檔再排一次「等 Retry-After、重試 3 次」。"""
+    now = time.time()
+    return now < BN_RL["ban"] or now - BN_RL["limitedAt"] < BN_WAIT_MAX
+
+
+def _bn_wait(s):
+    s = max(0.0, min(float(s), BN_WAIT_MAX))
+    BN_RL["waits"] += 1
+    BN_RL["waited"] += s
+    time.sleep(s)
+
+
+def _bn_limited_body(kind, detail):
+    return json.dumps({"error": kind, "temporary": True, "detail": detail}, ensure_ascii=False).encode()
+
+
+def _bn_kline(url, path_qs):
+    """K 線請求（第 6 條 r97）：排隊；這一分鐘已用＋這次的權重超過一半就等下一分鐘；429 照 Retry-After 等完重試，
+    最多 3 次，還是被擋回 429＋rate_limited（暫時性，不是沒有資料）；418 不重試，記下封鎖、立刻回。"""
+    try:
+        lim = int(urllib.parse.parse_qs(path_qs.split("?", 1)[1]).get("limit", ["500"])[0])
+    except Exception:
+        lim = 500
+    w = bn_kline_weight(lim)
+    with _bn_kline_lock:
+        tries = 0
+        while True:
+            now = time.time()
+            if now < BN_RL["ban"]:
+                return 418, _bn_limited_body("ip_banned", f"幣安 418 封鎖中，還要 {int(BN_RL['ban'] - now)} 秒")
+            if now < BN_RL["cool"]:
+                _bn_wait(BN_RL["cool"] - now + 0.5)
+                continue
+            if BN_RL["minute"] == int(now // 60) and BN_RL["used"] + w > BN_SOFT:
+                _bn_wait(60 - now % 60 + 1)
+                continue
+            req = urllib.request.Request(url, headers={"User-Agent": "local-crypto-screener/1.0", "Accept": "application/json"})
+            try:
+                with urllib.request.urlopen(req, timeout=40) as r:
+                    _bn_note(getattr(r, "headers", None))
+                    return 200, r.read()
+            except urllib.error.HTTPError as ex:
+                _bn_note(ex.headers, ex.code)
+                body = ex.read()
+                if ex.code == 418:
+                    BN_RL["limitedAt"] = time.time()
+                    return 418, body or _bn_limited_body("ip_banned", "幣安 418")
+                if ex.code == 429:
+                    tries += 1
+                    if tries > BN_RETRY:
+                        BN_RL["limitedAt"] = time.time()
+                        return 429, _bn_limited_body("rate_limited", f"幣安限流，重試 {BN_RETRY} 次仍被擋（暫時性，不是沒有資料）")
+                    continue
+                return ex.code, body or json.dumps({"error": f"HTTP {ex.code}"}).encode()
+            except Exception as ex:
+                tries += 1
+                if tries > 2:
+                    return 502, json.dumps({"error": "upstream_unreachable", "detail": str(ex)}, ensure_ascii=False).encode()
+                time.sleep(2)
+
 CFG = {"key": "", "pro": False, "gap": 2.4}
 NOTIFY = {"tg_token": "", "tg_chat": "", "discord": "",
           "smtp_host": "", "smtp_port": 587, "smtp_user": "", "smtp_pass": "", "mail_to": ""}
@@ -467,10 +586,28 @@ def _preflight_notify(add):
             add(f"設定檔 {label}", "warn", f"存檔連續失敗 {ce['saveFails']} 次：{ce.get('saveError')}", 8)
 
 
+def _preflight_bn_weight(add):
+    """第 6 條 r97：公開行情一樣算 IP 權重。抓一根 1 分 K（權重 1）拿這一分鐘的已用權重；封鎖中不送請求。"""
+    st, b = fetch_upstream("/fapi/v1/klines?symbol=BTCUSDT&interval=1m&limit=2", "/api/bn")
+    rs = bn_rate_status()
+    info = (f"這一分鐘已用 {rs['used']}/{rs['cap']}（K 線讓路線 {rs['soft']}）；累計 429 {rs['n429']} 次、418 {rs['n418']} 次、"
+            f"等待 {rs['waits']} 次共 {rs['waited']} 秒")
+    if st == 418:
+        add("IP 權重（K 線）", "fail", f"IP 被封鎖（418），還要 {rs['ban']} 秒——正式網的對帳、停損管理走同一個 IP；" + info, 6)
+    elif st == 429:
+        add("IP 權重（K 線）", "warn", "被限流（429）；" + info, 6)
+    elif st != 200:
+        add("IP 權重（K 線）", "warn", f"HTTP {st}；" + info, 6)
+    else:
+        add("IP 權重（K 線）", "warn" if rs["used"] > rs["soft"] else "ok", info, 6)
+
+
 if preflight is not None:
     # 重新載入模組（測試）時不重複登記
-    preflight.EXTRA[:] = [f for f in preflight.EXTRA if getattr(f, "__name__", "") != "_preflight_notify"]
+    preflight.EXTRA[:] = [f for f in preflight.EXTRA
+                          if getattr(f, "__name__", "") not in ("_preflight_notify", "_preflight_bn_weight")]
     preflight.EXTRA.append(_preflight_notify)
+    preflight.EXTRA.append(_preflight_bn_weight)
 
 MON = {"on": False, "watch": [], "cfg": None, "states": {}, "scope": "watch", "topN": 100,
        "history": [], "lastRun": None, "lastCount": 0, "lastError": None,
@@ -625,24 +762,31 @@ def bn_tickers():
 
 
 def bn_chart(bsym):
-    """幣安合約 90 天小時 K 線 → 跟 CoinGecko market_chart 一樣的格式：prices 每小時收盤、total_volumes 滾動 24 小時成交額。
-    快取照 90 天歷史的保鮮（存磁碟）。拿不到回 None。"""
+    """幣安合約 90 天小時 K 線 → 跟 CoinGecko market_chart 一樣的格式。拿不到回 None（原因看 bn_chart_ex）。"""
+    return bn_chart_ex(bsym)[0]
+
+
+def bn_chart_ex(bsym):
+    """回傳 (chart, 拿不到的原因)。原因：limited（幣安限流／封鎖——暫時性，不是沒有資料，第 6 條 r97）、
+    error（其他錯誤）、nodata（真的沒有足夠的歷史，例如剛上架）。快取照 90 天歷史的保鮮（存磁碟）。"""
     key = f"/api/bnx/{bsym}/market_chart_1h90"
     body = cache_get(key, MON.get("histTTL", 12) * 3600)
     if body is not None:
         try:
-            return json.loads(body)
+            return json.loads(body), None
         except Exception:
             pass
     rows, end = [], int(time.time() * 1000)
     for want in (1500, 700):                  # 90 天＋前 23 小時 ≈ 2183 根，分兩次拿
         st, b = fetch_upstream(f"/fapi/v1/klines?symbol={bsym}&interval=1h&limit={want}&endTime={end}", "/api/bn")
+        if st in (418, 429):
+            return None, "limited"
         if st != 200:
-            return None
+            return None, "error"
         try:
             k = json.loads(b)
         except Exception:
-            return None
+            return None, "error"
         if not isinstance(k, list) or not k:
             break
         rows = k + rows
@@ -650,7 +794,7 @@ def bn_chart(bsym):
         if len(k) < want:
             break
     if len(rows) < 24 + 48:
-        return None
+        return None, "nodata"
     mult = _bn_mult(bsym)
     closes = [(int(r[6]) + 1, float(r[4]) / mult) for r in rows]
     qv = [float(r[7]) for r in rows]
@@ -660,7 +804,7 @@ def bn_chart(bsym):
         vols.append([closes[i][0], sum(qv[i - 23:i + 1])])
     chart = {"prices": prices[-90 * 24:], "total_volumes": vols[-90 * 24:], "source": "binance", "symbol": bsym}
     cache_put(key, json.dumps(chart).encode())
-    return chart
+    return chart, None
 
 
 def bn_scan(cg_vol, chart, bn_now=None):
@@ -743,6 +887,8 @@ def bn_trig_evaluate(horizon_h=72):
         if t["result"] is not None:
             continue
         expired = now - t["ts"] >= horizon_h * 3600000
+        if bn_blocked():                      # 限流／封鎖：這輪不評了，下一輪再來（不是「沒資料」，第 6 條 r97）
+            break
         series = bn_hourly(t["bsym"], t["ts"]) or []
         pts = [(ts, p) for ts, p in series if t["ts"] <= ts <= t["ts"] + horizon_h * 3600000]
         if not pts or (not expired and len(pts) < 2):
@@ -825,6 +971,8 @@ def bn_shadow_round(rows, bases, listed, per_round=None):
     done = 0
     tick = bn_tickers() if cands else {}
     for _last, r, bsym in cands[:per_round]:
+        if bn_blocked():                      # 限流／封鎖：這輪剩下的不比了（第 6 條 r97）
+            break
         chart_bn = bn_chart(bsym)
         if not chart_bn:
             continue
@@ -1109,6 +1257,7 @@ def _mon_run_once():
     refreshed = [0]                 # 本輪實際向上游補抓的檔數
     listed, held = binance_listed_and_held()
     low = {"unlisted": 0, "held": 0}
+    bn_skip = {"limited": 0, "nodata": 0, "error": 0}   # 幣安備援拿不到的檔數，依原因分開（第 6 條 r97：限流 ≠ 沒資料）
     for c in markets:
         path = f"/coins/{c['id']}/market_chart?vs_currency=usd&days=90"
         key = "/api/v3" + path
@@ -1150,8 +1299,14 @@ def _mon_run_once():
         if body is None:
             # CoinGecko 拿不到這檔的 90 天歷史：幣安有合約的改用幣安 K 線接手（2026-09-29），幣安沒有的略過
             bsym = bn_symbol(c.get("symbol"), listed)
-            chart_bn = bn_chart(bsym) if bsym else None
+            if not bsym:
+                continue
+            if bn_blocked():                  # 這輪已經被限流／封鎖：剩下的不再一檔一檔排隊重試
+                bn_skip["limited"] += 1
+                continue
+            chart_bn, why_bn = bn_chart_ex(bsym)
             if not chart_bn:
+                bn_skip[why_bn or "error"] += 1
                 continue
             t = bn_tickers().get(bsym)
             try:
@@ -1186,6 +1341,9 @@ def _mon_run_once():
         sys.stderr.write(f"  ! 幣安影子比對出錯：{type(e).__name__}: {str(e)[:120]}\n")
 
     MON["lowPri"] = dict(low, ttlH=HIST_TTL_LOW)
+    MON["bnSkip"] = bn_skip
+    if bn_skip["limited"]:
+        sys.stderr.write(f"  ! 幣安備援被限流：這輪 {bn_skip['limited']} 檔沒算（暫時性，不是沒有資料）{bn_rate_status()}\n")
     now_ms = time.time() * 1000
     events, states = engine.evaluate(rows, MON["cfg"], MON["states"], now_ms)
 
@@ -1831,6 +1989,7 @@ def mon_handle(path, payload):
                      "lastError": MON["lastError"], "engine": bool(engine),
                      "historyCount": len(MON["history"]),
                      "lastRefreshed": MON.get("lastRefreshed", 0),
+                     "bnSkip": MON.get("bnSkip"), "bnRate": bn_rate_status(),
                      "gateStats": MON.get("gateStats"),
                      "callsToday": MON.get("callsToday", 0),
                      "histTTL": MON.get("histTTL", 12), "maxRefresh": MON.get("maxRefresh", 8),
@@ -2340,6 +2499,14 @@ def fetch_upstream(path_qs: str, prefix: str = "/api/v3", background: bool = Fal
     if prefix == "/api/v3":
         _count_cg(path_qs)
     url = upstream_url(path_qs) if prefix == "/api/v3" else UPSTREAMS[prefix] + path_qs
+    if prefix == "/api/bn":
+        now = time.time()
+        if now < BN_RL["ban"]:                 # 418 封鎖中：任何 /api/bn 都不送（繼續打會延長封鎖）
+            return 418, _bn_limited_body("ip_banned", f"幣安 418 封鎖中，還要 {int(BN_RL['ban'] - now)} 秒")
+        if path_qs.startswith("/fapi/v1/klines"):
+            return _bn_kline(url, path_qs)
+        if now < BN_RL["cool"]:                # 429 冷卻中：其他公開請求（行情、衍生品）這次不送
+            return 429, _bn_limited_body("rate_limited", f"幣安 429 冷卻中，還要 {int(BN_RL['cool'] - now)} 秒")
     req = urllib.request.Request(url, headers={
         "User-Agent": "local-crypto-screener/1.0",
         "Accept": "application/json",
@@ -2358,9 +2525,15 @@ def fetch_upstream(path_qs: str, prefix: str = "/api/v3", background: bool = Fal
             slot[0] = time.time()
         try:
             with urllib.request.urlopen(req, timeout=40) as r:
+                if prefix == "/api/bn":
+                    _bn_note(getattr(r, "headers", None))
                 return 200, r.read()
         except urllib.error.HTTPError as e:
             body = e.read()
+            if prefix == "/api/bn":
+                _bn_note(e.headers, e.code)
+                if e.code in (418, 429):       # 不原地重試：冷卻／封鎖已記下，K 線那邊會照 Retry-After 等
+                    return e.code, body or _bn_limited_body("rate_limited" if e.code == 429 else "ip_banned", f"HTTP {e.code}")
             if prefix == "/api/v3" and CG_UPSTREAM and (e.headers or {}).get("X-CG-Error") == "QUOTA":
                 # 模擬網（2026-09-30）：上游伺服器說 CoinGecko 額度用完——重試沒用（以前當成 5xx 重試兩次），
                 # 而且接下來一段時間都一樣：記下來，讓監控直接改用幣安備援，不再每輪白試
