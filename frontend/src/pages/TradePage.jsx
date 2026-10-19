@@ -791,8 +791,44 @@ export default function TradePage({ s }) {
                 {p.warnings?.length > 0 && (
                   <div className="mt-1.5" style={{ fontSize: 11, color: C.gold }}>{p.warnings.join("；")}</div>
                 )}
+                {/* 待平倉（2026-10-20）：以前網頁看不到，只能看 Telegram。交易所持續拒絕時才給「停止追蹤」——平常不該按 */}
+                {p.pendingClose && (
+                  <div className="mt-2 px-2.5 py-1.5 rounded" style={{ border: `1px solid ${C.red}`, fontSize: 11.5 }}>
+                    <div style={{ color: C.red }}>
+                      平倉失敗、部位仍在（{p.pendingClose.attempts} 次）：{p.pendingClose.lastErr || "—"}
+                    </div>
+                    {p.pendingClose.stuck ? (
+                      <div className="mt-1 flex items-center gap-2 flex-wrap" style={{ color: C.muted }}>
+                        <span>交易所持續拒絕，改成每 10 分鐘試一次。到幣安手動也平不掉的話：</span>
+                        <button disabled={tradeBusy} className="px-2.5 py-1 rounded"
+                          style={{ background: C.panel, border: `1px solid ${C.gold}`, color: C.gold, fontSize: 11.5 }}
+                          onClick={async () => {
+                            if (!window.confirm(`停止追蹤 ${p.symbol}？\n\n帳上移除這筆（記成損益未知、不計入績效），釋放持倉名額。` +
+                              `交易所上的部位與掛單都不會動，請自己到幣安處理。這檔在交易所清空之前不會再進場。`)) return;
+                            const j = await tradeCall("abandon", { symbol: p.symbol });
+                            if (j?.ok) { setTradeMsg(["ok", `${p.symbol} 已停止追蹤`]); refreshTrade(); }
+                            else if (j?.error) setTradeMsg(["err", `${p.symbol} ${j.error}`]);
+                          }}>
+                          停止追蹤此部位
+                        </button>
+                      </div>
+                    ) : (
+                      <div className="mt-0.5" style={{ color: C.muted }}>每 20 秒重試一次。</div>
+                    )}
+                  </div>
+                )}
               </div>
             ))}
+            {trade.abandoned && Object.keys(trade.abandoned).length > 0 && (
+              <div className="mt-2 px-3 py-2 rounded" style={{ background: C.panel2, border: `1px solid ${C.gold}`, fontSize: 11.5 }}>
+                <div style={{ color: C.gold }}>已停止追蹤的殘留部位（交易所上還在，帳上已移除）</div>
+                {Object.entries(trade.abandoned).map(([sym, a]) => (
+                  <div key={sym} style={{ fontFamily: FONT.data, color: C.muted }}>
+                    {sym}　{a.side === "LONG" ? "做多" : "做空"} {a.qty} @ {fmtPrice(a.entry)}　這檔不再進場，交易所清空後自動解除
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
   );
 }

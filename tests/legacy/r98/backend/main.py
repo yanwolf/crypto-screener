@@ -127,6 +127,9 @@ _revalidating = set()
 _reval_lock = threading.Lock()
 
 
+MARKETS_REVALIDATE_S = float(os.environ.get("MARKETS_REVALIDATE_S", 600))
+
+
 def revalidate_async(path_qs, prefix, key):
     """背景更新快取。同一個 key 同時只跑一輪，避免重複打上游。"""
     with _reval_lock:
@@ -136,7 +139,8 @@ def revalidate_async(path_qs, prefix, key):
 
     def run():
         try:
-            st, body = fetch_upstream(path_qs, prefix)
+            with cg_source("代理背景更新"):
+                st, body = fetch_upstream(path_qs, prefix)
             if st == 200:
                 cache_put(key, body)
         except Exception:
@@ -172,8 +176,8 @@ def cache_get(key: str, ttl: float):
 def cache_put(key: str, body: bytes):
     with _cache_lock:
         _cache[key] = (time.time(), body)
-    if "market_chart" not in key and "token_security" not in key:
-        return                                   # 只有昂貴的深度資料值得落地
+    if "market_chart" not in key and "token_security" not in key and "/coins/markets" not in key:
+        return                                   # 只有昂貴的深度資料值得落地；行情榜也存（2026-09-29：重啟後額度用完時還有上一份可給）
     try:
         os.makedirs(CACHE_DIR, exist_ok=True)
         with open(_disk_path(key), "w") as f:
@@ -186,6 +190,125 @@ _last_call = [0.0]
 _last_chain = [0.0]
 _bn_lock = threading.Lock()
 _last_bn = [0.0]
+
+# 幣安 IP 權重（BINANCE_LESSONS 第 6 條 r97）：公開行情不用金鑰，但一樣算 IP 權重——K 線 limit=1500 一次 10，每分鐘上限 2400。
+# CoinGecko 拿不到時，監控每檔改抓幣安 90 天小時 K（約 15 權重），整個宇宙一輪就是幾千權重；429 之後還打會升級成 418 封 IP，
+# 正式網服務的 trader 走同一個出口 IP（對帳、停損管理），會一起被封。
+BN_CAP = 2400                 # 合約每分鐘 IP 權重上限
+BN_SOFT = BN_CAP // 2         # K 線用到一半就等下一分鐘，另一半留給 trader 與其他請求
+BN_RETRY = 3                  # 429 照 Retry-After 重試的上限
+BN_WAIT_MAX = 120             # 單次最多等幾秒
+BN_RL = {"used": 0, "minute": -1, "cool": 0.0, "ban": 0.0, "n429": 0, "n418": 0, "waits": 0, "waited": 0.0,
+         "last": "", "limitedAt": 0.0}
+_bn_kline_lock = threading.Lock()   # 整個程序的 K 線排隊（含等待）；其他 /api/bn 請求不排這條隊
+
+
+def bn_kline_weight(limit):
+    """幣安合約 K 線權重：limit <100 → 1、<500 → 2、≤1000 → 5、>1000 → 10。"""
+    limit = int(limit)
+    return 1 if limit < 100 else 2 if limit < 500 else 5 if limit <= 1000 else 10
+
+
+def _bn_hdr(headers, name):
+    try:
+        return (headers or {}).get(name)
+    except Exception:
+        return None
+
+
+def _bn_note(headers, code=200):
+    """每個幣安（/api/bn）回應都記：已用權重；429 → 冷卻到 Retry-After（最多 120 秒）；418 → 封鎖到 Retry-After。"""
+    now = time.time()
+    try:
+        used = int(_bn_hdr(headers, "X-MBX-USED-WEIGHT-1M"))
+    except Exception:
+        used = None
+    if used is not None:
+        BN_RL.update(used=used, minute=int(now // 60))
+    if code not in (418, 429):
+        return
+    try:
+        ra = float(_bn_hdr(headers, "Retry-After") or 0)
+    except Exception:
+        ra = 0.0
+    if code == 418:
+        BN_RL["ban"] = max(BN_RL["ban"], now + (ra or BN_WAIT_MAX))
+        BN_RL["n418"] += 1
+    else:
+        BN_RL["cool"] = max(BN_RL["cool"], now + min(ra or 60.0, BN_WAIT_MAX))
+        BN_RL["n429"] += 1
+    BN_RL["last"] = time.strftime("%m-%d %H:%M:%S", time.localtime(now)) + f" HTTP {code}"
+
+
+def bn_rate_status():
+    now = time.time()
+    return {"used": BN_RL["used"] if BN_RL["minute"] == int(now // 60) else 0, "cap": BN_CAP, "soft": BN_SOFT,
+            "cool": max(0, int(BN_RL["cool"] - now)), "ban": max(0, int(BN_RL["ban"] - now)),
+            "n429": BN_RL["n429"], "n418": BN_RL["n418"], "waits": BN_RL["waits"], "waited": round(BN_RL["waited"]),
+            "last": BN_RL["last"]}
+
+
+def bn_blocked():
+    """這一刻幣安 K 線拿不到（封鎖中、或剛限流到放棄）：批次迴圈（監控備援、影子比對、觸發追蹤）這輪剩下的直接讓開，
+    不要每檔再排一次「等 Retry-After、重試 3 次」。"""
+    now = time.time()
+    return now < BN_RL["ban"] or now - BN_RL["limitedAt"] < BN_WAIT_MAX
+
+
+def _bn_wait(s):
+    s = max(0.0, min(float(s), BN_WAIT_MAX))
+    BN_RL["waits"] += 1
+    BN_RL["waited"] += s
+    time.sleep(s)
+
+
+def _bn_limited_body(kind, detail):
+    return json.dumps({"error": kind, "temporary": True, "detail": detail}, ensure_ascii=False).encode()
+
+
+def _bn_kline(url, path_qs):
+    """K 線請求（第 6 條 r97）：排隊；這一分鐘已用＋這次的權重超過一半就等下一分鐘；429 照 Retry-After 等完重試，
+    最多 3 次，還是被擋回 429＋rate_limited（暫時性，不是沒有資料）；418 不重試，記下封鎖、立刻回。"""
+    try:
+        lim = int(urllib.parse.parse_qs(path_qs.split("?", 1)[1]).get("limit", ["500"])[0])
+    except Exception:
+        lim = 500
+    w = bn_kline_weight(lim)
+    with _bn_kline_lock:
+        tries = 0
+        while True:
+            now = time.time()
+            if now < BN_RL["ban"]:
+                return 418, _bn_limited_body("ip_banned", f"幣安 418 封鎖中，還要 {int(BN_RL['ban'] - now)} 秒")
+            if now < BN_RL["cool"]:
+                _bn_wait(BN_RL["cool"] - now + 0.5)
+                continue
+            if BN_RL["minute"] == int(now // 60) and BN_RL["used"] + w > BN_SOFT:
+                _bn_wait(60 - now % 60 + 1)
+                continue
+            req = urllib.request.Request(url, headers={"User-Agent": "local-crypto-screener/1.0", "Accept": "application/json"})
+            try:
+                with urllib.request.urlopen(req, timeout=40) as r:
+                    _bn_note(getattr(r, "headers", None))
+                    return 200, r.read()
+            except urllib.error.HTTPError as ex:
+                _bn_note(ex.headers, ex.code)
+                body = ex.read()
+                if ex.code == 418:
+                    BN_RL["limitedAt"] = time.time()
+                    return 418, body or _bn_limited_body("ip_banned", "幣安 418")
+                if ex.code == 429:
+                    tries += 1
+                    if tries > BN_RETRY:
+                        BN_RL["limitedAt"] = time.time()
+                        return 429, _bn_limited_body("rate_limited", f"幣安限流，重試 {BN_RETRY} 次仍被擋（暫時性，不是沒有資料）")
+                    continue
+                return ex.code, body or json.dumps({"error": f"HTTP {ex.code}"}).encode()
+            except Exception as ex:
+                tries += 1
+                if tries > 2:
+                    return 502, json.dumps({"error": "upstream_unreachable", "detail": str(ex)}, ensure_ascii=False).encode()
+                time.sleep(2)
 
 CFG = {"key": "", "pro": False, "gap": 2.4}
 NOTIFY = {"tg_token": "", "tg_chat": "", "discord": "",
@@ -463,14 +586,34 @@ def _preflight_notify(add):
             add(f"設定檔 {label}", "warn", f"存檔連續失敗 {ce['saveFails']} 次：{ce.get('saveError')}", 8)
 
 
+def _preflight_bn_weight(add):
+    """第 6 條 r97：公開行情一樣算 IP 權重。抓一根 1 分 K（權重 1）拿這一分鐘的已用權重；封鎖中不送請求。"""
+    st, b = fetch_upstream("/fapi/v1/klines?symbol=BTCUSDT&interval=1m&limit=2", "/api/bn")
+    rs = bn_rate_status()
+    info = (f"這一分鐘已用 {rs['used']}/{rs['cap']}（K 線讓路線 {rs['soft']}）；累計 429 {rs['n429']} 次、418 {rs['n418']} 次、"
+            f"等待 {rs['waits']} 次共 {rs['waited']} 秒")
+    if st == 418:
+        add("IP 權重（K 線）", "fail", f"IP 被封鎖（418），還要 {rs['ban']} 秒——正式網的對帳、停損管理走同一個 IP；" + info, 6)
+    elif st == 429:
+        add("IP 權重（K 線）", "warn", "被限流（429）；" + info, 6)
+    elif st != 200:
+        add("IP 權重（K 線）", "warn", f"HTTP {st}；" + info, 6)
+    else:
+        add("IP 權重（K 線）", "warn" if rs["used"] > rs["soft"] else "ok", info, 6)
+
+
 if preflight is not None:
     # 重新載入模組（測試）時不重複登記
-    preflight.EXTRA[:] = [f for f in preflight.EXTRA if getattr(f, "__name__", "") != "_preflight_notify"]
+    preflight.EXTRA[:] = [f for f in preflight.EXTRA
+                          if getattr(f, "__name__", "") not in ("_preflight_notify", "_preflight_bn_weight")]
     preflight.EXTRA.append(_preflight_notify)
+    preflight.EXTRA.append(_preflight_bn_weight)
 
 MON = {"on": False, "watch": [], "cfg": None, "states": {}, "scope": "watch", "topN": 100,
        "history": [], "lastRun": None, "lastCount": 0, "lastError": None,
-       "histTTL": 12, "maxRefresh": 8, "lastRefreshed": 0, "callsToday": 0}
+       "histTTL": 24, "maxRefresh": 8, "lastRefreshed": 0, "callsToday": 0, "histTTLv": 2}
+# histTTL 2026-10-05 從 12 改 24 小時：90 天基準量一天內變化很小（量能倍數用的現量仍是即時的），
+# 監控補抓歷史一天約 250 次 → 約 125 次。histTTLv 標記已遷移，之後手動設回 12 不會被改掉
 _mon_lock = threading.Lock()
 
 
@@ -479,21 +622,469 @@ def mon_file():
 
 
 def mon_load():
-    _conf_load("monitor.json", mon_file(), MON.update)
+    loaded = {}
+    _conf_load("monitor.json", mon_file(), loaded.update)
+    MON.update(loaded)
+    # 看「設定檔本身」有沒有遷移記號，不是看 MON（預設值裡就有記號，看 MON 會讓舊檔永遠不遷移——測試抓到的）
+    if loaded and loaded.get("histTTLv") != 2:
+        # 舊設定檔存的是當時的預設 12：一次性改成 24（見上面 histTTL 的說明）；其他值是手動設的，不動
+        if loaded.get("histTTL") == 12:
+            MON["histTTL"] = 24
+        MON["histTTLv"] = 2
+        mon_save()
 
 
 def mon_save():
     return _conf_save("monitor.json", mon_file(),
                       {k: MON[k] for k in ("on", "watch", "cfg", "states", "history",
                                            "lastRun", "lastCount", "scope", "topN",
-                                           "histTTL", "maxRefresh", "callsToday")})
+                                           "histTTL", "histTTLv", "maxRefresh", "callsToday")})
+
+
+HIST_TTL_LOW = float(os.environ.get("HIST_TTL_LOW", 72))     # 幣安沒有的幣、已持倉的幣：歷史保鮮（小時）
+
+
+def _bn_candidates(sym):
+    s = (sym or "").upper()
+    return (f"{s}USDT", f"1000{s}USDT", f"1000000{s}USDT", f"1M{s}USDT")
+
+
+def binance_listed_and_held():
+    """幣安合約清單（取不到就回 None：一律當成有上架，不降頻）與目前持倉的合約代號。"""
+    listed, held = None, set()
+    if trader is not None:
+        try:
+            f = trader.load_filters()
+            if f:
+                listed = {k for k, v in f.items() if (v or {}).get("status") == "TRADING"}
+        except Exception:
+            listed = None
+        held = set((trader.STATE.get("positions") or {}).keys()) | set((trader.STATE.get("pending") or {}).keys())
+    return listed, held
+
+
+def low_priority(sym, listed, held):
+    """回傳降頻的原因：held（已持倉）／unlisted（幣安沒有合約）／None（正常）。"""
+    cands = _bn_candidates(sym)
+    if any(c in held for c in cands):
+        return "held"
+    if listed is not None and not any(c in listed for c in cands):
+        return "unlisted"
+    return None
+
+
+# ── 幣安備援：90 天小時 K 線（2026-09-29）──────────────────────────
+# 平常「影子跑」：每輪挑幾檔幣安有合約、CoinGecko 歷史也新鮮的，用幣安 K 線再算一次、兩邊比對（量能倍數、分數、階段、
+# 多空門檻有沒有同時過），累積起來看差異大不大。CoinGecko 拿不到時（額度用完、冷卻中、連不上），幣安有合約的幣改用幣安接手；
+# 接手算出的訊號照常通知，但比對樣本夠多、一致率達標才讓它自動下單。
+# 量能換算：幣安只算自家成交量、CoinGecko 是全市場，所以把幣安的基準量乘上「CoinGecko 當下量 ÷ 幣安當下量」——
+# 量能倍數變成「幣安現在 ÷ 幣安過去」，跟幣安的市佔無關。
+BN_SHADOW = {"samples": [], "lastCmp": {}, "ratio": {}, "trig": []}
+STALE_CG_MAX_H = float(os.environ.get("STALE_CG_MAX_H", 168))     # 舊 CoinGecko 歷史最多沿用幾小時（之後才換幣安）
+STALE_CG_TRADE_H = float(os.environ.get("STALE_CG_TRADE_H", 48))  # 舊到幾小時以內，訊號仍可自動下單（超過只通知）
+BN_SHADOW_PER_ROUND = int(os.environ.get("BN_SHADOW_PER_ROUND", 8))
+BN_OK_MIN_N, BN_OK_GATE, BN_OK_RVOL = 60, 0.90, 0.25       # 讓備援資料自動下單的門檻：樣本數、門檻一致率、量能倍數中位差
+# 觸發一致率（2026-09-30）：「門檻一致」大多是兩邊都沒觸發，容易一致。真正要看的是「有一邊觸發時，另一邊也觸發嗎」——
+# 分母是任一邊觸發的次數（多空各算），所以只有幣安觸發（CoinGecko 不會下的單）也會拉低一致率
+BN_OK_MIN_TRIG, BN_OK_TRIG = 10, 0.80
+BN_FALLBACK_MARKETS_S = 6 * 3600                           # 行情榜也拿不到時，最多沿用多舊的上一份
+_bn_ticker = {"ts": 0.0, "map": {}}
+
+
+def bn_shadow_file():
+    return os.path.join(CACHE_DIR, "bn_shadow.json")
+
+
+def bn_shadow_load():
+    try:
+        with open(bn_shadow_file(), "r", encoding="utf-8") as f:
+            d = json.load(f)
+        if isinstance(d, dict):
+            for k in ("samples", "lastCmp", "ratio", "trig"):
+                if isinstance(d.get(k), type(BN_SHADOW[k])):
+                    BN_SHADOW[k] = d[k]
+    except Exception:
+        pass
+
+
+def bn_shadow_save():
+    try:
+        tmp = bn_shadow_file() + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(BN_SHADOW, f, ensure_ascii=False)
+        os.replace(tmp, bn_shadow_file())
+    except Exception:
+        pass                                  # 比對統計存不下不影響交易
+
+
+def _bn_mult(bsym):
+    if bsym.startswith("1000000"):
+        return 1e6
+    if bsym.startswith("1M"):
+        return 1e6
+    if bsym.startswith("1000"):
+        return 1000.0
+    return 1.0
+
+
+def bn_symbol(sym, listed):
+    """CoinGecko 的幣別代號 → 幣安合約代號；幣安沒有回 None。清單取不到時先猜 XXXUSDT。"""
+    for c in _bn_candidates(sym):
+        if listed is None or c in listed:
+            return c
+    return None
+
+
+UPSTREAM_DOWN = {"until": 0.0, "hits": 0}     # 模擬網：上游伺服器回報 CoinGecko 額度用完，到這個時間前都當成拿不到
+UPSTREAM_DOWN_SEC = 20 * 60.0                # 監控 30 分鐘一輪：每輪最多再試一次，看上游恢復了沒
+
+
+def cg_down():
+    """CoinGecko 現在拿不到：月額度用完（降級模式）、剛被 429 在冷卻，或（模擬網）上游伺服器說額度用完。"""
+    return bool(QUOTA.get("exhausted")) or cg_cooling() or time.time() < UPSTREAM_DOWN["until"]
+
+
+def bn_tickers():
+    """幣安 24 小時統計（全部合約一次拿，權重 40，快取 60 秒）：{合約: (最新價, 24 小時成交額 USDT, 24 小時漲跌 %)}。"""
+    if time.time() - _bn_ticker["ts"] < 60 and _bn_ticker["map"]:
+        return _bn_ticker["map"]
+    st, b = fetch_upstream("/fapi/v1/ticker/24hr", "/api/bn")
+    if st == 200:
+        try:
+            m = {}
+            for x in json.loads(b):
+                m[x["symbol"]] = (float(x.get("lastPrice") or 0), float(x.get("quoteVolume") or 0),
+                                  float(x.get("priceChangePercent") or 0))
+            _bn_ticker.update(ts=time.time(), map=m)
+        except Exception:
+            pass
+    return _bn_ticker["map"]
+
+
+def bn_chart(bsym):
+    """幣安合約 90 天小時 K 線 → 跟 CoinGecko market_chart 一樣的格式。拿不到回 None（原因看 bn_chart_ex）。"""
+    return bn_chart_ex(bsym)[0]
+
+
+def bn_chart_ex(bsym):
+    """回傳 (chart, 拿不到的原因)。原因：limited（幣安限流／封鎖——暫時性，不是沒有資料，第 6 條 r97）、
+    error（其他錯誤）、nodata（真的沒有足夠的歷史，例如剛上架）。快取照 90 天歷史的保鮮（存磁碟）。"""
+    key = f"/api/bnx/{bsym}/market_chart_1h90"
+    body = cache_get(key, MON.get("histTTL", 12) * 3600)
+    if body is not None:
+        try:
+            return json.loads(body), None
+        except Exception:
+            pass
+    rows, end = [], int(time.time() * 1000)
+    for want in (1500, 700):                  # 90 天＋前 23 小時 ≈ 2183 根，分兩次拿
+        st, b = fetch_upstream(f"/fapi/v1/klines?symbol={bsym}&interval=1h&limit={want}&endTime={end}", "/api/bn")
+        if st in (418, 429):
+            return None, "limited"
+        if st != 200:
+            return None, "error"
+        try:
+            k = json.loads(b)
+        except Exception:
+            return None, "error"
+        if not isinstance(k, list) or not k:
+            break
+        rows = k + rows
+        end = int(k[0][0]) - 1
+        if len(k) < want:
+            break
+    if len(rows) < 24 + 48:
+        return None, "nodata"
+    mult = _bn_mult(bsym)
+    closes = [(int(r[6]) + 1, float(r[4]) / mult) for r in rows]
+    qv = [float(r[7]) for r in rows]
+    prices, vols = [], []
+    for i in range(23, len(rows)):
+        prices.append([closes[i][0], closes[i][1]])
+        vols.append([closes[i][0], sum(qv[i - 23:i + 1])])
+    chart = {"prices": prices[-90 * 24:], "total_volumes": vols[-90 * 24:], "source": "binance", "symbol": bsym}
+    cache_put(key, json.dumps(chart).encode())
+    return chart, None
+
+
+def bn_scan(cg_vol, chart, bn_now=None):
+    """用幣安 K 線算量能特徵，基準量換算成 CoinGecko 單位（見上面的說明）。"""
+    vols = chart.get("total_volumes") or []
+    now = bn_now if bn_now else (vols[-1][1] if vols else None)
+    sc = engine.extract_scan(chart, now)
+    if not sc.get("err") and cg_vol and now:
+        k = float(cg_vol) / float(now)
+        for f in ("base7", "base30"):
+            if sc.get(f):
+                sc[f] = sc[f] * k
+    return sc
+
+
+def _gates(row):
+    cfg = MON.get("cfg") or {}
+    out = {}
+    for side, fn in (("bull", getattr(engine, "bull_gate", None)), ("bear", getattr(engine, "bear_gate", None))):
+        try:
+            out[side] = bool(fn(row, cfg[side])[0]) if (fn and cfg.get(side) and row.get("scanned")) else False
+        except Exception:
+            out[side] = False
+    return out
+
+
+def bn_trig_record(sym, bsym, side, cg_row, bn_row, kind):
+    """觸發的後續追蹤（2026-10-05）：只有幣安觸發（bnOnly）、兩邊都觸發（both）分開記，之後用幣安小時 K 線看
+    72 小時內先到 2R 還是先碰停損——跟「被持倉上限擋掉的訊號」同一套算法。同一檔同一方向 24 小時內只記一次。"""
+    if trader is None:
+        return
+    now_ms = int(time.time() * 1000)
+    for t in BN_SHADOW["trig"]:
+        if t["sym"] == sym and t["side"] == side and now_ms - t["ts"] < 24 * 3600 * 1000:
+            return
+    bear = side == "SHORT"
+    row = bn_row if kind == "bnOnly" else cg_row
+    try:
+        pct, _sd = engine.stop_pct(row, bear, mode=trader.CFG.get("stopMode", "tighter"),
+                                   atr_mult=trader.CFG.get("stopAtrMult", 1.5),
+                                   max_pct=trader.CFG.get("maxStopPct", 12.0),
+                                   min_pct=trader.CFG.get("minStopPct", 1.5))
+    except Exception:
+        pct = None
+    price = cg_row.get("price")
+    if not pct or not price:
+        return
+    BN_SHADOW["trig"].append({"sym": sym, "bsym": bsym, "side": side, "kind": kind, "price": float(price),
+                              "stopPct": float(pct), "ts": now_ms, "result": None, "r": None})
+    del BN_SHADOW["trig"][:-300]
+
+
+_bn_hourly_memo = {}
+
+
+def bn_hourly(bsym, since_ms):
+    """幣安小時收盤 [(收盤時間, 價格)]（從 since_ms 起最多 80 根；同一檔 10 分鐘內不重拿）。"""
+    m = _bn_hourly_memo.get(bsym)
+    if m and time.time() - m[0] < 600 and m[1] <= since_ms:
+        return m[2]
+    st, b = fetch_upstream(f"/fapi/v1/klines?symbol={bsym}&interval=1h&limit=80&startTime={int(since_ms)}", "/api/bn")
+    if st != 200:
+        return None
+    try:
+        mult = _bn_mult(bsym)
+        out = [(int(r[6]) + 1, float(r[4]) / mult) for r in json.loads(b)]
+    except Exception:
+        return None
+    _bn_hourly_memo[bsym] = (time.time(), since_ms, out)
+    return out
+
+
+def bn_trig_evaluate(horizon_h=72):
+    """沒有結果的觸發：先碰停損 −1R、先到目標 +tp1R，72 小時都沒碰到以收盤算。出場位階跟實盤共用 plan_exits。"""
+    if trader is None:
+        return 0
+    now = time.time() * 1000
+    done = 0
+    for t in BN_SHADOW["trig"]:
+        if t["result"] is not None:
+            continue
+        expired = now - t["ts"] >= horizon_h * 3600000
+        if bn_blocked():                      # 限流／封鎖：這輪不評了，下一輪再來（不是「沒資料」，第 6 條 r97）
+            break
+        series = bn_hourly(t["bsym"], t["ts"]) or []
+        pts = [(ts, p) for ts, p in series if t["ts"] <= ts <= t["ts"] + horizon_h * 3600000]
+        if not pts or (not expired and len(pts) < 2):
+            continue
+        sgn = 1 if t["side"] == "LONG" else -1
+        entry = t["price"]
+        stop = entry - sgn * entry * t["stopPct"] / 100.0
+        ex = trader.plan_exits(entry, stop, t["side"])
+        res, r = "none", None
+        for _ts, p in pts:
+            if (p - stop) * sgn <= 0:
+                res, r = "stop", -1.0
+                break
+            if (p - ex["tp1"]) * sgn >= 0:
+                res, r = "tp2", float(trader.CFG.get("tp1R", 2))
+                break
+        if res == "none":
+            if not expired:
+                continue
+            r = round((pts[-1][1] - entry) * sgn / ex["R"], 2)
+        t["result"], t["r"] = res, r
+        done += 1
+    if done:
+        bn_shadow_save()
+    return done
+
+
+def bn_trig_summary():
+    out = {}
+    for kind in ("bnOnly", "both"):
+        ev = [t for t in BN_SHADOW["trig"] if t["kind"] == kind and t["result"] is not None]
+        pend = sum(1 for t in BN_SHADOW["trig"] if t["kind"] == kind and t["result"] is None)
+        rs = [t["r"] for t in ev]
+        out[kind] = {"evaluated": len(ev), "pending": pend,
+                     "tp2": sum(1 for t in ev if t["result"] == "tp2"),
+                     "stop": sum(1 for t in ev if t["result"] == "stop"),
+                     "avgR": round(sum(rs) / len(rs), 2) if rs else None}
+    return out
+
+
+def bn_compare(cid, sym, cg_row, bn_row, cg_vol, bn_now, bsym=None):
+    """記一筆比對樣本。"""
+    g1, g2 = _gates(cg_row), _gates(bn_row)
+    if bsym:
+        for side_key, side in (("bull", "LONG"), ("bear", "SHORT")):
+            if g2[side_key] and not g1[side_key]:
+                bn_trig_record(sym, bsym, side, cg_row, bn_row, "bnOnly")
+            elif g2[side_key] and g1[side_key]:
+                bn_trig_record(sym, bsym, side, cg_row, bn_row, "both")
+    BN_SHADOW["samples"].append({
+        "sym": sym, "id": cid, "ts": int(time.time() * 1000),
+        "rvCG": cg_row.get("rvol7"), "rvBN": bn_row.get("rvol7"),
+        "scCG": cg_row.get("radar"), "scBN": bn_row.get("radar"),
+        "stCG": cg_row.get("stage"), "stBN": bn_row.get("stage"),
+        "gCG": g1["bull"], "gBN": g2["bull"], "bCG": g1["bear"], "bBN": g2["bear"],
+    })
+    del BN_SHADOW["samples"][:-600]
+    BN_SHADOW["lastCmp"][cid] = int(time.time() * 1000)
+    if cg_vol and bn_now:
+        BN_SHADOW["ratio"][sym.upper()] = float(cg_vol) / float(bn_now)
+
+
+def bn_shadow_round(rows, bases, listed, per_round=None):
+    """挑這輪 CoinGecko 正常算出、幣安有合約、12 小時內沒比過的幣（最久沒比的優先），用幣安 K 線再算一次、記比對樣本。"""
+    per_round = BN_SHADOW_PER_ROUND if per_round is None else per_round
+    if per_round <= 0 or not rows:
+        return 0
+    now_ms = int(time.time() * 1000)
+    cands = []
+    for r in rows:
+        if r.get("dataSource") == "binance" or r["id"] not in bases or not r.get("scanned"):
+            continue
+        last = BN_SHADOW["lastCmp"].get(r["id"], 0)
+        if now_ms - last < 12 * 3600 * 1000:
+            continue
+        bsym = bn_symbol(r.get("sym"), listed)
+        if bsym:
+            cands.append((last, r, bsym))
+    cands.sort(key=lambda x: x[0])
+    done = 0
+    tick = bn_tickers() if cands else {}
+    for _last, r, bsym in cands[:per_round]:
+        if bn_blocked():                      # 限流／封鎖：這輪剩下的不比了（第 6 條 r97）
+            break
+        chart_bn = bn_chart(bsym)
+        if not chart_bn:
+            continue
+        base = bases[r["id"]]
+        t = tick.get(bsym)
+        bn_now = t[1] if t else None
+        bn_row = engine.analyze(base, bn_scan(base["vol"], chart_bn, bn_now))
+        bn_compare(r["id"], r.get("sym") or "", r, bn_row, base["vol"], bn_now or (chart_bn["total_volumes"][-1][1]
+                                                                                   if chart_bn.get("total_volumes") else None),
+                   bsym=bsym)
+        done += 1
+    if done:
+        bn_shadow_save()
+    return done
+
+
+def _median(a):
+    a = sorted(a)
+    return a[len(a) // 2] if a else None
+
+
+def bn_shadow_summary():
+    s = BN_SHADOW["samples"][-600:]
+    n = len(s)
+    rv = [abs(x["rvBN"] / x["rvCG"] - 1) for x in s if x.get("rvCG") and x.get("rvBN") is not None]
+    sc = [abs(x["scBN"] - x["scCG"]) for x in s if x.get("scCG") is not None and x.get("scBN") is not None]
+    gate = sum(1 for x in s if x["gCG"] == x["gBN"] and x["bCG"] == x["bBN"]) / n if n else None
+    stage = sum(1 for x in s if x.get("stCG") == x.get("stBN")) / n if n else None
+    both = sum(1 for x in s if x["gCG"] or x["bCG"])
+    hit = sum(1 for x in s if (x["gCG"] and x["gBN"]) or (x["bCG"] and x["bBN"]))
+    cg_t = bn_t = both_t = any_t = 0
+    for x in s:
+        for a, b in (("gCG", "gBN"), ("bCG", "bBN")):
+            cg_t += bool(x[a])
+            bn_t += bool(x[b])
+            both_t += bool(x[a] and x[b])
+            any_t += bool(x[a] or x[b])
+    trig = both_t / any_t if any_t else None
+    rvm = _median(rv)
+    why = []
+    if n < BN_OK_MIN_N:
+        why.append(f"樣本 {n}／{BN_OK_MIN_N} 筆不足")
+    if gate is not None and gate < BN_OK_GATE:
+        why.append(f"門檻一致 {gate * 100:.0f}% 未達 {BN_OK_GATE * 100:.0f}%")
+    if rvm is not None and rvm > BN_OK_RVOL:
+        why.append(f"量能倍數中位差 {rvm * 100:.0f}% 超過 {BN_OK_RVOL * 100:.0f}%")
+    if any_t < BN_OK_MIN_TRIG:
+        why.append(f"比到的觸發 {any_t}／{BN_OK_MIN_TRIG} 次不足")
+    elif trig < BN_OK_TRIG:
+        why.append(f"觸發一致 {trig * 100:.0f}% 未達 {BN_OK_TRIG * 100:.0f}%")
+    worst = sorted(((abs(x["rvBN"] / x["rvCG"] - 1), x["sym"]) for x in s if x.get("rvCG") and x.get("rvBN") is not None),
+                   reverse=True)[:3]
+    return {"n": n, "gateAgree": gate, "stageAgree": stage, "rvolMedDiff": rvm, "scoreMedDiff": _median(sc),
+            "cgTriggers": both, "bothTriggers": hit, "worst": [{"sym": w[1], "diff": w[0]} for w in worst],
+            "trig": {"cg": cg_t, "bn": bn_t, "both": both_t, "any": any_t, "agree": trig,
+                     "min": BN_OK_MIN_TRIG, "need": BN_OK_TRIG},
+            "outcomes": bn_trig_summary(),
+            "ok": not why, "why": "、".join(why)}
+
+
+def _upstream_error_text(st, body):
+    """把上游錯誤講清楚（2026-09-29：只寫「上游回應 403」看不出是額度用完、還是公開端點擋了伺服器 IP）。"""
+    try:
+        d = json.loads(body or b"{}")
+    except Exception:
+        d = {}
+    s = d.get("status") if isinstance(d.get("status"), dict) else d
+    code = s.get("error_code") if isinstance(s, dict) else None
+    msg = str((s or {}).get("error_message") or d.get("error") or "")[:120] if isinstance(s, dict) else ""
+    if code == 10006 or "calls limit" in msg:
+        return f"CoinGecko 每月額度用完（上游回應 {st}）：要等下個月重置或升級方案"
+    if st == 403 and QUOTA.get("exhausted"):
+        return ("CoinGecko 金鑰月額度已用完、改走公開端點也被拒（上游回應 403，公開端點常擋雲端主機的 IP）："
+                "要等下個月重置或升級方案")
+    if st == 403:
+        return f"CoinGecko 拒絕這個請求（上游回應 403）：金鑰失效、方案不符，或伺服器 IP 被擋{'：' + msg if msg else ''}"
+    if st == 429:
+        return "CoinGecko 請求太頻繁（上游回應 429）：稍後自動重試"
+    return f"上游回應 {st}{'：' + msg if msg else ''}"
 
 
 def mon_fetch_json(path):
     st, body = fetch_upstream(path)
     if st != 200:
-        raise RuntimeError(f"上游回應 {st}")
+        raise RuntimeError(_upstream_error_text(st, body))
+    if "/coins/markets" in path:
+        cache_put("/api/v3" + path, body)       # 行情榜也拿不到時，備援要沿用上一份（2026-09-29）
     return json.loads(body)
+
+
+def mon_markets(path):
+    """監控用的行情榜：拿不到時沿用 BN_FALLBACK_MARKETS_S 內的上一份，價格與成交量換成幣安即時（沒有換算比例的幣略過）。
+    回傳 (清單, 是否是沿用的)。上一份也沒有就照樣丟出原本的錯誤。"""
+    try:
+        return mon_fetch_json(path), False
+    except RuntimeError:
+        body, age = cache_peek("/api/v3" + path)
+        if body is None or age is None or age > BN_FALLBACK_MARKETS_S:
+            raise
+    listed, _held = binance_listed_and_held()
+    tick = bn_tickers()
+    out = []
+    for c in json.loads(body):
+        bsym = bn_symbol(c.get("symbol"), listed)
+        t = tick.get(bsym) if bsym else None
+        ratio = BN_SHADOW["ratio"].get((c.get("symbol") or "").upper())
+        if not t or not ratio:
+            continue                            # 沒有幣安即時價量、或還沒有換算比例：不硬算
+        c = dict(c, current_price=t[0] / _bn_mult(bsym), total_volume=t[1] * ratio,
+                 price_change_percentage_24h_in_currency=t[2], _stale_markets=int(age))
+        out.append(c)
+    return out, True
 
 
 
@@ -638,6 +1229,11 @@ def push_all(title, text):
 
 def mon_run_once():
     """跑一輪：抓行情 → 取歷史 → 評分 → 判斷訊號 → 發通知"""
+    with cg_source("監控"):
+        return _mon_run_once()
+
+
+def _mon_run_once():
     if not (engine and MON["cfg"]):
         return 0
     if MON["scope"] != "top" and not MON["watch"]:
@@ -645,36 +1241,35 @@ def mon_run_once():
     # 監控範圍：觀察清單，或市值前 N 檔
     if MON["scope"] == "top":
         n = max(10, min(250, int(MON.get("topN") or 100)))
-        markets = mon_fetch_json(
+        markets, stale_mk = mon_markets(
             f"/coins/markets?vs_currency=usd&order=market_cap_desc&per_page={n}&page=1"
-            "&sparkline=false&price_change_percentage=24h,7d,30d")[:n]
+            "&sparkline=false&price_change_percentage=24h,7d,30d")
+        markets = markets[:n]
     else:
         ids = MON["watch"]
         if not ids:
             return 0
-        markets = mon_fetch_json(
+        markets, stale_mk = mon_markets(
             "/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=250&page=1"
             "&sparkline=false&price_change_percentage=24h,7d,30d&ids=" + ",".join(ids[:250]))
     rows = []
+    bases = {}                      # CoinGecko 正常算出的幣：id → 基本資料（影子比對用）
     refreshed = [0]                 # 本輪實際向上游補抓的檔數
+    listed, held = binance_listed_and_held()
+    low = {"unlisted": 0, "held": 0}
+    bn_skip = {"limited": 0, "nodata": 0, "error": 0}   # 幣安備援拿不到的檔數，依原因分開（第 6 條 r97：限流 ≠ 沒資料）
     for c in markets:
         path = f"/coins/{c['id']}/market_chart?vs_currency=usd&days=90"
         key = "/api/v3" + path
         # 90 天歷史一天內不會有意義的變化，快取沿用到 TTL 到期為止。
         # 量能倍數是用「快取基準量 ÷ 即時成交量」現算的，所以訊號仍然即時。
-        body = cache_get(key, MON.get("histTTL", 12) * 3600)
-        if body is None:
-            if refreshed[0] >= MON.get("maxRefresh", 8):
-                continue                      # 單輪補抓上限，避免一次把額度用光
-            st, body = fetch_upstream(path, background=True)      # 補歷史是背景工作，冷卻期間讓路
-            if st != 200:
-                continue
-            cache_put(key, body)
-            refreshed[0] += 1
-        try:
-            chart = json.loads(body)
-        except Exception:
-            continue
+        # 2026-09-29：幣安沒有合約的幣、已經持倉的幣，就算出訊號也不會下單——歷史保鮮拉長到 HIST_TTL_LOW 小時，
+        # 把額度留給能交易的。幣安後來上架、或部位平掉之後，下一輪就回到正常保鮮。
+        ttl_h = MON.get("histTTL", 12)
+        why_low = low_priority(c.get("symbol"), listed, held)
+        if why_low:
+            low[why_low] += 1
+            ttl_h = max(ttl_h, HIST_TTL_LOW)
         base = {
             "id": c["id"], "sym": (c.get("symbol") or "").upper(), "name": c.get("name", ""),
             "price": c.get("current_price"), "vol": c.get("total_volume") or 0,
@@ -684,11 +1279,71 @@ def mon_run_once():
             "m30": c.get("price_change_percentage_30d_in_currency"),
         }
         base["turn"] = (base["vol"] / base["mcap"] * 100) if base["mcap"] else None
+        body = cache_get(key, ttl_h * 3600)
+        if body is None and not cg_down():
+            if refreshed[0] >= MON.get("maxRefresh", 8):
+                continue                      # 單輪補抓上限，避免一次把額度用光（CoinGecko 正常時不動用備援）
+            st, body = fetch_upstream(path, background=True)      # 補歷史是背景工作，冷卻期間讓路
+            if st == 200:
+                cache_put(key, body)
+                refreshed[0] += 1
+            else:
+                body = None
+        stale_h = None
+        if body is None:
+            # 2026-10-05：先用快取裡的舊 CoinGecko 歷史（STALE_CG_MAX_H 內）。現量仍來自 CoinGecko 行情榜，算法完全一樣，
+            # 只差基準量舊幾天——比換成幣安準得多（影子比對：幣安會多觸發一倍以上）。太舊才退回幣安
+            old, age = cache_peek(key)
+            if old is not None and age is not None and age <= STALE_CG_MAX_H * 3600:
+                body, stale_h = old, age / 3600.0
+        if body is None:
+            # CoinGecko 拿不到這檔的 90 天歷史：幣安有合約的改用幣安 K 線接手（2026-09-29），幣安沒有的略過
+            bsym = bn_symbol(c.get("symbol"), listed)
+            if not bsym:
+                continue
+            if bn_blocked():                  # 這輪已經被限流／封鎖：剩下的不再一檔一檔排隊重試
+                bn_skip["limited"] += 1
+                continue
+            chart_bn, why_bn = bn_chart_ex(bsym)
+            if not chart_bn:
+                bn_skip[why_bn or "error"] += 1
+                continue
+            t = bn_tickers().get(bsym)
+            try:
+                row = engine.analyze(base, bn_scan(base["vol"], chart_bn, t[1] if t else None))
+            except Exception:
+                continue
+            row["dataSource"] = "binance"
+            rows.append(row)
+            continue
         try:
-            rows.append(engine.analyze(base, engine.extract_scan(chart, base["vol"])))
+            chart = json.loads(body)
         except Exception:
             continue
+        try:
+            row = engine.analyze(base, engine.extract_scan(chart, base["vol"]))
+        except Exception:
+            continue
+        if stale_mk:
+            row["dataSource"] = "binance"      # 行情榜是沿用的：價格、成交量來自幣安即時（CoinGecko 歷史仍可用）
+        elif stale_h is not None:
+            row["dataSource"] = "coingecko_stale"
+            row["staleH"] = round(stale_h, 1)
+        else:
+            bases[c["id"]] = base
+        rows.append(row)
 
+    # 影子比對（2026-09-29）：CoinGecko 正常的幣挑幾檔用幣安再算一次，累積兩邊差異；觸發的後續用幣安 K 線評估（2026-10-05）
+    try:
+        bn_shadow_round(rows, bases, listed)
+        bn_trig_evaluate()
+    except Exception as e:
+        sys.stderr.write(f"  ! 幣安影子比對出錯：{type(e).__name__}: {str(e)[:120]}\n")
+
+    MON["lowPri"] = dict(low, ttlH=HIST_TTL_LOW)
+    MON["bnSkip"] = bn_skip
+    if bn_skip["limited"]:
+        sys.stderr.write(f"  ! 幣安備援被限流：這輪 {bn_skip['limited']} 檔沒算（暫時性，不是沒有資料）{bn_rate_status()}\n")
     now_ms = time.time() * 1000
     events, states = engine.evaluate(rows, MON["cfg"], MON["states"], now_ms)
 
@@ -727,6 +1382,11 @@ def mon_run_once():
         except Exception as ex:
             outcome = {"stage": "failed", "why": f"執行時發生錯誤：{str(ex)[:80]}"}
 
+        src_row = by_id.get(e.get("id")) or {}
+        if src_row.get("dataSource") == "binance":
+            text += "\n資料來源：幣安合約 K 線（CoinGecko 暫時拿不到，備援接手）"
+        elif src_row.get("dataSource") == "coingecko_stale":
+            text += f"\n資料來源：CoinGecko 歷史（{src_row.get('staleH', 0):.0f} 小時前的快取，CoinGecko 暫時拿不到）"
         text += "\n" + trade_outcome_text(outcome)
         push_all(title, text)
 
@@ -761,6 +1421,14 @@ def auto_try_trade(ev, row):
         return {"stage": "disabled", "why": "自動下單未啟用"}
     if not row:
         return {"stage": "disabled", "why": "本輪沒有這檔的完整掃描資料"}
+
+    if row.get("dataSource") == "coingecko_stale" and (row.get("staleH") or 0) > STALE_CG_TRADE_H:
+        return {"stage": "gate", "why": f"CoinGecko 歷史已經 {row.get('staleH'):.0f} 小時沒更新（超過 {STALE_CG_TRADE_H:.0f} 小時），只通知不下單"}
+    if row.get("dataSource") == "binance":
+        # 幣安備援資料算出的訊號（2026-09-29）：兩邊比對夠多、夠一致才自動下單，不然只通知
+        s = bn_shadow_summary()
+        if not s["ok"]:
+            return {"stage": "gate", "why": f"這筆用的是幣安備援資料（CoinGecko 暫時拿不到），跟 CoinGecko 的比對{s['why']}，只通知不下單"}
 
     bear = ev.get("side") == "bear"
     sym = (row.get("sym") or "").upper()
@@ -894,7 +1562,8 @@ def hourly_prices(cid):
     key = _deep_key(cid)
     body, _ = cache_peek(key)
     if body is None:
-        st, body = fetch_upstream(f"/coins/{cid}/market_chart?vs_currency=usd&days=90")
+        with cg_source("影子追蹤"):
+            st, body = fetch_upstream(f"/coins/{cid}/market_chart?vs_currency=usd&days=90")
         if st != 200:
             return None
         cache_put(key, body)
@@ -1196,6 +1865,9 @@ def trade_handle(path, payload):
             "lastPush": MON.get("lastPushTs"),
         }
         st["cgCooldown"] = {"active": cg_cooling(), "until": int(CG_COOL["until"] * 1000), "hits": CG_COOL["hits"]}
+        st["cgCalls"] = {"day": CG_CALLS["day"], "today": dict(CG_CALLS["today"]),
+                         "month": CG_CALLS["month"], "thisMonth": dict(CG_CALLS["thisMonth"]),
+                         "lowPri": MON.get("lowPri")}
         st["poll"] = float(os.environ.get("POSITION_POLL", 20))
         st["readiness"] = live_readiness()
         st["notify"] = {"channels": notify_channels(), "errors": NOTIFY_ERR["errors"][-10:],
@@ -1317,6 +1989,7 @@ def mon_handle(path, payload):
                      "lastError": MON["lastError"], "engine": bool(engine),
                      "historyCount": len(MON["history"]),
                      "lastRefreshed": MON.get("lastRefreshed", 0),
+                     "bnSkip": MON.get("bnSkip"), "bnRate": bn_rate_status(),
                      "gateStats": MON.get("gateStats"),
                      "callsToday": MON.get("callsToday", 0),
                      "histTTL": MON.get("histTTL", 12), "maxRefresh": MON.get("maxRefresh", 8),
@@ -1726,7 +2399,95 @@ def ttl_for(path_qs: str) -> float:
         return 900.0            # 合約檢查結果變動慢
     if "/trades" in path_qs or "_pools" in path_qs:
         return 60.0
+    if "market_chart" in path_qs and "days=90" in path_qs:
+        # 2026-10-05：跟監控的保鮮一致（24 小時）。磁碟快取原本只算 12 小時——模擬網、網頁來要 12～24 小時前的那份時，
+        # 伺服器會重打 CoinGecko，拿回來的幾乎一樣
+        return max(OHLC_TTL, MON.get("histTTL", 24) * 3600)
     return OHLC_TTL if "/ohlc" in path_qs or "market_chart" in path_qs else CACHE_TTL
+
+
+# CoinGecko 用量按來源計數（2026-09-29：月額度 29 日用完，要看得出是誰在吃）。只算真的打到 CoinGecko 的（有 CG_UPSTREAM 時算轉發）
+CG_CALLS = {"day": None, "today": {}, "month": None, "thisMonth": {}, "since": None}
+_cg_src = threading.local()
+_cg_saved = [0.0]
+CG_DEMO_MONTHLY = 10000          # Demo 方案每月總額度（Pro 方案看自己的方案）
+
+
+def cg_calls_file():
+    return os.path.join(CACHE_DIR, "cg_calls.json")
+
+
+def cg_calls_load():
+    """重啟後讀回本月計數（不然每次部署都從 0 開始，看不出本月用了多少）。讀不到就從 0 開始並寫明起算時間。"""
+    try:
+        with open(cg_calls_file(), "r", encoding="utf-8") as f:
+            d = json.load(f)
+        if isinstance(d, dict) and d.get("month") == time.strftime("%Y-%m", time.gmtime()):
+            CG_CALLS.update({k: d.get(k) for k in ("day", "today", "month", "thisMonth", "since")})
+            CG_CALLS["today"] = CG_CALLS["today"] or {}
+            CG_CALLS["thisMonth"] = CG_CALLS["thisMonth"] or {}
+            if CG_CALLS["day"] != time.strftime("%Y-%m-%d", time.gmtime()):
+                CG_CALLS.update(day=None, today={})
+    except Exception:
+        pass
+
+
+def _cg_calls_save(force=False):
+    if not force and time.time() - _cg_saved[0] < 30:
+        return
+    _cg_saved[0] = time.time()
+    try:
+        tmp = cg_calls_file() + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(CG_CALLS, f, ensure_ascii=False)
+        os.replace(tmp, cg_calls_file())
+    except Exception:
+        pass                                  # 只是用量統計，存不下不影響交易
+
+
+def cg_usage():
+    """給網頁看的用量（本機的）。"""
+    return {"day": CG_CALLS["day"], "today": dict(CG_CALLS["today"] or {}),
+            "month": CG_CALLS["month"], "thisMonth": dict(CG_CALLS["thisMonth"] or {}),
+            "since": CG_CALLS.get("since"), "relay": bool(CG_UPSTREAM),
+            "hasKey": bool(CFG.get("key")), "pro": bool(CFG.get("pro")),
+            "limit": None if CFG.get("pro") else CG_DEMO_MONTHLY,
+            "exhausted": bool(QUOTA.get("exhausted")), "cooling": cg_cooling(),
+            "upstreamDown": time.time() < UPSTREAM_DOWN["until"],
+            "lowPri": MON.get("lowPri"), "bnShadow": bn_shadow_summary(),
+            "prefetch": {"on": bool(REFRESH.get("budget")), "budget": REFRESH.get("budget"),
+                         "universeFrom": REFRESH.get("universeFrom")}}
+
+
+class cg_source:
+    """with cg_source("monitor"): —— 這條執行緒接下來打 CoinGecko 算在哪個來源。"""
+
+    def __init__(self, name):
+        self.name = name
+
+    def __enter__(self):
+        self.old = getattr(_cg_src, "name", None)
+        _cg_src.name = self.name
+
+    def __exit__(self, *a):
+        _cg_src.name = self.old
+        return False
+
+
+def _count_cg(path_qs):
+    kind = "markets" if "/coins/markets" in path_qs else ("history" if "market_chart" in path_qs else "other")
+    src = getattr(_cg_src, "name", None) or "other"
+    key = f"{src}·{kind}" + ("（轉發）" if CG_UPSTREAM else "")
+    day, month = time.strftime("%Y-%m-%d", time.gmtime()), time.strftime("%Y-%m", time.gmtime())
+    if CG_CALLS["day"] != day:
+        CG_CALLS.update(day=day, today={})
+    if CG_CALLS["month"] != month:
+        CG_CALLS.update(month=month, thisMonth={}, since=int(time.time() * 1000))
+    if not CG_CALLS.get("since"):
+        CG_CALLS["since"] = int(time.time() * 1000)
+    CG_CALLS["today"][key] = CG_CALLS["today"].get(key, 0) + 1
+    CG_CALLS["thisMonth"][key] = CG_CALLS["thisMonth"].get(key, 0) + 1
+    _cg_calls_save()
 
 
 def fetch_upstream(path_qs: str, prefix: str = "/api/v3", background: bool = False):
@@ -1735,7 +2496,17 @@ def fetch_upstream(path_qs: str, prefix: str = "/api/v3", background: bool = Fal
     if background and prefix == "/api/v3" and cg_cooling():
         return 429, json.dumps({"error": "cg_cooldown", "detail": "CoinGecko 剛回 429，背景請求讓路中"},
                                ensure_ascii=False).encode()
+    if prefix == "/api/v3":
+        _count_cg(path_qs)
     url = upstream_url(path_qs) if prefix == "/api/v3" else UPSTREAMS[prefix] + path_qs
+    if prefix == "/api/bn":
+        now = time.time()
+        if now < BN_RL["ban"]:                 # 418 封鎖中：任何 /api/bn 都不送（繼續打會延長封鎖）
+            return 418, _bn_limited_body("ip_banned", f"幣安 418 封鎖中，還要 {int(BN_RL['ban'] - now)} 秒")
+        if path_qs.startswith("/fapi/v1/klines"):
+            return _bn_kline(url, path_qs)
+        if now < BN_RL["cool"]:                # 429 冷卻中：其他公開請求（行情、衍生品）這次不送
+            return 429, _bn_limited_body("rate_limited", f"幣安 429 冷卻中，還要 {int(BN_RL['cool'] - now)} 秒")
     req = urllib.request.Request(url, headers={
         "User-Agent": "local-crypto-screener/1.0",
         "Accept": "application/json",
@@ -1754,9 +2525,21 @@ def fetch_upstream(path_qs: str, prefix: str = "/api/v3", background: bool = Fal
             slot[0] = time.time()
         try:
             with urllib.request.urlopen(req, timeout=40) as r:
+                if prefix == "/api/bn":
+                    _bn_note(getattr(r, "headers", None))
                 return 200, r.read()
         except urllib.error.HTTPError as e:
             body = e.read()
+            if prefix == "/api/bn":
+                _bn_note(e.headers, e.code)
+                if e.code in (418, 429):       # 不原地重試：冷卻／封鎖已記下，K 線那邊會照 Retry-After 等
+                    return e.code, body or _bn_limited_body("rate_limited" if e.code == 429 else "ip_banned", f"HTTP {e.code}")
+            if prefix == "/api/v3" and CG_UPSTREAM and (e.headers or {}).get("X-CG-Error") == "QUOTA":
+                # 模擬網（2026-09-30）：上游伺服器說 CoinGecko 額度用完——重試沒用（以前當成 5xx 重試兩次），
+                # 而且接下來一段時間都一樣：記下來，讓監控直接改用幣安備援，不再每輪白試
+                UPSTREAM_DOWN["until"] = time.time() + UPSTREAM_DOWN_SEC
+                UPSTREAM_DOWN["hits"] += 1
+                return e.code, body
             # error_code 10006 是「每月總額度用盡」，重試沒有意義，直接放棄
             if b"10006" in body or b"calls limit" in body:
                 QUOTA["exhausted"] = True
@@ -1791,6 +2574,22 @@ class Handler(http.server.SimpleHTTPRequestHandler):
     # ── 路由 ──────────────────────────────────────────────
     def do_GET(self):
         p = self.path.split("?")[0]
+        if p == "/api/cg/usage":
+            # CoinGecko 用量（2026-09-29）：放在網頁補掃／重掃旁邊。模擬網沒有自己的額度，照 /api/deep/ts 的做法問上游（額度在那邊）
+            data = None
+            if CG_UPSTREAM:
+                try:
+                    req = urllib.request.Request(CG_UPSTREAM + "/api/cg/usage",
+                                                 headers={"User-Agent": "crypto-screener/relay"})
+                    with urllib.request.urlopen(req, timeout=10) as r:
+                        data = json.loads(r.read())
+                        data["via"] = "upstream"
+                except Exception as e:
+                    data = {"error": f"問不到上游的用量：{type(e).__name__}"}
+            if data is None:
+                data = cg_usage()
+            return self.send_json(200, json.dumps(data, ensure_ascii=False).encode())
+
         if p == "/api/deep/ts":
             # 有上游時，深度資料的時間戳以上游為準——資料本來就在那邊
             if CG_UPSTREAM:
@@ -1948,14 +2747,29 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         # 行情差幾十秒不影響量能倍數的判讀，畫面卡住才是問題。
         # 行情榜（/coins/markets）不設寬限上限：只要快取裡有舊的就先送、背景更新——畫面永遠不等上游（回應帶 X-Stale-Age，網頁會標「快取」）。
         stale, age = cache_peek(key)
+        if self.headers.get("X-Cache-Only") == "1" and prefix == "/api/v3":
+            # 網頁的背景掃描（2026-09-29）：伺服器有就給（再舊都給，網頁自己比時間戳），沒有就說沒有——
+            # 伺服器的監控本來就在更新這些資料，網頁不該為了背景掃描再去打 CoinGecko
+            if stale is not None:
+                return self.send_json(200, stale, cached=True, stale=int(age or 0), data_ts=time.time() - (age or 0))
+            self.send_response(404)
+            self.send_header("X-Cache", "CACHE-ONLY-MISS")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         markets = prefix == "/api/v3" and "/coins/markets" in path_qs
         if stale is not None and age is not None and (markets or age < ttl + STALE_GRACE):
-            revalidate_async(path_qs, prefix, key)
+            # 行情榜的背景更新至少隔 MARKETS_REVALIDATE_S（2026-10-05：網頁每 90 秒輪詢、模擬網每輪都來要，
+            # 以前每次都觸發一次 CoinGecko，「代理背景更新」一天約 50 次）
+            if not markets or age >= MARKETS_REVALIDATE_S:
+                revalidate_async(path_qs, prefix, key)
             return self.send_json(200, stale, cached=True, stale=int(age), data_ts=time.time() - age)
 
         # 深度資料（瀏覽器的背景深掃）是背景工作：冷卻期間直接讓路
         background = prefix == "/api/v3" and ("market_chart" in path_qs or "/ohlc" in path_qs)
-        status, body = fetch_upstream(path_qs, prefix, background=background)
+        who = "模擬網" if "relay" in (self.headers.get("User-Agent") or "") or "screener/1.0" in (self.headers.get("User-Agent") or "") else "網頁"
+        with cg_source(who):
+            status, body = fetch_upstream(path_qs, prefix, background=background)
         if status == 200:
             cache_put(key, body)
             # 網頁抓行情榜時順便更新宇宙清單，這樣即使沒開補抓，
@@ -1968,14 +2782,20 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                         REFRESH["universeTs"] = time.time()
                 except Exception:
                     pass
+        if status != 200 and prefix == "/api/v3" and QUOTA.get("exhausted"):
+            # 2026-09-29：額度用完後改走公開端點被拒（403），網頁以前顯示成「API Key 被拒絕」——講錯原因
+            return self.send_json(503, json.dumps({"error": "QUOTA", "detail": _upstream_error_text(status, body)},
+                                                  ensure_ascii=False).encode(), cg_error="QUOTA")
         self.send_json(status, body, data_ts=time.time() if status == 200 else None)
 
-    def send_json(self, code, body, cached=False, stale=None, data_ts=None):
+    def send_json(self, code, body, cached=False, stale=None, data_ts=None, cg_error=None):
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Access-Control-Allow-Origin", "*")
         if stale is not None:
             self.send_header("X-Stale-Age", str(stale))
+        if cg_error:
+            self.send_header("X-CG-Error", cg_error)
         if data_ts is not None:
             self.send_header("X-Data-Ts", str(int(data_ts * 1000)))
         self.send_header("Cache-Control", "no-store")
@@ -2001,6 +2821,51 @@ class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
 REFRESH = {"universe": [], "universeTs": 0, "last": None, "lastTs": None,
            "callsToday": 0, "day": None, "interval": None,
            "fresh": 0, "stale": 0, "never": 0, "n": 0, "budget": 0}
+
+
+UNIVERSE_EVERY = 6 * 3600.0
+PREFETCH_MARKETS = "/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=250&page=1"
+
+
+def cached_universe(max_age=UNIVERSE_EVERY):
+    """伺服器快取裡 max_age 秒內的市值排行（滾動補抓、網頁、監控拿過的都算），取最長的那份。沒有回 None。"""
+    n = max(10, min(250, int(MON.get("topN") or 100)))
+    keys = [PREFETCH_MARKETS,
+            "/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=250&page=1"
+            "&sparkline=true&price_change_percentage=1h,24h,7d,30d,1y",          # 網頁
+            f"/coins/markets?vs_currency=usd&order=market_cap_desc&per_page={n}&page=1"
+            "&sparkline=false&price_change_percentage=24h,7d,30d"]               # 監控
+    best = None
+    for k in keys:
+        body, age = cache_peek("/api/v3" + k)
+        if body is None or age is None or age > max_age:
+            continue
+        try:
+            ids = [c["id"] for c in json.loads(body) if isinstance(c, dict) and c.get("id")]
+        except Exception:
+            continue
+        if ids and (best is None or len(ids) > len(best)):
+            best = ids
+    return best
+
+
+def refresh_universe():
+    """滾動補抓的幣別清單：6 小時更新一次，先用快取裡已有的行情榜，都沒有才打 CoinGecko；額度用完時不打。"""
+    if time.time() - REFRESH["universeTs"] <= UNIVERSE_EVERY and REFRESH["universe"]:
+        return "fresh"
+    uni = cached_universe()
+    if uni:
+        REFRESH["universe"], REFRESH["universeTs"], REFRESH["universeFrom"] = uni, time.time(), "cache"
+        return "cache"
+    if QUOTA["exhausted"]:
+        return "skip"
+    st, body = fetch_upstream(PREFETCH_MARKETS)
+    if st == 200:
+        cache_put("/api/v3" + PREFETCH_MARKETS, body)
+        REFRESH["universe"] = [c["id"] for c in json.loads(body)]
+        REFRESH["universeTs"], REFRESH["universeFrom"] = time.time(), "coingecko"
+        return "coingecko"
+    return "failed"
 
 
 def _deep_key(cid):
@@ -2078,6 +2943,7 @@ def prefetch_worker(count: int, ttl_h: float):
     幾輪之後各檔的到期時間自然錯開，負載變成穩定的細流。
     """
     time.sleep(5)
+    _cg_src.name = "滾動補抓"                    # 這條執行緒整條都算在滾動補抓
     budget = int(os.environ.get("REFRESH_BUDGET", 0)) or max(24, int(count * 24 / ttl_h * 1.3))
     interval = 86400.0 / budget
     REFRESH["budget"] = budget
@@ -2093,13 +2959,10 @@ def prefetch_worker(count: int, ttl_h: float):
                 REFRESH["day"] = d
                 REFRESH["callsToday"] = 0
 
-            # 宇宙每 15 分鐘更新一次，新幣進榜會自動被納入
-            if time.time() - REFRESH["universeTs"] > 900:
-                st, body = fetch_upstream(
-                    "/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=250&page=1")
-                if st == 200:
-                    REFRESH["universe"] = [c["id"] for c in json.loads(body)]
-                    REFRESH["universeTs"] = time.time()
+            # 幣別清單（市值前 250）變化很慢：6 小時更新一次，而且先拿伺服器快取裡已有的行情榜（監控、網頁剛拿過的），
+            # 都沒有才打 CoinGecko；額度用完時不打。2026-09-30：以前每 15 分鐘打一次、額度用完也照打，一天約 96 次——
+            # 是「滾動補抓」用量的大宗
+            refresh_universe()
 
             if QUOTA["exhausted"] or not REFRESH["universe"]:
                 time.sleep(300)
@@ -2239,6 +3102,8 @@ def main():
 
     tg_load()
     mon_load()
+    cg_calls_load()
+    bn_shadow_load()
     chans = [n for n, v in (("Telegram", _tg["token"]),
                             ("Discord", NOTIFY["discord"]),
                             ("電子郵件", NOTIFY["smtp_host"] and NOTIFY["mail_to"])) if v]

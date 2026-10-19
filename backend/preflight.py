@@ -15,7 +15,7 @@ import time
 
 import trader as T
 
-VERSION = "2026-10-12r98"        # 與 BINANCE_LESSONS.md 最上面的版本一致
+VERSION = "2026-10-20r99"        # 與 BINANCE_LESSONS.md 最上面的版本一致
 EXTRA = []                         # 其他模組登記的本機檢查：fn(add)（main 的推播管道、設定檔，第 8 條 r40）
 
 
@@ -149,6 +149,12 @@ def check():
         add("帳與交易所不符", "warn", f"查不到：{'、'.join(sorted(unknown))}（全量表沒有、逐幣也查不到，無法確認，不下結論）", 2)
     if ghost:
         add("帳與交易所不符", "warn", f"帳上有但交易所沒有：{'、'.join(sorted(ghost))}（下一輪對帳會記為平倉）", 2)
+    gave_up = extra & set(T.STATE.get("abandoned") or {})
+    extra -= gave_up
+    if gave_up:
+        # 2026-10-20：人工放棄追蹤的殘留部位（交易所拒絕平倉）——不是別的專案的，也不是正式網子帳戶的異常
+        add("已停止追蹤的殘留部位", "warn",
+            f"{'、'.join(sorted(gave_up))}：交易所一直拒絕平倉，已從帳上移除；這些幣不再進場，交易所清空後自動解除", 8)
     if extra:
         add("交易所上的其他部位", "ok" if not T.CFG.get("live") else "warn",
             f"{'、'.join(sorted(extra))}"

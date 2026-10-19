@@ -511,6 +511,8 @@ class Ex42(Ex17):
       partial  回應 NEW／成交 0，最後只成交一半（查單回 EXPIRED、成交一半）
       stuck    回應 NEW／成交 0，一直是 NEW（撤單後變 CANCELED、成交 0）
       partial_stuck  回應 NEW／成交 0，成交 40% 後卡在 PARTIALLY_FILLED（撤單後 CANCELED、成交 40%；r44 pump-dump-hunter）
+      reject   交易所直接拒絕：400 {code -2022, ReduceOnly Order is rejected.}（2026-10-20 模擬盤卡住的樣子）
+      error    暫時性錯誤：500（對照用——不該被當成交易所拒絕）
     跟有沒有帶 newOrderRespType=RESULT 無關：帶了 RESULT 也可能回 NEW。
     """
 
@@ -580,6 +582,12 @@ class Ex42(Ex17):
         return super()._handle(method, path, params, signed, timeout)
 
     def _market_new(self, how, method, path, params):
+        if how == "reject":
+            self.calls.append((method, path, params))
+            return 400, {"code": -2022, "msg": "ReduceOnly Order is rejected."}
+        if how == "error":
+            self.calls.append((method, path, params))
+            return 500, {"code": -1001, "msg": "Internal error; unable to process your request. Please try again."}
         sym, qty = params["symbol"], float(params["quantity"])
         ack = {"symbol": sym, "status": "NEW", "executedQty": "0", "origQty": str(qty), "avgPrice": "0.00", "cumQuote": "0"}
         self._inject(f"市價單回 NEW（{how}）", path, params)

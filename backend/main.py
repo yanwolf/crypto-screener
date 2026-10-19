@@ -1919,6 +1919,10 @@ def trade_handle(path, payload):
                               "狀態檔讀到之後會以狀態檔裡的設定為準")
         return 200, out
 
+    if path == "/api/trade/abandon":
+        # 2026-10-20：交易所一直拒絕平倉、手動也平不掉時，人工放棄追蹤（帳上移除、交易所不動）。要管理金鑰（在上面檢查）
+        return 200, trader.abandon_position(str(payload.get("symbol", "")).strip(), str(payload.get("note", ""))[:200])
+
     if path == "/api/trade/exclude":
         tid = str(payload.get("id", ""))
         ok = trader.set_excluded(tid, payload.get("excluded", True))

@@ -152,6 +152,7 @@ STATE = {
     "enabled": False,
     "leftovers": [],               # 平倉後撤不掉的條件單，每輪重試（第 13 條）
     "pending": {},                 # symbol → 已送單、尚未記帳的部位（第 3 條）
+    "abandoned": {},               # symbol → 人工放棄追蹤的殘留部位（交易所一直拒絕平倉；2026-10-20 模擬盤 WLFI/BR）
     "positions": {},               # symbol → 部位紀錄
     "trades": [],                  # 已平倉紀錄
     "errors": [],
@@ -861,6 +862,8 @@ def open_position(symbol_base, side, entry_hint, stop, info=None, note="", stop_
     # 記帳時直接蓋掉原本那筆（原本的停損、停利從此沒人管）。引擎鎖讓兩張單排隊，這裡擋第二張。
     if sym in STATE["positions"]:
         return {"ok": False, "error": f"{sym} 已有部位，不重複進場（要加碼請先平倉）"}
+    if sym in (STATE.get("abandoned") or {}):
+        return {"ok": False, "error": f"{sym} 有放棄追蹤的殘留部位（交易所拒絕平倉），不進場；交易所清空後自動解除"}
     if sym in (STATE.get("pending") or {}):
         return {"ok": False, "error": f"{sym} 剛送出進場單、還在等交易所確認，不重複下單"}
 
@@ -1525,14 +1528,43 @@ def place_stop(pos, price, own=None):
     return ("placed" if st == 200 else "failed"), st, r, ep
 
 
+REJECT_STUCK_AFTER = 30          # 交易所連續拒絕平倉幾次（每 20 秒一次，約 10 分鐘）之後改成退讓
+REJECT_RETRY_S = 600              # 退讓後多久再試一次
+
+
+def _is_exchange_reject(why):
+    """交易所明確的業務拒絕：一直重送也是一樣的結果（2026-10-20 模擬盤：ReduceOnly Order is rejected 連續上千次，
+    連網頁上手動平倉、重置資產後全部平倉都被拒）。網路錯誤、逾時、查不到這類暫時性的不算——那些照舊每輪重試。"""
+    w = str(why or "").lower()
+    return "reduceonly order is rejected" in w or "-2022" in w
+
+
 def _set_pending_close(pos, reason, why):
-    """平倉沒平掉：記待平倉旗標、告警第 1 次（第 8 條 r13）。停損與停利不動，守衛照常運作。"""
+    """平倉沒平掉：記待平倉旗標、告警第 1 次（第 8 條 r13）。停損與停利不動，守衛照常運作。
+    交易所連續明確拒絕 REJECT_STUCK_AFTER 次：標成「卡住」，只推一則要人工處理的通知，之後每 REJECT_RETRY_S 才試一次。"""
     pc = pos.get("pendingClose")
     if not pc:
         pc = pos["pendingClose"] = {"reason": reason, "attempts": 0, "since": int(time.time() * 1000)}
     pc["attempts"] += 1
     pc["lastErr"] = why
+    pc["rejects"] = pc.get("rejects", 0) + 1 if _is_exchange_reject(why) else 0
+    became_stuck = False
+    if pc["rejects"] >= REJECT_STUCK_AFTER:
+        became_stuck = not pc.get("stuck")
+        pc["stuck"] = True
+        pc["nextTry"] = int((time.time() + REJECT_RETRY_S) * 1000)
+    elif pc.get("stuck"):
+        pc["stuck"], pc["nextTry"] = False, 0          # 換成別的錯誤（不是交易所拒絕）：回到每輪重試
     save_state()
+    if became_stuck:
+        _notify("⚠ 交易所持續拒絕平倉，需要人工處理",
+                f"{pos['symbol']} {pc['reason']}\n交易所已連續拒絕 {pc['rejects']} 次：{why}\n"
+                f"改成每 {REJECT_RETRY_S // 60} 分鐘再試一次，不再每 {CFG.get('positionPoll', 20):g} 秒重試。\n"
+                f"請到幣安手動平倉；平不掉的話，在網頁的持倉卡片按「停止追蹤此部位」，"
+                f"帳上移除這筆、釋放持倉名額，交易所上的部位不動。")
+        return
+    if pc.get("stuck"):
+        return                                         # 卡住期間不再照次數告警（上面那則已講明）
     n = pc["attempts"]
     if alert_due(n):
         _notify(f"⚠ 平倉失敗，部位仍在（第 {n} 次）",
@@ -1549,6 +1581,9 @@ def retry_pending_closes():
             pc = pos.get("pendingClose")
             if not pc:
                 continue
+            if pc.get("stuck") and time.time() * 1000 < pc.get("nextTry", 0):
+                events.append({"symbol": sym, "action": "stuck_wait"})
+                continue                                 # 交易所持續拒絕：退讓中，時間到才再試
             closed, why = _market_close(sym, pos["side"], pos["qty"], pos.get("base") or 0, pos=pos)
             if closed == "gone":
                 events.append({"symbol": sym, "action": "gone"})     # 交給對帳記帳
@@ -1567,6 +1602,56 @@ def retry_pending_closes():
         else:
             _pos_step_ok("待平倉重試", sym)
     return events
+
+
+@engine_op
+def abandon_position(symbol, note=""):
+    """人工放棄追蹤（2026-10-20）：交易所一直拒絕平倉、手動也平不掉時，從帳上移除這筆、釋放持倉名額。
+    交易所上的部位與掛單都不動（撤單也平不掉的情況下，留著停損至少多一層保護）。
+    記一筆排除的平倉紀錄（損益未知、標明人工放棄），不計入績效、也不算進當日斷路器——這不是策略出場。
+    這檔記進 abandoned：不再進場，對帳時看到交易所這一側清空了才移除。"""
+    pos = STATE["positions"].get(symbol)
+    if not pos:
+        return {"ok": False, "error": "帳上沒有這個部位"}
+    now_ms = int(time.time() * 1000)
+    pc = pos.get("pendingClose") or {}
+    STATE["trades"].append({
+        "id": f"{symbol}-{now_ms}", "excluded": True, "abandoned": True,
+        "version": pos.get("version") or "v1", "symbol": symbol, "side": pos.get("side"), "qty": pos.get("qty"),
+        "partials": pos.get("partials") or [], "entry": pos.get("entry"), "exit": None, "pnl": None, "rMultiple": None,
+        "orders": pos.get("orders") or [], "leftover": None, "opened": pos.get("opened"), "closed": now_ms,
+        "reason": "人工放棄追蹤（交易所拒絕平倉）", "note": (pos.get("note") or "") + (f"；{note}" if note else ""),
+        "lastErr": pc.get("lastErr"),
+    })
+    STATE["abandoned"][symbol] = {"side": pos.get("side"), "qty": pos.get("qty"), "base": pos.get("base") or 0,
+                                  "entry": pos.get("entry"), "ts": now_ms, "lastErr": pc.get("lastErr")}
+    STATE["positions"].pop(symbol, None)
+    save_state()
+    _notify("已停止追蹤", f"{symbol} 已從帳上移除（人工放棄追蹤，不計入績效）。交易所上的部位與掛單沒有動，"
+                          f"這檔不再進場；交易所那邊清空之後會自動解除。")
+    return {"ok": True, "symbol": symbol}
+
+
+def abandoned_sync(by_side):
+    """對帳時：已放棄追蹤的幣，交易所這一側（扣掉基準）清空了就移除，並通知。by_side 讀不到就不動。"""
+    gone = []
+    for sym, a in list((STATE.get("abandoned") or {}).items()):
+        row = (by_side or {}).get((sym, a.get("side")))
+        if row is None and by_side:
+            row = (by_side or {}).get((sym, "BOTH"))
+        if row is None:
+            q = _live_qty(sym, a.get("side"))
+            if q is None:
+                continue                          # 查不到：不下結論
+        else:
+            q = abs(float(row.get("positionAmt") or 0))
+        if q - float(a.get("base") or 0) <= 1e-12:
+            STATE["abandoned"].pop(sym, None)
+            gone.append(sym)
+    if gone:
+        save_state()
+        _notify("殘留部位已清空", f"{'、'.join(gone)}：交易所上已經沒有這些放棄追蹤的部位，解除限制、可以再進場。")
+    return gone
 
 
 @engine_op
@@ -2149,6 +2234,10 @@ def sync_positions():
     if st != 200 or not isinstance(d, list):
         return {"error": "對帳失敗"}
     by_side = _rows_by_side(d)
+    try:
+        abandoned_sync(by_side)                   # 放棄追蹤的殘留部位：交易所清空了就解除（2026-10-20）
+    except Exception as e:
+        _pos_step_error("殘留部位對帳", "", e)
     reopened = set()                          # r54、r60：原本那筆在交易所端平掉、這一側被別人重開的
     # 先認領，再算「還在場」：以前反過來，剛認領的部位不在清單裡，同一輪就被判成平倉、停損也被撤掉
     adopt_pending(by_side)
@@ -2925,7 +3014,7 @@ def save_state():
         # 先寫暫存檔再換名：直接覆蓋寫，寫到一半當機就會留下壞檔（r37）
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump({"state": {k: STATE.get(k) for k in ("enabled", "pending", "positions", "trades",
-                                                           "lastNet", "leftovers")},
+                                                           "lastNet", "leftovers", "abandoned")},
                        "missed": MISSED, "conflicts": CONFLICTS,
                        "auto": AUTO,
                        # 金鑰與網路別刻意不存：金鑰只該在環境變數，
@@ -3013,7 +3102,8 @@ def load_state(path, _retry=False):
                 t["pnl"] = round(float(t["pnl"]), 4)
         new_state = {"enabled": st.get("enabled", False), "positions": st.get("positions") or {},
                      "trades": trades, "lastNet": st.get("lastNet"),
-                     "pending": st.get("pending") or {}, "leftovers": st.get("leftovers") or []}
+                     "pending": st.get("pending") or {}, "leftovers": st.get("leftovers") or [],
+                     "abandoned": st.get("abandoned") or {}}
         new_auto = {k: v for k, v in (d.get("auto") or {}).items() if k in AUTO}
         new_cfg = {k: v for k, v in (d.get("cfg") or {}).items() if k in PERSIST_CFG and v is not None}
         missed, conflicts = list(d.get("missed") or []), list(d.get("conflicts") or [])
@@ -3145,6 +3235,7 @@ def status():
         "autoOn": AUTO["on"],
         "hasCreds": bool(CFG["key"] and CFG["secret"]),
         "positions": pos,
+        "abandoned": dict(STATE.get("abandoned") or {}),
         "openPnl": round(sum((r.get("pnl") or 0) for r in pos), 2),
         "balance": (account_balance()[0] if (CFG["key"] and CFG["secret"] and not CFG["dryRun"]) else None),
         "capital": (capital_state()[0] if (CFG["key"] and CFG["secret"] and not CFG["dryRun"]) else None),

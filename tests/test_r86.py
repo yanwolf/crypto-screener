@@ -19,7 +19,7 @@ from tests.harness import make_case                             # noqa: E402
 RESULTS = []
 case = make_case(RESULTS)
 fresh, open_long, restart, market_posts = R.fresh, R.open_long, R75.restart, R.market_posts
-STATE_WRITTEN = ("enabled", "pending", "positions", "trades", "lastNet", "leftovers")
+STATE_WRITTEN = ("enabled", "pending", "positions", "trades", "lastNet", "leftovers", "abandoned")
 NOT_PERSISTED = {"lastRun": "上次背景那輪的時間，畫面顯示用，重啟後自然更新",
                  "loadError": "讀取失敗的狀態本身，每次開機重讀（r37）",
                  "errors": "錯誤清單，畫面顯示用"}
