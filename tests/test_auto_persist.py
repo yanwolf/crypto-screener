@@ -37,9 +37,10 @@ def runtime_auto_keys():
                 and n.value.id == "AUTO" and isinstance(n.slice, ast.Constant):
             keys.add(n.slice.value)
         if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "setdefault" \
-                and isinstance(n.func.value, ast.Name) and n.func.value.id == "AUTO" and n.args \
-                and isinstance(n.args[0], ast.Constant):
-            keys.add(n.args[0].value)
+                and isinstance(n.func.value, ast.Name) and n.func.value.id == "AUTO" and len(n.args) >= 1:
+            first = n.args[0]
+            if isinstance(first, ast.Constant):
+                keys.add(first.value)
     return keys
 
 

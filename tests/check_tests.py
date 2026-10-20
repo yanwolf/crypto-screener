@@ -25,10 +25,10 @@ import os
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-# 2026-10-20（r100 gold-scalper 提醒）：以前 FILES 是寫死的清單——r97 新增的 test_r97 就沒登記、到 r99 才發現。
-# 改成掃 tests/test_*.py 全部：@case 框架的照原本檢查；舊式（最上層 check(…)、fresh() 切情境）另用 script_problems 檢查；
-# 兩種都不是的報「認不得」，不讓新檔案悄悄漏掉。FILES 只留著當「至少要有這些」的下限（被刪掉或改名會報）。
-FILES = ["test_r11.py", "test_r14.py", "test_r17.py", "test_r20.py", "test_r23.py", "test_r26.py", "test_r29.py", "test_r32.py", "test_r35.py", "test_r38.py", "test_r42.py", "test_r46.py", "test_r49.py", "test_r52.py", "test_r55.py", "test_r58.py", "test_r60.py", "test_r63.py", "test_cg_cooldown.py", "test_r71.py", "test_r73.py", "test_r75.py", "test_r77.py", "test_auto_persist.py", "test_r86.py", "test_cg_budget.py", "test_bn_backup.py", "test_r97.py", "test_r99.py"]
+# 2026-10-20：測試檔清單一律從登記表（tests/registry.py）來——全部 test_*.py 自動列入、不參加的寫理由。
+# @case 框架的照原本檢查；舊式（最上層 check(…)、fresh() 切情境）另用 script_problems 檢查。
+sys.path.insert(0, os.path.dirname(HERE))
+from tests import registry  # noqa: E402
 STATEY = ("STATE", "positions", "pending", "leftovers", ".pos", "ex.algo")
 
 
@@ -133,28 +133,56 @@ SELFTEST_SCRIPT = [
 
 
 def suite_registration_problems(case_files, script_files):
-    """@case 測試檔要登記進突變檢查、舊版重跑、新介面檢查與 verify.sh——r97 漏登記在這三個檢查裡兩輪才發現。
-    舊式檔案只要求進 verify.sh（其他三個檢查是 @case 框架專用的）。"""
-    out = []
+    """r101：逐檔掃的工具都從登記表拿清單（自動），這裡只剩 verify.sh 要人工登記（每支測試有自己的標題）；
+    再加上登記表本身的問題（跳過的檔不存在、認不得的寫法）。"""
+    out = list(registry.problems())
     try:
-        mut = open(os.path.join(HERE, "mutation_check.py"), encoding="utf-8").read()
-        leg = open(os.path.join(HERE, "run_on_legacy.py"), encoding="utf-8").read()
-        sys.path.insert(0, os.path.dirname(HERE))
-        from tests import check_newapi as _na          # 新介面檢查現在自動掃（2026-10-20）：直接拿它實際要掃的清單
-        newapi = " ".join(f'"{s}"' for s in _na.SUITES)
         ver = open(os.path.join(os.path.dirname(HERE), "verify.sh"), encoding="utf-8").read()
     except OSError as e:
-        return [f"讀不到登記檢查要比對的檔案：{e}"]
-    for f in case_files:
-        m = f[:-3]
-        miss = [name for name, txt, key in (("突變檢查", mut, f'"{m}"'), ("舊版重跑", leg, f'"{m}"'),
-                                           ("新介面檢查", newapi, f'"{f}"'), ("verify.sh", ver, f"tests.{m}"))
-                if key not in txt]
-        if miss:
-            out.append(f"{f} 沒登記進：{'、'.join(miss)}")
-    for f in script_files:
+        return out + [f"讀不到 verify.sh：{e}"]
+    for f in case_files + script_files:
         if f"tests.{f[:-3]}" not in ver:
             out.append(f"{f} 沒登記進 verify.sh")
+    return out
+
+
+TEST_NAME = re.compile(r"^test_[A-Za-z0-9_]+(\.py)?$")
+
+
+def hardcoded_lists(src, fname="<src>"):
+    """工具原始碼裡寫死的測試檔清單：兩個以上全是 test_… 字串的 list／tuple／set（r101 pump-dump-hunter：
+    擋「工具裡還寫死清單」——自動掃之後，有人又寫一份清單就會再漏）。"""
+    out = []
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:
+        return out
+    for n in ast.walk(tree):
+        if isinstance(n, (ast.List, ast.Tuple, ast.Set)) and len(n.elts) >= 2 and all(
+                isinstance(e, ast.Constant) and isinstance(e.value, str) and TEST_NAME.match(e.value) for e in n.elts):
+            out.append((fname, n.lineno, ", ".join(e.value for e in n.elts[:3]) + ("…" if len(n.elts) > 3 else "")))
+    return out
+
+
+SELFTEST_HARDCODED = [
+    ('SUITES = ["test_r11", "test_r14"]\n', 1),
+    ('FILES = ("test_a.py", "test_b.py", "test_c.py")\n', 1),
+    ('SUITES = registry.modules_for("mutation")\n', 0),
+    ('ONE = ["test_r11"]\n', 0),                               # 單一個名稱（例如指定跑哪一支）不算清單
+    ('X = ["test_r11", "other"]\n', 0),                        # 混了別的字串
+]
+
+
+def tool_hardcoded_problems():
+    """掃 tests/ 的工具與 scripts/ 下的 .py（測試檔本身、登記表除外）。"""
+    out = []
+    root = os.path.dirname(HERE)
+    paths = [p for p in glob.glob(os.path.join(HERE, "*.py"))
+             if not os.path.basename(p).startswith("test_") and os.path.basename(p) != "registry.py"]
+    paths += glob.glob(os.path.join(root, "scripts", "*.py"))
+    for p in sorted(paths):
+        for fname, line, what in hardcoded_lists(open(p, encoding="utf-8").read(), os.path.relpath(p, root)):
+            out.append(f"{fname}:{line} 寫死了測試檔清單（{what}）——改從 tests/registry.py 拿")
     return out
 
 
@@ -339,6 +367,9 @@ def selftest():
         fn = next(c[2] for c in cases(src))
         if needs_keep_save(fn, src) != want:
             wrong.append(f"第 26 種判錯：{src.splitlines()[2].strip()} / {src.splitlines()[3].strip()}")
+    for body, want in SELFTEST_HARDCODED:
+        if len(hardcoded_lists(body)) != want:
+            wrong.append(f"寫死清單判錯：{body.strip()}（應報 {want} 處）")
     for body, want in SELFTEST_SCRIPT:
         _g, probs = script_problems(body)
         if len(probs) != want:
@@ -368,21 +399,12 @@ def main():
         if bool(infra_touches_program(fn)) != want:
             print("✕ 檢查器自我驗證失敗：infra 規則判錯")
             return 1
-    print(f"✓ 檢查器自我驗證：{len(SELFTEST)} 組否定句＋{len(SELFTEST_SCRIPT)} 組舊式情境＋2 組 infra＋{len(SELFTEST_26)} 組 keep_save＋{len(SELFTEST_27)} 組重設順序固定人造資料全部判對")
+    print(f"✓ 檢查器自我驗證：{len(SELFTEST)} 組否定句＋{len(SELFTEST_SCRIPT)} 組舊式情境＋{len(SELFTEST_HARDCODED)} 組寫死清單＋2 組 infra＋{len(SELFTEST_26)} 組 keep_save＋{len(SELFTEST_27)} 組重設順序固定人造資料全部判對")
     bad, total, neg = [], 0, 0
-    all_files = sorted(os.path.basename(p) for p in glob.glob(os.path.join(HERE, "test_*.py")))
-    for f in FILES:
-        if f not in all_files:
-            bad.append(f"{f} 在清單上卻找不到檔案（被刪掉或改名）")
-    case_files, script_files = [], []
-    for f in all_files:
-        src = open(os.path.join(HERE, f), encoding="utf-8").read()
-        if "@case(" in src:
-            case_files.append(f)
-        elif re.search(r"^check\(", src, re.M) and "fresh(" in src:
-            script_files.append(f)
-        else:
-            bad.append(f"{f} 認不得的寫法（不是 @case 框架、也不是最上層 check(…)），否定句檢查掃不到")
+    all_files = registry.files_for("negative")
+    case_files = [f for f in all_files if registry.style(f) == "case"]
+    script_files = [f for f in all_files if registry.style(f) == "script"]          # 認不得的由 registry.problems() 報
+    bad += tool_hardcoded_problems()
     for f in script_files:
         src = open(os.path.join(HERE, f), encoding="utf-8").read()
         groups, probs = script_problems(src)

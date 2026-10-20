@@ -57,7 +57,7 @@ def exchange(sym, mark, qty_holder, side="LONG"):
         if p == "/fapi/v2/positionRisk" and (params or {}).get("symbol") and os.environ.get("MUTATE_SYMBOL_EMPTY"):
             return 200, []                                        # 突變測試：逐幣查詢回空清單（基準查不到）
         if p == "/fapi/v2/positionRisk":
-            q = qty_holder[0]
+            q = qty_holder[0]                                   # 固定長度：只有一格的容器
             hedge = bool(T._mode.get("hedge"))
             amt = q if side == "LONG" else -q
             return 200, [{"symbol": sym, "positionAmt": str(amt), "entryPrice": str(mark),
@@ -147,7 +147,8 @@ for tp1R in (1.5, 2.0, 2.5):
                     "why": "", "ts": 0, "result": None, "r": None}]
     path = [(0, entry)] + [(i * 3600000, entry + (ex["tp1"] - entry) * i / 5) for i in range(1, 7)]
     T.missed_evaluate(lambda cid: path)
-    m = T.MISSED[0]
+    check(T.MISSED, "評估後被追蹤的訊號不見了")
+    m = T.MISSED[0] if T.MISSED else {}
     check(m["result"] == "tp2" and abs(m["r"] - tp1R) < 1e-9,
           f"影子追蹤 tp1R={tp1R}：結果 {m['result']} {m['r']}R，應為 tp2 {tp1R}R")
 

@@ -9,7 +9,6 @@
     python3 -m tests.check_newapi
 """
 import ast
-import glob
 import os
 import sys
 
@@ -18,8 +17,9 @@ MODULE_BASES = {"T": "trader", "M": "main", "FX": "fake_exchange", "R": "test_r4
                 "R73": "test_r73", "R75": "test_r75"}
 # 2026-10-20：以前寫死清單、只從 test_r42 起——test_r11～test_r38 從沒掃過，test_r97 也漏登記兩輪。
 # 改成掃 tests/ 下所有用 @case 框架的 test_*.py（舊式的 test_lessons／test_parity 沒有案例函式，這個檢查不適用）
-SUITES = sorted(os.path.basename(p) for p in glob.glob(os.path.join(ROOT, "tests", "test_*.py"))
-                if "@case(" in open(p, encoding="utf-8").read())
+sys.path.insert(0, ROOT)
+from tests import registry as _registry       # noqa: E402  2026-10-20：清單從登記表來
+SUITES = _registry.files_for("newapi")
 
 
 def legacy_names():

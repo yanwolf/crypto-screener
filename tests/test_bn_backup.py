@@ -66,6 +66,8 @@ def install(M, series_by_sym, cg_fail=False):
     """假的上游：/api/bn 回 K 線與 24 小時統計；/api/v3 回 CoinGecko（cg_fail 時回 403）。回傳呼叫紀錄。"""
     calls = []
 
+    need(all(len(sr) > 24 for sr in series_by_sym.values()), "假幣安的價格序列不夠長（前提）")
+
     def fake(path, prefix="/api/v3", background=False):
         calls.append((prefix, path))
         if prefix == "/api/bn":
@@ -80,9 +82,9 @@ def install(M, series_by_sym, cg_fail=False):
             lim = int(q["limit"])
             ks = klines(sr, 1000 if q["symbol"].startswith("1000") else 1)
             if "startTime" in q:                                 # 觸發後續追蹤：從某個時間往後拿
-                rows = [k for k in ks if k[0] >= int(q["startTime"])][:lim]
+                rows = [k for k in ks if k[0] >= int(q["startTime"])][:lim]   # 固定長度：klines() 造的每一列都是 12 欄
             else:
-                rows = [k for k in ks if k[0] <= int(q["endTime"])][-lim:]
+                rows = [k for k in ks if k[0] <= int(q["endTime"])][-lim:]   # 固定長度：同上
             return 200, json.dumps(rows).encode()
         if cg_fail:
             return 403, b"<html>blocked</html>"
@@ -101,6 +103,7 @@ def mon_setup(M, syms, listed=None):
     T()._filters.update({s + "USDT": {"status": "TRADING"} for s in (listed if listed is not None else syms)})
     T()._filters_ts = 9e18
     series = {s + "USDT": make_series(i + 1) for i, s in enumerate(syms)}
+    need(all(len(v) > 24 for v in series.values()), "造出的價格序列不夠長（前提）")
     M.MON.update({"cfg": {"bull": {"minRvol": 2, "minRadar": 65, "minLiq": 0, "maxChase": 100, "maxStopPct": 25},
                           "bear": {"minBear": 65, "minStruct": 0, "maxVolRatio": 99, "minLiq": 0, "maxStopPct": 25},
                           "cooldownMin": 60, "minDelta": 5, "breakoutPct": 3},
@@ -125,6 +128,7 @@ def _():
     need(hasattr(M, "bn_chart"), "程式沒有幣安備援（前提）")
     M.CACHE_DIR = tempfile.mkdtemp()
     sr = make_series(7)
+    need(len(sr) > 24, "造出的價格序列不夠長（前提）")
     install(M, {"1000PEPEUSDT": sr})
     ch = M.bn_chart("1000PEPEUSDT")
     need(ch, "拿不到圖表（前提）")
@@ -143,6 +147,7 @@ def _():
     M = main_mod()
     series, markets = mon_setup(M, ["AAA"])
     install(M, series)
+    need(markets, "行情榜是空的（前提）")
     c = markets[0]
     base = {"id": "aaa", "sym": "AAA", "name": "AAA", "price": c["current_price"], "vol": c["total_volume"], "mcap": c["market_cap"],
             "m24": 3.0, "m7": 5.0, "m30": 8.0}
@@ -166,6 +171,7 @@ def _():
     M = main_mod()
     series, markets = mon_setup(M, ["AAA"])
     install(M, series)
+    need(markets, "行情榜是空的（前提）")
     c = markets[0]
     ch = M.bn_chart("AAAUSDT")
     need(ch, "拿不到圖表（前提）")
@@ -430,6 +436,7 @@ def _():
     kinds = sorted(t["kind"] for t in M.BN_SHADOW["trig"])
     if kinds != ["bnOnly", "both"]:
         return f"應記一筆只有幣安、一筆兩邊都有：{kinds}"
+    need(M.BN_SHADOW["trig"], "觸發紀錄是空的（前提）")
     t0 = M.BN_SHADOW["trig"][0]["ts"]
     path = {"AAAUSDT": [1.0, 0.99, 0.96, 0.94], "BBBUSDT": [1.0, 1.03, 1.08, 1.12]}       # AAA 先停損（5%），BBB 先到 2R（+10%）
 

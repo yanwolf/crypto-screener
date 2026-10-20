@@ -8,7 +8,6 @@
     python3 -m tests.check_indexing
 """
 import ast
-import glob
 import os
 import sys
 
@@ -78,7 +77,11 @@ def main():
         if len(scan(src)) != want:
             print(f"✕ 索引檢查的自我驗證失敗：{src.splitlines()[1].strip()} 預期 {want} 處")
             return 1
-    files = sorted(glob.glob(os.path.join(HERE, "test_r*.py"))) + [os.path.join(HERE, "test_lessons.py")]
+    # 2026-10-20（r101 對照 pump-dump-hunter）：以前只掃 test_r*.py＋test_lessons.py——名字不是 test_rNN 的 5 個檔從沒被掃過，
+    # 補掃找出 13 處（都不會讓測試悄悄通過，照規則補上前提）。改成從登記表拿全部
+    sys.path.insert(0, os.path.dirname(HERE))
+    from tests import registry
+    files = [os.path.join(HERE, f) for f in registry.files_for("indexing")]
     if len(files) < 8:
         print(f"✕ 前提不成立：只找到 {len(files)} 支測試檔")
         return 1
