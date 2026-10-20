@@ -9,14 +9,17 @@
     python3 -m tests.check_newapi
 """
 import ast
+import glob
 import os
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MODULE_BASES = {"T": "trader", "M": "main", "FX": "fake_exchange", "R": "test_r42", "R55": "test_r55", "R71": "test_r71",
                 "R73": "test_r73", "R75": "test_r75"}
-SUITES = ["test_r42.py", "test_r46.py", "test_r49.py", "test_r52.py", "test_r55.py", "test_r58.py", "test_r60.py",
-          "test_r63.py", "test_cg_cooldown.py", "test_r71.py", "test_r73.py", "test_r75.py", "test_r77.py", "test_auto_persist.py", "test_r86.py", "test_cg_budget.py", "test_bn_backup.py", "test_r97.py", "test_r99.py"]
+# 2026-10-20：以前寫死清單、只從 test_r42 起——test_r11～test_r38 從沒掃過，test_r97 也漏登記兩輪。
+# 改成掃 tests/ 下所有用 @case 框架的 test_*.py（舊式的 test_lessons／test_parity 沒有案例函式，這個檢查不適用）
+SUITES = sorted(os.path.basename(p) for p in glob.glob(os.path.join(ROOT, "tests", "test_*.py"))
+                if "@case(" in open(p, encoding="utf-8").read())
 
 
 def legacy_names():

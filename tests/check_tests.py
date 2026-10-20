@@ -19,10 +19,15 @@
 """
 import ast
 import functools
+import glob
+import re
 import os
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+# 2026-10-20（r100 gold-scalper 提醒）：以前 FILES 是寫死的清單——r97 新增的 test_r97 就沒登記、到 r99 才發現。
+# 改成掃 tests/test_*.py 全部：@case 框架的照原本檢查；舊式（最上層 check(…)、fresh() 切情境）另用 script_problems 檢查；
+# 兩種都不是的報「認不得」，不讓新檔案悄悄漏掉。FILES 只留著當「至少要有這些」的下限（被刪掉或改名會報）。
 FILES = ["test_r11.py", "test_r14.py", "test_r17.py", "test_r20.py", "test_r23.py", "test_r26.py", "test_r29.py", "test_r32.py", "test_r35.py", "test_r38.py", "test_r42.py", "test_r46.py", "test_r49.py", "test_r52.py", "test_r55.py", "test_r58.py", "test_r60.py", "test_r63.py", "test_cg_cooldown.py", "test_r71.py", "test_r73.py", "test_r75.py", "test_r77.py", "test_auto_persist.py", "test_r86.py", "test_cg_budget.py", "test_bn_backup.py", "test_r97.py", "test_r99.py"]
 STATEY = ("STATE", "positions", "pending", "leftovers", ".pos", "ex.algo")
 
@@ -45,18 +50,31 @@ def _literal_names(src):
         tree = ast.parse(src)
     except SyntaxError:
         return frozenset()
+    # r100 gold-scalper 對照：被指定兩次以上（含 +=、在函式裡重新指定）的不算——不能保證它還是那個非空清單
+    times = {}
+    for n in ast.walk(tree):
+        tgts = n.targets if isinstance(n, ast.Assign) else [n.target] if isinstance(n, (ast.AugAssign, ast.AnnAssign)) else []
+        for t in tgts:
+            for x in ast.walk(t):
+                if isinstance(x, ast.Name):
+                    times[x.id] = times.get(x.id, 0) + 1
     for n in tree.body:
-        if isinstance(n, ast.Assign) and isinstance(n.value, (ast.List, ast.Tuple, ast.Set)) and n.value.elts:
+        if isinstance(n, ast.Assign) and isinstance(n.value, (ast.List, ast.Tuple, ast.Set)) and _has_plain_elt(n.value):
             for t in n.targets:
-                if isinstance(t, ast.Name):
+                if isinstance(t, ast.Name) and times.get(t.id) == 1:
                     out.add(t.id)
     return frozenset(out)
+
+
+def _has_plain_elt(node):
+    """寫死的清單裡至少有一個不是 * 展開的元素（[*xs] 看起來有一個元素，xs 空的時候還是空的——r100 gold-scalper）。"""
+    return any(not isinstance(e, ast.Starred) for e in node.elts)
 
 
 def _nonempty_literal(node, src):
     """這個迭代來源一定非空：寫死的非空 list／tuple／set、非空字串常數、或模組最上層的寫死非空清單名稱。"""
     if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
-        return bool(node.elts)
+        return _has_plain_elt(node)
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
         return bool(node.value)
     if isinstance(node, ast.Name):
@@ -72,10 +90,72 @@ def _all_cannot_be_vacuous(call, src):
         return False
     a = call.args[0]
     if isinstance(a, (ast.List, ast.Tuple, ast.Set)):
-        return bool(a.elts)
+        return _has_plain_elt(a)
     if isinstance(a, (ast.GeneratorExp, ast.ListComp, ast.SetComp)):
         return all(not g.ifs and _nonempty_literal(g.iter, src) for g in a.generators)
     return False
+
+
+def script_problems(src):
+    """舊式測試（最上層一路往下跑、每個情境以 fresh() 開頭、斷言是 check(條件, 訊息)）：
+    以含 fresh() 的最上層敘述切情境，情境裡有 check、而且全部是否定句（要求「沒發生」）就報。
+    check(cond) 的失敗條件是 not cond；cond 本身是 not X 時失敗條件就是 X。函式定義裡的 check 不算（不知道誰呼叫）。"""
+    tree = ast.parse(src)
+    groups, cur = [], None
+    for st in tree.body:
+        if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        if any(isinstance(n, ast.Call) and getattr(n.func, "id", "") == "fresh" for n in ast.walk(st)):
+            cur = {"line": st.lineno, "checks": []}
+            groups.append(cur)
+        if cur is None:
+            continue
+        for n in ast.walk(st):
+            if isinstance(n, ast.Call) and getattr(n.func, "id", "") == "check" and n.args:
+                cur["checks"].append(n.args[0])
+    probs = []
+    for g in groups:
+        conds = [c.operand if isinstance(c, ast.UnaryOp) and isinstance(c.op, ast.Not)
+                 else ast.UnaryOp(op=ast.Not(), operand=c) for c in g["checks"]]
+        if conds and all(negative(c, src) for c in conds):
+            probs.append((g["line"], (ast.get_source_segment(src, g["checks"][0]) or "")[:60]))
+    return groups, probs
+
+
+SELFTEST_SCRIPT = [
+    ("fresh()\nx = run()\ncheck(x == 3, 'm')\n", 0),                      # 正向
+    ("fresh()\ncheck(not stops_sent(ex), 'm')\n", 1),                        # 只有否定句
+    ("fresh()\ncheck(not sent(ex), 'm')\ncheck(len(b) == 1, 'm')\n", 0),       # 有正向斷言
+    ("fresh()\ncheck(x == 1, 'm')\nfresh()\ncheck(not sent(ex), 'm')\n", 1),  # 第二個情境只有否定句
+    ("fresh()\ncheck(all(k in h for k in ('a', 'b')), 'm')\n", 0),             # 寫死的非空清單：不會空跑
+    ("fresh()\ncheck(all(p['r'] for p in posts(ex)), 'm')\n", 1),              # 空清單時 all() 成立
+]
+
+
+def suite_registration_problems(case_files, script_files):
+    """@case 測試檔要登記進突變檢查、舊版重跑、新介面檢查與 verify.sh——r97 漏登記在這三個檢查裡兩輪才發現。
+    舊式檔案只要求進 verify.sh（其他三個檢查是 @case 框架專用的）。"""
+    out = []
+    try:
+        mut = open(os.path.join(HERE, "mutation_check.py"), encoding="utf-8").read()
+        leg = open(os.path.join(HERE, "run_on_legacy.py"), encoding="utf-8").read()
+        sys.path.insert(0, os.path.dirname(HERE))
+        from tests import check_newapi as _na          # 新介面檢查現在自動掃（2026-10-20）：直接拿它實際要掃的清單
+        newapi = " ".join(f'"{s}"' for s in _na.SUITES)
+        ver = open(os.path.join(os.path.dirname(HERE), "verify.sh"), encoding="utf-8").read()
+    except OSError as e:
+        return [f"讀不到登記檢查要比對的檔案：{e}"]
+    for f in case_files:
+        m = f[:-3]
+        miss = [name for name, txt, key in (("突變檢查", mut, f'"{m}"'), ("舊版重跑", leg, f'"{m}"'),
+                                           ("新介面檢查", newapi, f'"{f}"'), ("verify.sh", ver, f"tests.{m}"))
+                if key not in txt]
+        if miss:
+            out.append(f"{f} 沒登記進：{'、'.join(miss)}")
+    for f in script_files:
+        if f"tests.{f[:-3]}" not in ver:
+            out.append(f"{f} 沒登記進 verify.sh")
+    return out
 
 
 def negative(cond, src):
@@ -161,6 +241,13 @@ SELFTEST = [
     ("if not all(k in html for k in ('a', 'b') if k != 'z'):\n        return 'x'", True),   # 有篩選：篩完可能空
     ("if not all(k in html for k in FIELDS):\n        return 'x'", False),         # 模組最上層寫死的清單名稱（見 PRELUDE）
     ("if not all(k in html for k in fields_of(ex)):\n        return 'x'", True),   # 執行時才算出來的：照舊要前提
+    # r100 gold-scalper 對照的兩個邊界
+    ("if not all(k in html for k in (*extra,)):\n        return 'x'", True),     # 只有 * 展開：可能是空的
+    ("if not all([*oks]):\n        return 'x'", True),
+    ("if not all(k in html for k in ('a', *extra)):\n        return 'x'", False),  # 至少一個寫死的元素
+    ("if not all(k in html for k in TWICE):\n        return 'x'", True),        # 被指定兩次以上（見 PRELUDE）
+    ("if not all(k in html for k in GROWN):\n        return 'x'", True),        # 有 +=
+    ("if not all(k in html for k in x for x in rows(ex)):\n        return 'x'", True),   # 多層、有一層是執行時算出來的
 ]
 
 
@@ -252,8 +339,13 @@ def selftest():
         fn = next(c[2] for c in cases(src))
         if needs_keep_save(fn, src) != want:
             wrong.append(f"第 26 種判錯：{src.splitlines()[2].strip()} / {src.splitlines()[3].strip()}")
+    for body, want in SELFTEST_SCRIPT:
+        _g, probs = script_problems(body)
+        if len(probs) != want:
+            wrong.append(f"舊式情境判錯：{body.splitlines()[1]} …（應報 {want} 個、實際 {len(probs)}）")
     for body, want in SELFTEST:
-        src = f"FIELDS = ('a', 'b')\n\n\n@case('t', 'd')\ndef _():\n    ex = fresh()\n    {body}\n"
+        src = (f"FIELDS = ('a', 'b')\nTWICE = ('a',)\nTWICE = ()\nGROWN = ['a']\nGROWN += []\n\n\n"
+               f"@case('t', 'd')\ndef _():\n    ex = fresh()\n    {body}\n")
         fn = next(c[2] for c in cases(src))
         br = fail_branches(fn)
         got = bool(br) and all(negative(x, src) for x in br) and not has_need(fn)
@@ -276,9 +368,31 @@ def main():
         if bool(infra_touches_program(fn)) != want:
             print("✕ 檢查器自我驗證失敗：infra 規則判錯")
             return 1
-    print(f"✓ 檢查器自我驗證：{len(SELFTEST)} 組否定句＋2 組 infra＋{len(SELFTEST_26)} 組 keep_save＋{len(SELFTEST_27)} 組重設順序固定人造資料全部判對")
+    print(f"✓ 檢查器自我驗證：{len(SELFTEST)} 組否定句＋{len(SELFTEST_SCRIPT)} 組舊式情境＋2 組 infra＋{len(SELFTEST_26)} 組 keep_save＋{len(SELFTEST_27)} 組重設順序固定人造資料全部判對")
     bad, total, neg = [], 0, 0
+    all_files = sorted(os.path.basename(p) for p in glob.glob(os.path.join(HERE, "test_*.py")))
     for f in FILES:
+        if f not in all_files:
+            bad.append(f"{f} 在清單上卻找不到檔案（被刪掉或改名）")
+    case_files, script_files = [], []
+    for f in all_files:
+        src = open(os.path.join(HERE, f), encoding="utf-8").read()
+        if "@case(" in src:
+            case_files.append(f)
+        elif re.search(r"^check\(", src, re.M) and "fresh(" in src:
+            script_files.append(f)
+        else:
+            bad.append(f"{f} 認不得的寫法（不是 @case 框架、也不是最上層 check(…)），否定句檢查掃不到")
+    for f in script_files:
+        src = open(os.path.join(HERE, f), encoding="utf-8").read()
+        groups, probs = script_problems(src)
+        total += len(groups)
+        neg += len(probs)
+        if not groups:
+            bad.append(f"{f} 舊式測試切不出情境（前提：掃描真的找到了情境）")
+        for line, snippet in probs:
+            bad.append(f"{f} 第 {line} 行起的情境只有否定句（check 全部要求「沒發生」）：{snippet}")
+    for f in case_files:
         src = open(os.path.join(HERE, f), encoding="utf-8").read()
         found = list(cases(src))
         if len(found) < 5:
@@ -305,7 +419,11 @@ def main():
                     bad.append(f"{f} [{tag}] 所有斷言都是否定句、沒有前提 need(...)：{desc[:36]}")
     for b in bad:
         print("✕ " + b)
-    print(f"{'✕' if bad else '✓'} 測試靜態檢查：{total} 個案例，全否定句 {neg} 個；問題 {len(bad)} 項")
+    for b in suite_registration_problems(case_files, script_files):
+        bad.append(b)
+        print("✕ " + b)
+    print(f"{'✕' if bad else '✓'} 測試靜態檢查：掃了 {len(case_files) + len(script_files)} 個測試檔（@case {len(case_files)}、"
+          f"舊式 {len(script_files)}），{total} 個案例／情境，全否定句 {neg} 個；問題 {len(bad)} 項")
     return 1 if bad else 0
 
 
