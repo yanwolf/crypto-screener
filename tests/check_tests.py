@@ -18,6 +18,7 @@
     python3 -m tests.check_tests
 """
 import ast
+import functools
 import os
 import sys
 
@@ -36,6 +37,47 @@ def cases(src):
                 yield d.args[0].value, d.args[1].value, fn
 
 
+@functools.lru_cache(maxsize=64)
+def _literal_names(src):
+    """模組最上層指定成「非空的寫死清單」的名稱（FIELDS = ("a", "b") 這種）。"""
+    out = set()
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:
+        return frozenset()
+    for n in tree.body:
+        if isinstance(n, ast.Assign) and isinstance(n.value, (ast.List, ast.Tuple, ast.Set)) and n.value.elts:
+            for t in n.targets:
+                if isinstance(t, ast.Name):
+                    out.add(t.id)
+    return frozenset(out)
+
+
+def _nonempty_literal(node, src):
+    """這個迭代來源一定非空：寫死的非空 list／tuple／set、非空字串常數、或模組最上層的寫死非空清單名稱。"""
+    if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+        return bool(node.elts)
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return bool(node.value)
+    if isinstance(node, ast.Name):
+        return node.id in _literal_names(src)
+    return False
+
+
+def _all_cannot_be_vacuous(call, src):
+    """all(…) 的迭代對象一定非空時，空清單讓 all() 成立的漏洞不存在（r99 pump-dump-hunter 對照：
+    以前一律當否定句，檢查網頁有沒有某幾個欄位這種迭代寫死清單的寫法會被誤報）。
+    帶 if 篩選的不算（篩完可能是空的）；巢狀的每一層都要符合。"""
+    if len(call.args) != 1:
+        return False
+    a = call.args[0]
+    if isinstance(a, (ast.List, ast.Tuple, ast.Set)):
+        return bool(a.elts)
+    if isinstance(a, (ast.GeneratorExp, ast.ListComp, ast.SetComp)):
+        return all(not g.ifs and _nonempty_literal(g.iter, src) for g in a.generators)
+    return False
+
+
 def negative(cond, src):
     """失敗條件 cond：程式什麼都沒做時是否「不成立」（＝這條斷言會空跑通過）。"""
     if isinstance(cond, ast.BoolOp):
@@ -45,7 +87,7 @@ def negative(cond, src):
         # 第 25 種（r44 pump-dump-hunter）：if not all(…)——清單是空的時 all() 成立，這條永遠不失敗 → 藏起來的否定句
         o = cond.operand
         if isinstance(o, ast.Call) and isinstance(o.func, ast.Name) and o.func.id == "all":
-            return True
+            return not _all_cannot_be_vacuous(o, src)
         return False                                  # if not X：要求 X 發生 → 正向
     if isinstance(cond, (ast.Call, ast.Name, ast.Attribute, ast.Subscript)):
         return True                                   # if X：要求 X 沒發生 → 否定
@@ -112,6 +154,13 @@ SELFTEST = [
     ("if len(booked) != 1:\n        return 'x'", False),
     ("if not all(p['r'] for p in posts(ex)):\n        return 'x'", True),     # 第 25 種：空清單時 all() 成立
     ("need(posts(ex), 'p')\n    if not all(p['r'] for p in posts(ex)):\n        return 'x'", False),  # 先確認非空
+    # r99 pump-dump-hunter 對照：迭代寫死的非空清單不會空跑，不該報
+    ("if not all(k in html for k in ('a', 'b')):\n        return 'x'", False),       # 寫死的 tuple
+    ("if not all([ok1, ok2]):\n        return 'x'", False),                        # 寫死的 list
+    ("if not all(k in html for k in ()):\n        return 'x'", True),              # 寫死但是空的：照樣會空跑
+    ("if not all(k in html for k in ('a', 'b') if k != 'z'):\n        return 'x'", True),   # 有篩選：篩完可能空
+    ("if not all(k in html for k in FIELDS):\n        return 'x'", False),         # 模組最上層寫死的清單名稱（見 PRELUDE）
+    ("if not all(k in html for k in fields_of(ex)):\n        return 'x'", True),   # 執行時才算出來的：照舊要前提
 ]
 
 
@@ -204,7 +253,7 @@ def selftest():
         if needs_keep_save(fn, src) != want:
             wrong.append(f"第 26 種判錯：{src.splitlines()[2].strip()} / {src.splitlines()[3].strip()}")
     for body, want in SELFTEST:
-        src = f"@case('t', 'd')\ndef _():\n    ex = fresh()\n    {body}\n"
+        src = f"FIELDS = ('a', 'b')\n\n\n@case('t', 'd')\ndef _():\n    ex = fresh()\n    {body}\n"
         fn = next(c[2] for c in cases(src))
         br = fail_branches(fn)
         got = bool(br) and all(negative(x, src) for x in br) and not has_need(fn)
